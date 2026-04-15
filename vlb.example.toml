@@ -1,0 +1,80 @@
+# Virtual Load Balancer — example configuration
+#
+# Scenario: this machine acts as the default gateway for clients. It has
+# several upstream providers reachable on one or more local interfaces. The
+# service picks the highest-priority healthy provider and installs it as the
+# kernel default route. Packet forwarding is done entirely by the kernel —
+# userspace only decides *which* next-hop to use.
+#
+# Topology example (everything on one /10 subnet, single LAN interface):
+#
+#   clients ──► 10.0.0.100 (this box)  ┬─► 10.0.0.2   (isp-main,     prio 0)
+#                                      ├─► 10.0.0.1   (isp-backup-a, prio 1)
+#                                      └─► 10.0.1.1   (isp-backup-b, prio 2)
+#
+# Health model
+# ────────────
+# For EVERY provider (not just the active one) the service runs two probes
+# per tick:
+#   - gateway probe — ping the provider's next hop directly. Catches cable
+#     cuts, power outages at the ISP router, and similar next-hop failures.
+#   - internet probe — ping public targets THROUGH that specific provider,
+#     forced via a per-provider routing table and an `ip rule fwmark` entry
+#     (ping -m <mark>). Catches "gateway answers but ISP uplink is dead".
+#
+# A provider is healthy only if BOTH probes succeed. Failover triggers on
+# either failure, regardless of which one — so the exact reason the internet
+# is gone does not matter.
+
+[general]
+lan_interface = "eth0"          # informational — interface facing clients
+gateway_address = "10.0.0.100"  # the address clients set as their gateway
+
+[health]
+interval_secs = 3               # how often each provider is probed
+timeout_ms = 1000               # per-probe timeout, fractional supported
+failure_threshold = 2           # consecutive failed cycles → DOWN
+success_threshold = 2           # consecutive healthy cycles → UP
+probe_targets = ["1.1.1.1", "8.8.8.8"]
+status_print_secs = 30          # how often to print the colored status table
+
+[routing]
+# Each provider gets a dedicated routing table and fwmark derived from its
+# priority. Defaults are fine unless you have pre-existing rules/tables in
+# the same numeric range.
+table_base  = 200               # table IDs = table_base + priority
+fwmark_base = 0x200             # marks    = fwmark_base + priority
+rule_pref   = 32000             # ip-rule pref base (well below main = 32766)
+
+[firewall]
+manage = true                   # install IP forwarding, NAT, FORWARD ACCEPT
+disable_host_firewall = false   # set true to also stop ufw / firewalld
+# wan_interface = "eth0"        # override MASQUERADE iface (else per-provider)
+
+[database]
+path = "/var/lib/vlb/stats.db"  # SQLite stats file (WAL mode)
+
+# ── providers ──────────────────────────────────────────────────────────
+# priority 0 = primary, higher numbers = backups in order. Priorities must
+# be unique; names must be unique.
+
+[[providers]]
+name = "isp-main"
+gateway = "10.0.0.2"
+interface = "eth0"
+priority = 0
+role = "primary"
+
+[[providers]]
+name = "isp-backup-a"
+gateway = "10.0.0.1"
+interface = "eth0"
+priority = 1
+role = "backup"
+
+[[providers]]
+name = "isp-backup-b"
+gateway = "10.0.1.1"
+interface = "eth0"
+priority = 2
+role = "backup"

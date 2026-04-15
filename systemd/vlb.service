@@ -1,0 +1,26 @@
+[Unit]
+Description=Virtual Load Balancer — multi-provider failover gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vlb --config /etc/vlb/vlb.toml
+Restart=on-failure
+RestartSec=2
+# The service needs root for ip route / iptables / sysctl.
+User=root
+Group=root
+# Keep the journal clean and colorized logs flowing.
+Environment=RUST_LOG=info,virtual_load_balancer=debug
+Environment=CLICOLOR_FORCE=1
+StandardOutput=journal
+StandardError=journal
+# Light hardening — still allows network admin.
+NoNewPrivileges=false
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

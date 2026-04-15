@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ping -h)",
+      "Bash(ping -V)",
+      "WebFetch(domain:manpages.ubuntu.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:www.kernel.org)",
+      "WebFetch(domain:man7.org)",
+      "WebFetch(domain:conntrack-tools.netfilter.org)",
+      "WebSearch"
+    ]
+  }
+}
