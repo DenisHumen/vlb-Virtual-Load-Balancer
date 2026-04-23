@@ -321,6 +321,16 @@ impl Balancer {
                     Some(entry) if entry.state == State::Up => {
                         (Some(entry.cfg.clone()), "operator override")
                     }
+                    Some(entry) if always_install => {
+                        // Operator-initiated action (force / auto-then-force).
+                        // Install the override *regardless* of our health
+                        // view so manual switching is never blocked by a
+                        // stale/lagging probe. Health-driven reconciles
+                        // (the ticker path, `always_install = false`) still
+                        // fall back to a healthy provider below, so the
+                        // operator can recover automatically.
+                        (Some(entry.cfg.clone()), "operator override (forced)")
+                    }
                     Some(_) => {
                         // Forced provider exists but is not UP — fall back
                         // automatically and log once.
@@ -549,38 +559,50 @@ impl Balancer {
     }
 
     pub async fn force_provider(self: &Arc<Self>, name: &str) -> Result<()> {
-        // Validate the provider exists AND is currently Up. Silently
-        // installing a force that will be overridden by the health fallback
-        // is the worst kind of operator surprise: the CLI prints "ok, forced
-        // = X" while the actual route stays on the previous active. Refuse
-        // loudly instead — the operator can try again after health recovers,
-        // or first investigate why the provider is Down.
-        {
+        // Validate that the provider exists. We deliberately do NOT refuse
+        // to install the pin when the provider is Down or Unknown — operator
+        // intent wins over our health view. Two concrete reasons:
+        //
+        //   1. Health probes can lag by several ticks after boot. Rejecting
+        //      a force on Unknown meant the TUI's `f` key did nothing for the
+        //      first few seconds after start, which is exactly when operators
+        //      reach for it most.
+        //   2. `force` is the documented escape hatch when our probes and
+        //      reality disagree (e.g. the probe target is blocked by the
+        //      upstream ISP but real traffic works). Refusing the force in
+        //      that case is the worst kind of user-hostile behaviour.
+        //
+        // If the forced provider happens to be Down, `reconcile_inner`
+        // transparently falls back to the best healthy provider until the
+        // pin's target recovers, then re-installs the pinned route.
+        let (exists, state) = {
             let ps = self.providers.read().await;
-            let entry = ps
-                .get(name)
-                .ok_or_else(|| anyhow!("unknown provider '{name}'"))?;
-            match entry.state {
-                State::Up => {}
-                State::Down => {
-                    return Err(anyhow!(
-                        "provider '{name}' is currently DOWN — refusing to force. \
-                         Check health probes; use `vlb status` for details."
-                    ));
-                }
-                State::Unknown => {
-                    return Err(anyhow!(
-                        "provider '{name}' health state is UNKNOWN (no probes yet) — \
-                         wait a few seconds and retry."
-                    ));
-                }
+            match ps.get(name) {
+                Some(p) => (true, p.state),
+                None => (false, State::Unknown),
             }
+        };
+        if !exists {
+            return Err(anyhow!("unknown provider '{name}'"));
         }
         {
             let mut f = self.force_override.write().await;
             *f = Some(name.to_string());
         }
-        info!(provider = %name, "operator override installed");
+        match state {
+            State::Up => info!(provider = %name, "operator override installed"),
+            State::Down => warn!(
+                provider = %name,
+                "operator override installed for provider currently DOWN — \
+                 route will switch as soon as it recovers; using healthy \
+                 fallback in the meantime"
+            ),
+            State::Unknown => info!(
+                provider = %name,
+                "operator override installed for provider in UNKNOWN state \
+                 (no probes yet) — route will switch as soon as it comes up"
+            ),
+        }
         // Always reconcile AND force a route re-install even if the target
         // is already the current active — this lets operators use `force`
         // to recover from a situation where an external actor (NetworkManager,

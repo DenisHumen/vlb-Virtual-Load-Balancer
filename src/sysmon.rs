@@ -11,7 +11,7 @@
 //! value types and a stateless `sample()` helper for tests.
 
 use serde::{Deserialize, Serialize};
-use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
+use sysinfo::{CpuRefreshKind, MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
 /// Flattened system snapshot that goes to the DB, the control port and
 /// the TUI. All numeric fields are intentionally plain primitives so the
@@ -100,7 +100,8 @@ impl SysMonitor {
     pub fn new() -> Self {
         let spec = RefreshKind::new()
             .with_cpu(CpuRefreshKind::everything())
-            .with_memory(MemoryRefreshKind::everything());
+            .with_memory(MemoryRefreshKind::everything())
+            .with_processes(ProcessRefreshKind::new());
         let sys = System::new_with_specifics(spec);
         Self {
             sys,
@@ -116,6 +117,10 @@ impl SysMonitor {
     pub fn sample(&mut self) -> SysSample {
         self.sys.refresh_cpu_all();
         self.sys.refresh_memory();
+        // Refresh process list so `procs` reflects reality. We use a
+        // minimal ProcessRefreshKind because we only need the count.
+        self.sys
+            .refresh_processes_specifics(ProcessesToUpdate::All, ProcessRefreshKind::new());
 
         // Compute host-wide network aggregate by summing every interface
         // reported by sysinfo. `Networks::new_with_refreshed_list` is used

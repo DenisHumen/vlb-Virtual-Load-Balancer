@@ -1,5 +1,5 @@
 ﻿[general]
-lan_interface = "enp0s18"
+lan_interface = "ens18"
 gateway_address = "10.0.0.100"
 
 [health]
@@ -39,20 +39,20 @@ per_core = true
 [[providers]]
 name = "isp-main"
 gateway = "10.0.0.2"
-interface = "enp0s18"
+interface = "ens18"
 priority = 0
 role = "primary"
 
 [[providers]]
 name = "isp-backup-a"
 gateway = "10.0.0.1"
-interface = "enp0s18"
+interface = "ens18"
 priority = 1
 role = "backup"
 
 [[providers]]
 name = "isp-backup-b"
 gateway = "10.0.1.1"
-interface = "enp0s18"
+interface = "ens18"
 priority = 2
 role = "backup"
