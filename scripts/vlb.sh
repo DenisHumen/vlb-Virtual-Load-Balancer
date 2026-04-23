@@ -8,6 +8,8 @@
 #   scripts/vlb.sh <command> [args...]
 #
 # Commands:
+#   (no args)          Alias of `up`: build (if needed) + start daemon + show status
+#   up                 Same as above — the one-shot "just start it" entry point
 #   build              Release build (cargo build --release)
 #   check              Validate configuration (no side effects)
 #   run                Run the balancer in the foreground (needs root on Linux)
@@ -57,7 +59,53 @@ warn() { printf '%b[!! ]%b %s\n' "$C_YLW" "$C_RST" "$*"; }
 die()  { printf '%b[err]%b %s\n' "$C_RED" "$C_RST" "$*" >&2; exit 1; }
 
 require_cargo() { command -v cargo >/dev/null || die "cargo not found — install Rust toolchain"; }
-require_bin()   { [[ -x "$VLB_BIN" ]] || { log "building release binary..."; cmd_build; }; }
+
+# Minimum Rust version required to build the project. Must match `rust-version`
+# in Cargo.toml. Transitive deps (clap_lex 1.1, anstream 1.0, serde 1.0.228)
+# use Cargo `edition2024`, which was stabilised in Rust 1.85.
+VLB_MIN_RUST="1.85.0"
+
+# Compare two dotted versions; returns 0 iff $1 >= $2.
+version_ge() {
+    [[ "$1" == "$2" ]] && return 0
+    local older
+    older=$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)
+    [[ "$older" == "$2" ]]
+}
+
+ensure_rust() {
+    if command -v rustc >/dev/null; then
+        local cur
+        cur=$(rustc --version | awk '{print $2}')
+        if version_ge "$cur" "$VLB_MIN_RUST"; then
+            return 0
+        fi
+        warn "rustc $cur found, but $VLB_MIN_RUST+ required"
+    else
+        warn "rustc not found"
+    fi
+
+    if command -v rustup >/dev/null; then
+        log "upgrading toolchain via rustup (rustup update stable && rustup default stable)"
+        rustup install stable >/dev/null
+        rustup default stable >/dev/null
+        return 0
+    fi
+
+    warn "rustup not installed — bootstrapping from https://sh.rustup.rs"
+    if ! command -v curl >/dev/null; then
+        die "need curl to bootstrap rustup; install it (or install Rust ≥$VLB_MIN_RUST manually) and rerun"
+    fi
+    # -y non-interactive, default profile, default stable.
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+        --default-toolchain stable --profile minimal
+    # shellcheck disable=SC1091
+    source "$HOME/.cargo/env"
+    command -v cargo >/dev/null || die "rustup install failed — see output above"
+    ok "rust toolchain installed: $(rustc --version)"
+}
+
+require_bin()   { [[ -x "$VLB_BIN" ]] || { ensure_rust; log "building release binary..."; cmd_build; }; }
 require_cfg()   { [[ -r "$VLB_CONFIG" ]] || die "config not readable: $VLB_CONFIG"; }
 
 is_running() {
@@ -68,9 +116,14 @@ is_running() {
 }
 
 cmd_build() {
+    ensure_rust
     require_cargo
-    log "cargo build --release"
-    cargo build --release
+    # --locked forces cargo to honour the shipped Cargo.lock so we don't
+    # pull transitive crates that need a newer Rust than our MSRV.
+    local lock_flag="--locked"
+    [[ -f "${REPO_DIR}/Cargo.lock" ]] || lock_flag=""
+    log "cargo build --release ${lock_flag}"
+    cargo build --release ${lock_flag}
     ok "built: $VLB_BIN"
 }
 
@@ -168,9 +221,22 @@ cmd_uninstall_service() {
 
 cmd_help() { sed -n '2,30p' "$0"; }
 
+cmd_up() {
+    # "just start everything" — build if needed, start daemon, show status.
+    require_bin
+    require_cfg
+    if ! is_running; then cmd_start; fi
+    cmd_status || true
+    log "done. attach the dashboard with:  $0 tui"
+    log "stop the daemon with:            $0 stop"
+}
+
 main() {
-    local cmd=${1:-help}; shift || true
+    # No args → full bring-up (build + start + status). This is the "just run
+    # it" path the operator asked for.
+    local cmd=${1:-up}; shift || true
     case "$cmd" in
+        up)                 cmd_up ;;
         build)              cmd_build ;;
         check)              cmd_check ;;
         run)                cmd_run ;;

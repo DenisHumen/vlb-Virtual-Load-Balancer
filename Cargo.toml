@@ -2,7 +2,10 @@
 name = "virtual-load-balancer"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+# MSRV 1.85 — required because our transitive deps (clap_lex 1.1, anstream 1.0,
+# serde 1.0.228, etc.) have adopted Cargo `edition2024`. The launcher script
+# (`scripts/vlb.sh`) will bootstrap rustup/stable automatically if needed.
+rust-version = "1.85"
 description = "High-performance multi-provider failover gateway for Linux"
 license = "MIT"
 
