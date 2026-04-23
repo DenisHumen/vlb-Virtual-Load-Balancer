@@ -569,8 +569,27 @@ impl Balancer {
         let retention = self.cfg.traffic.retention_hours;
         let mut prev: HashMap<String, traffic::IfCounters> = HashMap::new();
         let mut last_prune = Utc::now();
+        let mut first_sample_logged = false;
+        let mut missing_warned: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
-        // Seed `prev` on the first tick; we emit deltas only after that.
+        // Distinct interfaces we actually need to sample (multiple providers
+        // may share one LAN NIC — sampling it 3× per tick was wasteful and
+        // caused stale-prev bugs).
+        let watched: Vec<String> = {
+            let mut seen = std::collections::HashSet::new();
+            self.cfg
+                .providers
+                .iter()
+                .filter_map(|p| seen.insert(p.interface.clone()).then(|| p.interface.clone()))
+                .collect()
+        };
+        info!(
+            interval_s = interval.as_secs(),
+            interfaces = ?watched,
+            "traffic: sampling started"
+        );
+
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -593,31 +612,55 @@ impl Balancer {
                 }
             };
 
+            // 1. Compute per-interface deltas once (fixes the bug where
+            //    providers sharing an interface got 0 deltas because `prev`
+            //    had already been overwritten by the previous iteration).
             let now = Utc::now();
-            for p in &self.cfg.providers {
-                let Some(curr) = snap.get(&p.interface).copied() else {
-                    continue;
-                };
-                if let Some(prev_c) = prev.get(&p.interface).copied() {
-                    if let Some(d) = traffic::delta(prev_c, curr) {
-                        let secs = interval.as_secs_f64();
-                        if let Err(e) = self.stats.record_traffic(
-                            &p.name,
-                            &p.interface,
-                            now,
-                            secs,
-                            &d,
-                        ) {
-                            warn!(error = %e, "traffic: failed to persist sample");
-                        }
-                    } else {
-                        debug!(
-                            iface = %p.interface,
-                            "traffic: counter reset detected, skipping sample"
+            let mut iface_delta: HashMap<String, traffic::IfCounters> = HashMap::new();
+            for iface in &watched {
+                let Some(curr) = snap.get(iface).copied() else {
+                    if missing_warned.insert(iface.clone()) {
+                        warn!(
+                            iface = %iface,
+                            "traffic: interface not found in /proc/net/dev — \
+                             check `ip link` and the config `interface = ...` values"
                         );
                     }
+                    continue;
+                };
+                if let Some(prev_c) = prev.get(iface).copied() {
+                    if let Some(d) = traffic::delta(prev_c, curr) {
+                        iface_delta.insert(iface.clone(), d);
+                    } else {
+                        debug!(iface = %iface, "traffic: counter reset, skipping");
+                    }
                 }
-                prev.insert(p.interface.clone(), curr);
+                prev.insert(iface.clone(), curr);
+            }
+
+            // 2. Persist one row per provider using the cached delta.
+            for p in &self.cfg.providers {
+                let Some(d) = iface_delta.get(&p.interface).copied() else {
+                    continue;
+                };
+                if let Err(e) = self.stats.record_traffic(
+                    &p.name,
+                    &p.interface,
+                    now,
+                    interval.as_secs_f64(),
+                    &d,
+                ) {
+                    warn!(error = %e, provider = %p.name, "traffic: persist failed");
+                } else if !first_sample_logged {
+                    info!(
+                        provider = %p.name,
+                        iface = %p.interface,
+                        rx_bytes = d.rx_bytes,
+                        tx_bytes = d.tx_bytes,
+                        "traffic: first sample recorded"
+                    );
+                    first_sample_logged = true;
+                }
             }
 
             // Prune at most once per hour.

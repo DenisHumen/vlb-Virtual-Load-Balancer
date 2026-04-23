@@ -74,6 +74,11 @@ enum Command {
         #[arg(long, default_value_t = 60)]
         limit: u32,
     },
+    /// Diagnostic dump: configured interfaces vs /proc/net/dev, DB row
+    /// counts per provider. Use this when the TUI shows "samples: 0" to
+    /// tell whether the daemon is sampling, whether counters are moving,
+    /// and whether the DB contains anything.
+    Diag,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -136,6 +141,11 @@ async fn main() -> Result<()> {
                 control::send(&config.control.listen, &Request::System { limit }).await?;
             print_response(&resp);
             Ok(())
+        }
+        Command::Diag => {
+            let config = Config::load(&cli.config)?;
+            config.validate()?;
+            diag(&config).await
         }
         Command::Run => run(cli).await,
     }
@@ -202,4 +212,97 @@ async fn wait_for_shutdown() {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
+}
+
+/// `vlb diag` — inspect the live sampling chain without touching the daemon.
+///
+/// Prints:
+///   1. Configured provider interfaces and whether each appears in
+///      `/proc/net/dev` (with current rx/tx byte counters).
+///   2. Whether the daemon is reachable on the control port.
+///   3. Row counts per provider in `traffic_samples` and `system_samples`
+///      along with the most recent timestamp.
+///
+/// This is the first thing to run when the TUI shows `samples: 0`.
+async fn diag(config: &Config) -> Result<()> {
+    println!("== vlb diag ==");
+    println!("config path used      : (loaded and validated)");
+    println!("database path         : {}", config.database.path.display());
+    println!("traffic enabled       : {}", config.traffic.enabled);
+    println!("traffic interval_secs : {}", config.traffic.interval_secs);
+    println!("control listen        : {}", config.control.listen);
+    println!();
+
+    // 1. /proc/net/dev snapshot for every interface we care about.
+    println!("-- interfaces (/proc/net/dev) --");
+    let snap = traffic::snapshot().await.unwrap_or_default();
+    let mut seen = std::collections::HashSet::new();
+    for p in &config.providers {
+        if !seen.insert(p.interface.clone()) {
+            continue;
+        }
+        match snap.get(&p.interface) {
+            Some(c) => println!(
+                "  {:<12} OK  rx_bytes={:>15}  tx_bytes={:>15}  rx_pkts={:>10}  tx_pkts={:>10}",
+                p.interface, c.rx_bytes, c.tx_bytes, c.rx_packets, c.tx_packets
+            ),
+            None => println!(
+                "  {:<12} MISSING — not found in /proc/net/dev (check `ip link`)",
+                p.interface
+            ),
+        }
+    }
+    println!();
+
+    // 2. control port reachability.
+    println!("-- control port --");
+    match control::send(&config.control.listen, &control::Request::Status).await {
+        Ok(_) => println!("  {} reachable — daemon is up", config.control.listen),
+        Err(e) => println!("  {} UNREACHABLE: {e}", config.control.listen),
+    }
+    println!();
+
+    // 3. DB row counts. Opened read-only to avoid any accidental writes
+    //    stepping on a running daemon.
+    println!("-- database row counts --");
+    match rusqlite::Connection::open_with_flags(
+        &config.database.path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Err(e) => println!("  cannot open DB: {e}"),
+        Ok(conn) => {
+            for p in &config.providers {
+                let row: rusqlite::Result<(i64, Option<String>)> = conn.query_row(
+                    "SELECT COUNT(*), MAX(ts) FROM traffic_samples WHERE provider = ?1",
+                    rusqlite::params![p.name],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                );
+                match row {
+                    Ok((n, ts)) => println!(
+                        "  traffic {:<14} rows={:>6}  last={}",
+                        p.name,
+                        n,
+                        ts.unwrap_or_else(|| "—".into())
+                    ),
+                    Err(e) => println!("  traffic {:<14} query error: {e}", p.name),
+                }
+            }
+            let sys_row: rusqlite::Result<(i64, Option<String>)> = conn.query_row(
+                "SELECT COUNT(*), MAX(ts) FROM system_samples",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            );
+            match sys_row {
+                Ok((n, ts)) => println!(
+                    "  system                rows={:>6}  last={}",
+                    n,
+                    ts.unwrap_or_else(|| "—".into())
+                ),
+                Err(e) => println!("  system query error: {e}"),
+            }
+        }
+    }
+    Ok(())
 }

@@ -20,6 +20,7 @@
 #   tui                Attach the btop-style interactive dashboard
 #   stats              Print a stats report (default: last 1h)
 #   system             Fetch recent host metric samples (JSON)
+#   diag               Diagnostic dump (interfaces, DB rows, control port)
 #   logs               Tail the daemon log file
 #   install-service    Install + enable systemd/vlb.service (Linux, root)
 #   uninstall-service  Disable + remove the installed systemd unit
@@ -190,6 +191,7 @@ cmd_status() {
 cmd_tui()    { require_bin; require_cfg; exec "$VLB_BIN" --config "$VLB_CONFIG" tui; }
 cmd_stats()  { require_bin; require_cfg; "$VLB_BIN" --config "$VLB_CONFIG" stats "$@"; }
 cmd_system() { require_bin; require_cfg; "$VLB_BIN" --config "$VLB_CONFIG" system "$@"; }
+cmd_diag()   { require_bin; require_cfg; "$VLB_BIN" --config "$VLB_CONFIG" diag; }
 
 cmd_logs() {
     [[ -f "$VLB_LOG" ]] || die "no log file at $VLB_LOG"
@@ -247,6 +249,7 @@ main() {
         tui)                cmd_tui ;;
         stats)              cmd_stats "$@" ;;
         system)             cmd_system "$@" ;;
+        diag)               cmd_diag ;;
         logs)               cmd_logs ;;
         install-service)    cmd_install_service ;;
         uninstall-service)  cmd_uninstall_service ;;
