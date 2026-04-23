@@ -11,6 +11,7 @@
 #   (no args)          Alias of `up`: build (if needed) + start daemon + show status
 #   up                 Same as above — the one-shot "just start it" entry point
 #   build              Release build (cargo build --release)
+#   rebuild            Delete binary, rebuild from scratch, restart if running
 #   check              Validate configuration (no side effects)
 #   run                Run the balancer in the foreground (needs root on Linux)
 #   start              Build + daemonise in background, record PID
@@ -106,7 +107,29 @@ ensure_rust() {
     ok "rust toolchain installed: $(rustc --version)"
 }
 
-require_bin()   { [[ -x "$VLB_BIN" ]] || { ensure_rust; log "building release binary..."; cmd_build; }; }
+require_bin() {
+    # Rebuild when the binary is missing OR when any source file (Cargo.toml,
+    # Cargo.lock, anything under src/) is newer than it. Without this, a
+    # stale binary from a previous build would silently be used after edits —
+    # which is exactly how operators end up debugging "fixed" code.
+    local need_build=0
+    if [[ ! -x "$VLB_BIN" ]]; then
+        need_build=1
+    else
+        local newer
+        newer=$(find "${REPO_DIR}/src" "${REPO_DIR}/Cargo.toml" "${REPO_DIR}/Cargo.lock" \
+                     -type f -newer "$VLB_BIN" -print -quit 2>/dev/null || true)
+        if [[ -n "$newer" ]]; then
+            log "source newer than binary ($newer) — rebuilding"
+            need_build=1
+        fi
+    fi
+    if (( need_build )); then
+        ensure_rust
+        log "building release binary..."
+        cmd_build
+    fi
+}
 require_cfg()   { [[ -r "$VLB_CONFIG" ]] || die "config not readable: $VLB_CONFIG"; }
 
 is_running() {
@@ -128,6 +151,17 @@ cmd_build() {
     ok "built: $VLB_BIN"
 }
 
+cmd_rebuild() {
+    # Force a fresh build regardless of timestamps, then restart.
+    rm -f "$VLB_BIN"
+    cmd_build
+    if is_running; then
+        log "restarting with new binary"
+        cmd_stop
+        cmd_start
+    fi
+}
+
 cmd_check() {
     require_bin; require_cfg
     "$VLB_BIN" --config "$VLB_CONFIG" check
@@ -144,10 +178,18 @@ cmd_start() {
         warn "already running (pid $(cat "$VLB_PID"))"
         return 0
     fi
+    # Guard against a stale second daemon — systemd unit or a previous run
+    # with a different pid file could still be holding the control port.
+    local listen port
+    listen=$(grep -E '^\s*listen\s*=' "$VLB_CONFIG" | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+    port=${listen##*:}
+    if [[ -n "$port" ]] && command -v ss >/dev/null && ss -ltn "sport = :$port" 2>/dev/null | grep -q LISTEN; then
+        warn "port $port already in use — another vlb instance (maybe systemd) is running"
+        warn "stop it first:  sudo systemctl stop vlb  ||  pkill -x vlb"
+        die "refusing to start a second daemon"
+    fi
     "$VLB_BIN" --config "$VLB_CONFIG" check
     log "starting daemon, log=$VLB_LOG pid=$VLB_PID"
-    # nohup + setsid so the daemon survives the script exit and is its own
-    # session leader. stdout/stderr → log file.
     nohup setsid "$VLB_BIN" --config "$VLB_CONFIG" run \
         >>"$VLB_LOG" 2>&1 &
     echo $! >"$VLB_PID"
@@ -240,6 +282,7 @@ main() {
     case "$cmd" in
         up)                 cmd_up ;;
         build)              cmd_build ;;
+        rebuild)            cmd_rebuild ;;
         check)              cmd_check ;;
         run)                cmd_run ;;
         start)              cmd_start ;;
