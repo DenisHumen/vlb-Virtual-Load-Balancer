@@ -5,6 +5,8 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use crate::config::Provider;
+use crate::sysmon::SysSample;
+use crate::traffic::IfCounters;
 
 pub struct Stats {
     conn: Mutex<Connection>,
@@ -25,6 +27,34 @@ pub struct FailoverRecord {
     pub from_provider: Option<String>,
     pub to_provider: String,
     pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TrafficPoint {
+    pub ts: DateTime<Utc>,
+    pub interval_s: f64,
+    pub rx_bytes: u64,
+    pub rx_packets: u64,
+    pub tx_bytes: u64,
+    pub tx_packets: u64,
+}
+
+/// Aggregate over a time window. Totals are i64 because SQLite's SUM is
+/// signed; values are non-negative in practice.
+#[derive(Debug, Clone)]
+pub struct TrafficTotals {
+    pub provider: String,
+    pub rx_bytes: i64,
+    pub rx_packets: i64,
+    pub tx_bytes: i64,
+    pub tx_packets: i64,
+}
+
+/// One row of `system_samples`, wire-compatible with the control protocol.
+#[derive(Debug, Clone)]
+pub struct SystemPoint {
+    pub ts: DateTime<Utc>,
+    pub sample: SysSample,
 }
 
 impl Stats {
@@ -114,11 +144,240 @@ impl Stats {
         Ok(())
     }
 
+    pub fn record_traffic(
+        &self,
+        provider: &str,
+        interface: &str,
+        ts: DateTime<Utc>,
+        interval_s: f64,
+        delta: &IfCounters,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO traffic_samples(
+                ts, provider, interface, interval_s,
+                rx_bytes, rx_packets, tx_bytes, tx_packets
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                ts.to_rfc3339(),
+                provider,
+                interface,
+                interval_s,
+                delta.rx_bytes as i64,
+                delta.rx_packets as i64,
+                delta.tx_bytes as i64,
+                delta.tx_packets as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Remove traffic samples older than `retention_hours`. Cheap — the
+    /// index on `ts` turns it into a range delete.
+    pub fn prune_traffic(&self, retention_hours: u32) -> Result<usize> {
+        if retention_hours == 0 {
+            return Ok(0);
+        }
+        let window = format!("-{retention_hours} hours");
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM traffic_samples WHERE ts < datetime('now', ?1)",
+            params![window],
+        )?;
+        Ok(n)
+    }
+
+    /// Sum rx/tx bytes+packets per provider over a trailing time window.
+    pub fn traffic_totals(&self, hours: u32) -> Result<Vec<TrafficTotals>> {
+        let window = format!("-{hours} hours");
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT provider,
+                    COALESCE(SUM(rx_bytes), 0),
+                    COALESCE(SUM(rx_packets), 0),
+                    COALESCE(SUM(tx_bytes), 0),
+                    COALESCE(SUM(tx_packets), 0)
+             FROM traffic_samples
+             WHERE ts >= datetime('now', ?1)
+             GROUP BY provider
+             ORDER BY provider",
+        )?;
+        let rows = stmt.query_map(params![window], |row| {
+            Ok(TrafficTotals {
+                provider: row.get::<_, String>(0)?,
+                rx_bytes: row.get::<_, i64>(1)?,
+                rx_packets: row.get::<_, i64>(2)?,
+                tx_bytes: row.get::<_, i64>(3)?,
+                tx_packets: row.get::<_, i64>(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Latest N traffic samples for a single provider, oldest-first. Used
+    /// by the TUI to draw sparklines without having to keep in-memory
+    /// buffers duplicated between the daemon and the viewer.
+    pub fn recent_traffic(
+        &self,
+        provider: &str,
+        limit: u32,
+    ) -> Result<Vec<TrafficPoint>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT ts, interval_s, rx_bytes, rx_packets, tx_bytes, tx_packets
+             FROM traffic_samples
+             WHERE provider = ?1
+             ORDER BY id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![provider, limit], |row| {
+            let ts_str: String = row.get(0)?;
+            let ts = DateTime::parse_from_rfc3339(&ts_str)
+                .map(|t| t.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            Ok(TrafficPoint {
+                ts,
+                interval_s: row.get(1)?,
+                rx_bytes: row.get::<_, i64>(2)? as u64,
+                rx_packets: row.get::<_, i64>(3)? as u64,
+                tx_bytes: row.get::<_, i64>(4)? as u64,
+                tx_packets: row.get::<_, i64>(5)? as u64,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        out.reverse();
+        Ok(out)
+    }
+
+    /// Record one system sample. `per_core_json` is `None` when the config
+    /// disables per-core storage (saves ~16 bytes/core/sample).
+    pub fn record_system(
+        &self,
+        ts: DateTime<Utc>,
+        s: &SysSample,
+        store_per_core: bool,
+    ) -> Result<()> {
+        let per_core_json = if store_per_core {
+            Some(serde_json::to_string(&s.cpu_per_core).unwrap_or_else(|_| "[]".into()))
+        } else {
+            None
+        };
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO system_samples(
+                ts, cpu_total, cpu_per_core,
+                mem_total, mem_used, mem_available,
+                swap_total, swap_used,
+                load1, load5, load15,
+                net_rx_bytes, net_tx_bytes,
+                disk_total, disk_used,
+                uptime_s, procs
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+            params![
+                ts.to_rfc3339(),
+                s.cpu_total as f64,
+                per_core_json,
+                s.mem_total as i64,
+                s.mem_used as i64,
+                s.mem_available as i64,
+                s.swap_total as i64,
+                s.swap_used as i64,
+                s.load1,
+                s.load5,
+                s.load15,
+                s.net_rx_bytes as i64,
+                s.net_tx_bytes as i64,
+                s.disk_total as i64,
+                s.disk_used as i64,
+                s.uptime_s as i64,
+                s.procs as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Range-delete old system samples. Returns the number of rows removed.
+    pub fn prune_system(&self, retention_hours: u32) -> Result<usize> {
+        if retention_hours == 0 {
+            return Ok(0);
+        }
+        let window = format!("-{retention_hours} hours");
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM system_samples WHERE ts < datetime('now', ?1)",
+            params![window],
+        )?;
+        Ok(n)
+    }
+
+    /// Latest N system samples, oldest-first. The TUI uses this for
+    /// CPU/RAM/LOAD sparklines.
+    pub fn recent_system(&self, limit: u32) -> Result<Vec<SystemPoint>> {
+        let limit = limit.min(10_000);
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT ts, cpu_total, cpu_per_core,
+                    mem_total, mem_used, mem_available,
+                    swap_total, swap_used,
+                    load1, load5, load15,
+                    net_rx_bytes, net_tx_bytes,
+                    disk_total, disk_used,
+                    uptime_s, procs
+             FROM system_samples
+             ORDER BY id DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| {
+            let ts_str: String = row.get(0)?;
+            let ts = DateTime::parse_from_rfc3339(&ts_str)
+                .map(|t| t.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            let per_core_json: Option<String> = row.get(2)?;
+            let cpu_per_core: Vec<f32> = per_core_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            Ok(SystemPoint {
+                ts,
+                sample: SysSample {
+                    cpu_total: row.get::<_, f64>(1)? as f32,
+                    cpu_per_core,
+                    mem_total: row.get::<_, i64>(3)? as u64,
+                    mem_used: row.get::<_, i64>(4)? as u64,
+                    mem_available: row.get::<_, i64>(5)? as u64,
+                    swap_total: row.get::<_, i64>(6)? as u64,
+                    swap_used: row.get::<_, i64>(7)? as u64,
+                    load1: row.get(8)?,
+                    load5: row.get(9)?,
+                    load15: row.get(10)?,
+                    net_rx_bytes: row.get::<_, i64>(11)? as u64,
+                    net_tx_bytes: row.get::<_, i64>(12)? as u64,
+                    disk_total: row.get::<_, i64>(13)? as u64,
+                    disk_used: row.get::<_, i64>(14)? as u64,
+                    uptime_s: row.get::<_, i64>(15)? as u64,
+                    procs: row.get::<_, i64>(16)? as u64,
+                },
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        out.reverse();
+        Ok(out)
+    }
+
     /// Aggregated, human-readable report across the trailing `hours` window.
     /// Used by the `vlb stats` CLI subcommand; the query runs read-only and
     /// does not block probe writers for any meaningful duration.
-    pub fn report(&self, hours: u32, recent: u32) -> Result<String> {
-        use std::fmt::Write;
+    pub fn report(&self, hours: u32, recent: u32) -> Result<String> {        use std::fmt::Write;
         let conn = self.conn.lock().unwrap();
         let window = format!("-{hours} hours");
 
@@ -166,10 +425,96 @@ impl Stats {
             let _ = writeln!(s, "(no health-check samples in window)");
         }
 
+        // Traffic totals per provider over the same window. We have to
+        // release the connection lock before calling `traffic_totals`
+        // because it re-acquires the same mutex internally.
+        drop(rows);
+        drop(stmt);
+        drop(conn);
+        let traffic = self.traffic_totals(hours).unwrap_or_default();
+        let _ = writeln!(s);
+        let _ = writeln!(s, "traffic totals:");
+        let _ = writeln!(s, "{}", "-".repeat(72));
+        let _ = writeln!(
+            s,
+            "{:<18} {:>14} {:>12} {:>14} {:>12}",
+            "provider", "rx_bytes", "rx_pkts", "tx_bytes", "tx_pkts"
+        );
+        if traffic.is_empty() {
+            let _ = writeln!(s, "(no traffic samples in window)");
+        } else {
+            for t in &traffic {
+                let _ = writeln!(
+                    s,
+                    "{:<18} {:>14} {:>12} {:>14} {:>12}",
+                    t.provider, t.rx_bytes, t.rx_packets, t.tx_bytes, t.tx_packets
+                );
+            }
+        }
+
+        // System load aggregate over the same window. Cheap single-row query.
+        type SysAgg = (f64, f64, f64, f64, f64, f64, i64, i64);
+        let sys_agg: Option<SysAgg> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT AVG(cpu_total), MAX(cpu_total),
+                        AVG(mem_used),  MAX(mem_used),
+                        AVG(load1),     MAX(load1),
+                        MAX(mem_total), MAX(swap_used)
+                 FROM system_samples
+                 WHERE ts >= datetime('now', ?1)",
+            )?;
+            let mut rows = stmt.query(params![window])?;
+            if let Some(row) = rows.next()? {
+                let avg_cpu: Option<f64> = row.get(0)?;
+                let max_cpu: Option<f64> = row.get(1)?;
+                let avg_mem: Option<f64> = row.get(2)?;
+                let max_mem: Option<f64> = row.get(3)?;
+                let avg_load: Option<f64> = row.get(4)?;
+                let max_load: Option<f64> = row.get(5)?;
+                let mem_total: Option<i64> = row.get(6)?;
+                let max_swap: Option<i64> = row.get(7)?;
+                match (avg_cpu, max_cpu, avg_mem, max_mem, avg_load, max_load, mem_total, max_swap) {
+                    (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f), Some(g), Some(h)) => {
+                        Some((a, b, c, d, e, f, g, h))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        };
+        let _ = writeln!(s);
+        let _ = writeln!(s, "system load (btop-style aggregate):");
+        let _ = writeln!(s, "{}", "-".repeat(72));
+        if let Some((avg_cpu, max_cpu, avg_mem, max_mem, avg_load, max_load, mem_total, max_swap)) =
+            sys_agg
+        {
+            let mem_total_f = mem_total as f64;
+            let avg_mem_pct = if mem_total_f > 0.0 { avg_mem / mem_total_f * 100.0 } else { 0.0 };
+            let max_mem_pct = if mem_total_f > 0.0 { max_mem / mem_total_f * 100.0 } else { 0.0 };
+            let _ = writeln!(
+                s,
+                "cpu   avg {avg_cpu:>6.2}%  max {max_cpu:>6.2}%"
+            );
+            let _ = writeln!(
+                s,
+                "mem   avg {avg_mem_pct:>6.2}%  max {max_mem_pct:>6.2}%  (total {})",
+                fmt_bytes_inline(mem_total as u64),
+            );
+            let _ = writeln!(
+                s,
+                "load  avg {avg_load:>6.2}   max {max_load:>6.2}   swap_peak {}",
+                fmt_bytes_inline(max_swap as u64),
+            );
+        } else {
+            let _ = writeln!(s, "(no system samples in window)");
+        }
+        let conn = self.conn.lock().unwrap();
+
         // Recent failovers.
         let _ = writeln!(s);
-        let _ = writeln!(s, "recent failovers (last {recent}):");
-        let _ = writeln!(s, "{}", "-".repeat(72));
+        let _ = writeln!(s, "recent failovers (last {recent}):");        let _ = writeln!(s, "{}", "-".repeat(72));
         let mut stmt = conn.prepare(
             "SELECT ts, from_provider, to_provider, reason
              FROM failover_events
@@ -192,6 +537,21 @@ impl Stats {
         }
 
         Ok(s)
+    }
+}
+
+fn fmt_bytes_inline(n: u64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let mut v = n as f64;
+    let mut u = 0usize;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{n} {}", UNITS[u])
+    } else {
+        format!("{v:.2} {}", UNITS[u])
     }
 }
 
@@ -231,6 +591,42 @@ CREATE TABLE IF NOT EXISTS state_changes (
     state    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_state_provider_ts ON state_changes(provider, ts);
+
+CREATE TABLE IF NOT EXISTS traffic_samples (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          TEXT NOT NULL,
+    provider    TEXT NOT NULL,
+    interface   TEXT NOT NULL,
+    interval_s  REAL NOT NULL,
+    rx_bytes    INTEGER NOT NULL,
+    rx_packets  INTEGER NOT NULL,
+    tx_bytes    INTEGER NOT NULL,
+    tx_packets  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_traffic_provider_ts ON traffic_samples(provider, ts);
+CREATE INDEX IF NOT EXISTS idx_traffic_ts          ON traffic_samples(ts);
+
+CREATE TABLE IF NOT EXISTS system_samples (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts            TEXT    NOT NULL,
+    cpu_total     REAL    NOT NULL,
+    cpu_per_core  TEXT,                    -- JSON array of per-core %, optional
+    mem_total     INTEGER NOT NULL,
+    mem_used      INTEGER NOT NULL,
+    mem_available INTEGER NOT NULL,
+    swap_total    INTEGER NOT NULL,
+    swap_used     INTEGER NOT NULL,
+    load1         REAL    NOT NULL,
+    load5         REAL    NOT NULL,
+    load15        REAL    NOT NULL,
+    net_rx_bytes  INTEGER NOT NULL,
+    net_tx_bytes  INTEGER NOT NULL,
+    disk_total    INTEGER NOT NULL,
+    disk_used     INTEGER NOT NULL,
+    uptime_s      INTEGER NOT NULL,
+    procs         INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_system_ts ON system_samples(ts);
 
 -- Convenience view: per-provider rolling success ratio over last 1h.
 CREATE VIEW IF NOT EXISTS provider_health_summary AS

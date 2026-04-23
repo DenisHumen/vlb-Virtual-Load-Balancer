@@ -15,6 +15,12 @@ pub struct Config {
     pub routing: RoutingConfig,
     #[serde(default)]
     pub database: DatabaseConfig,
+    #[serde(default)]
+    pub control: ControlConfig,
+    #[serde(default)]
+    pub traffic: TrafficConfig,
+    #[serde(default)]
+    pub system: SystemConfig,
     pub providers: Vec<Provider>,
 }
 
@@ -124,6 +130,78 @@ impl Default for DatabaseConfig {
 }
 
 fn default_db_path() -> PathBuf { PathBuf::from("/var/lib/vlb/stats.db") }
+
+/// Where the balancer's control server listens. The TUI and the CLI
+/// `vlb force` / `vlb status` subcommands connect here. Default is a
+/// localhost-only TCP port — no auth, so do NOT expose externally.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ControlConfig {
+    #[serde(default = "default_control_listen")]
+    pub listen: String,
+}
+
+impl Default for ControlConfig {
+    fn default() -> Self { Self { listen: default_control_listen() } }
+}
+
+fn default_control_listen() -> String { "127.0.0.1:7650".to_string() }
+
+/// Traffic counter sampling. We read `/proc/net/dev` for each provider
+/// interface and derive per-tick rx/tx deltas, both in bytes and packets.
+#[derive(Debug, Deserialize, Clone)]
+pub struct TrafficConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_traffic_interval")]
+    pub interval_secs: u64,
+    /// How long raw samples are kept before being pruned. 0 disables pruning.
+    #[serde(default = "default_traffic_retention")]
+    pub retention_hours: u32,
+}
+
+impl Default for TrafficConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: default_traffic_interval(),
+            retention_hours: default_traffic_retention(),
+        }
+    }
+}
+
+fn default_traffic_interval() -> u64 { 2 }
+fn default_traffic_retention() -> u32 { 72 }
+
+/// Host-wide system metrics sampling (btop-style: CPU/RAM/swap/load/disks).
+/// The same DB that stores traffic also stores system samples, so the TUI
+/// can render everything from a single live query.
+#[derive(Debug, Deserialize, Clone)]
+pub struct SystemConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_system_interval")]
+    pub interval_secs: u64,
+    #[serde(default = "default_system_retention")]
+    pub retention_hours: u32,
+    /// Store per-core CPU % as a JSON array in the DB. Costs ~16 bytes per
+    /// core per sample; disable on large-SMT boxes if DB size matters.
+    #[serde(default = "default_true")]
+    pub per_core: bool,
+}
+
+impl Default for SystemConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: default_system_interval(),
+            retention_hours: default_system_retention(),
+            per_core: true,
+        }
+    }
+}
+
+fn default_system_interval() -> u64 { 2 }
+fn default_system_retention() -> u32 { 72 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Provider {
@@ -287,6 +365,40 @@ impl Config {
             bail!("routing.fwmark_base + max priority overflows u32");
         }
 
+        // Control server: empty listen is a config error; parse validated by
+        // the listener itself, but we eagerly check so `vlb check` catches
+        // typos before service start.
+        if self.control.listen.trim().is_empty() {
+            bail!("control.listen must not be empty");
+        }
+        let parsed_listen: std::net::SocketAddr = self
+            .control
+            .listen
+            .parse()
+            .map_err(|_| anyhow::anyhow!(
+                "control.listen '{}' is not a valid IP:port (example: 127.0.0.1:7650)",
+                self.control.listen
+            ))?;
+        // The control protocol is unauthenticated. Binding it to anything
+        // other than a loopback address would let any host on the network
+        // force a provider over to themselves or read traffic stats. We
+        // hard-fail here so a misconfiguration never makes it to runtime.
+        if !parsed_listen.ip().is_loopback() {
+            bail!(
+                "control.listen '{}' is not a loopback address — the control \
+                 protocol has no authentication and must only bind to 127.0.0.1 \
+                 or ::1. Put a reverse-proxy with auth in front if remote \
+                 access is required.",
+                self.control.listen
+            );
+        }
+        if self.traffic.enabled && self.traffic.interval_secs == 0 {
+            bail!("traffic.interval_secs must be >= 1 when traffic.enabled = true");
+        }
+        if self.system.enabled && self.system.interval_secs == 0 {
+            bail!("system.interval_secs must be >= 1 when system.enabled = true");
+        }
+
         Ok(())
     }
 
@@ -331,6 +443,21 @@ impl Config {
         );
         let _ = writeln!(s, "database:");
         let _ = writeln!(s, "  path={}", self.database.path.display());
+        let _ = writeln!(s, "control:");
+        let _ = writeln!(s, "  listen={}", self.control.listen);
+        let _ = writeln!(
+            s,
+            "traffic:\n  enabled={} interval={}s retention={}h",
+            self.traffic.enabled, self.traffic.interval_secs, self.traffic.retention_hours
+        );
+        let _ = writeln!(
+            s,
+            "system:\n  enabled={} interval={}s retention={}h per_core={}",
+            self.system.enabled,
+            self.system.interval_secs,
+            self.system.retention_hours,
+            self.system.per_core
+        );
         let _ = writeln!(s, "providers ({}):", self.providers.len());
         let mut sorted: Vec<&Provider> = self.providers.iter().collect();
         sorted.sort_by_key(|p| p.priority);
@@ -392,6 +519,9 @@ mod tests {
             firewall: FirewallConfig::default(),
             routing: RoutingConfig::default(),
             database: DatabaseConfig::default(),
+            control: ControlConfig::default(),
+            traffic: TrafficConfig::default(),
+            system: SystemConfig::default(),
             providers,
         }
     }
@@ -467,6 +597,24 @@ mod tests {
         let mut cfg = base_cfg(vec![provider("p", 0)]);
         cfg.health.probe_targets = vec!["127.0.0.1".parse().unwrap()];
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_non_loopback_control_listen() {
+        let mut cfg = base_cfg(vec![provider("p", 0)]);
+        cfg.control.listen = "0.0.0.0:7650".into();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("loopback"),
+            "expected loopback-only error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_ipv6_loopback_listen() {
+        let mut cfg = base_cfg(vec![provider("p", 0)]);
+        cfg.control.listen = "[::1]:7650".into();
+        cfg.validate().unwrap();
     }
 
     #[test]

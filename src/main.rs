@@ -5,14 +5,19 @@ use tokio::sync::watch;
 
 mod balancer;
 mod config;
+mod control;
 mod health;
 mod logger;
 mod router;
 mod stats;
 mod system;
+mod sysmon;
+mod traffic;
+mod tui;
 
 use crate::balancer::Balancer;
 use crate::config::Config;
+use crate::control::{Request, Response};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -49,6 +54,26 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         recent: u32,
     },
+    /// Interactive terminal dashboard. Connects to the running daemon's
+    /// control port (taken from the config file) to display live status,
+    /// rx/tx graphs per provider, and to force-select a provider.
+    Tui,
+    /// Query the running daemon for a JSON status snapshot.
+    Status,
+    /// Pin the active provider (override). The daemon will keep this
+    /// provider active for as long as it stays healthy.
+    Force {
+        /// Provider name to force.
+        provider: String,
+    },
+    /// Release an operator pin and return to automatic selection.
+    Auto,
+    /// Query the running daemon for recent host metrics (CPU/RAM/load/etc).
+    System {
+        /// How many recent samples to fetch (clamped to 10_000).
+        #[arg(long, default_value_t = 60)]
+        limit: u32,
+    },
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -74,7 +99,52 @@ async fn main() -> Result<()> {
             println!("{report}");
             Ok(())
         }
+        Command::Tui => {
+            let config = Config::load(&cli.config)?;
+            config.validate()?;
+            tui::run(config.control.listen).await
+        }
+        Command::Status => {
+            let config = Config::load(&cli.config)?;
+            config.validate()?;
+            let resp = control::send(&config.control.listen, &Request::Status).await?;
+            print_response(&resp);
+            Ok(())
+        }
+        Command::Force { provider } => {
+            let config = Config::load(&cli.config)?;
+            config.validate()?;
+            let resp = control::send(
+                &config.control.listen,
+                &Request::Force { provider },
+            )
+            .await?;
+            print_response(&resp);
+            Ok(())
+        }
+        Command::Auto => {
+            let config = Config::load(&cli.config)?;
+            config.validate()?;
+            let resp = control::send(&config.control.listen, &Request::Auto).await?;
+            print_response(&resp);
+            Ok(())
+        }
+        Command::System { limit } => {
+            let config = Config::load(&cli.config)?;
+            config.validate()?;
+            let resp =
+                control::send(&config.control.listen, &Request::System { limit }).await?;
+            print_response(&resp);
+            Ok(())
+        }
         Command::Run => run(cli).await,
+    }
+}
+
+fn print_response(resp: &Response) {
+    match serde_json::to_string_pretty(resp) {
+        Ok(s) => println!("{s}"),
+        Err(_) => println!("{resp:?}"),
     }
 }
 

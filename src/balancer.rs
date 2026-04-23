@@ -1,19 +1,24 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use colored::Colorize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::{watch, RwLock};
 use tokio::task::JoinHandle;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, Provider};
+use crate::control;
 use crate::health::{check_gateway, check_internet_via};
 use crate::router::Router;
-use crate::stats::{FailoverRecord, HealthRecord, Stats};
+use crate::stats::{FailoverRecord, HealthRecord, Stats, SystemPoint, TrafficPoint};
+use crate::sysmon::SysMonitor;
+use crate::traffic;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum State {
     Up,
     Down,
@@ -28,6 +33,8 @@ impl State {
             State::Unknown => "unknown",
         }
     }
+
+    pub fn as_label(self) -> &'static str { self.as_str() }
 
     fn colored(self) -> String {
         match self {
@@ -58,7 +65,35 @@ pub struct Balancer {
     stats: Arc<Stats>,
     providers: RwLock<HashMap<String, ProviderState>>,
     active: RwLock<Option<String>>,
+    /// Operator pin: when set, the balancer tries to keep this provider
+    /// active regardless of priority. It still respects health — a forced
+    /// provider that's DOWN falls back to the best available until it
+    /// recovers.
+    force_override: RwLock<Option<String>>,
     handles: StdMutex<Vec<JoinHandle<()>>>,
+}
+
+/// Read-only snapshot of the balancer state, serialized over the control
+/// protocol and consumed by the TUI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlSnapshot {
+    pub active: Option<String>,
+    pub forced: Option<String>,
+    pub providers: Vec<ProviderSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderSnapshot {
+    pub name: String,
+    pub gateway: String,
+    pub interface: String,
+    pub priority: u32,
+    pub role: String,
+    pub state: State,
+    pub last_latency_ms: Option<f64>,
+    pub last_check: Option<DateTime<Utc>>,
+    pub consecutive_failures: u32,
+    pub consecutive_successes: u32,
 }
 
 impl Balancer {
@@ -93,6 +128,7 @@ impl Balancer {
             stats,
             providers: RwLock::new(providers),
             active: RwLock::new(None),
+            force_override: RwLock::new(None),
             handles: StdMutex::new(Vec::new()),
         }))
     }
@@ -110,6 +146,26 @@ impl Balancer {
         let me = Arc::clone(self);
         let rx = shutdown.clone();
         let handle = tokio::spawn(async move { me.status_loop(rx).await });
+        self.handles.lock().unwrap().push(handle);
+
+        if self.cfg.traffic.enabled {
+            let me = Arc::clone(self);
+            let rx = shutdown.clone();
+            let handle = tokio::spawn(async move { me.traffic_loop(rx).await });
+            self.handles.lock().unwrap().push(handle);
+        }
+
+        if self.cfg.system.enabled {
+            let me = Arc::clone(self);
+            let rx = shutdown.clone();
+            let handle = tokio::spawn(async move { me.system_loop(rx).await });
+            self.handles.lock().unwrap().push(handle);
+        }
+
+        let listen = self.cfg.control.listen.clone();
+        let me = Arc::clone(self);
+        let rx = shutdown.clone();
+        let handle = tokio::spawn(async move { control::serve(listen, me, rx).await });
         self.handles.lock().unwrap().push(handle);
     }
 
@@ -239,15 +295,47 @@ impl Balancer {
         }
     }
 
-    /// Pick the highest-priority UP provider and ensure the kernel default
-    /// route points at it. No-op when the best candidate is already active.
+    /// Pick the best provider (forced if set and healthy; else highest-
+    /// priority UP) and ensure the kernel default route points at it. No-op
+    /// when the best candidate is already active.
     async fn reconcile_active(self: &Arc<Self>) -> Result<()> {
-        let best: Option<Provider> = {
+        let forced = self.force_override.read().await.clone();
+
+        let (best, reason_prefix): (Option<Provider>, &'static str) = {
             let ps = self.providers.read().await;
-            ps.values()
-                .filter(|p| p.state == State::Up)
-                .min_by_key(|p| p.cfg.priority)
-                .map(|p| p.cfg.clone())
+            if let Some(ref forced_name) = forced {
+                match ps.get(forced_name) {
+                    Some(entry) if entry.state == State::Up => {
+                        (Some(entry.cfg.clone()), "operator override")
+                    }
+                    Some(_) => {
+                        // Forced provider exists but is not UP — fall back
+                        // automatically and log once.
+                        let fallback = ps
+                            .values()
+                            .filter(|p| p.state == State::Up)
+                            .min_by_key(|p| p.cfg.priority)
+                            .map(|p| p.cfg.clone());
+                        (fallback, "forced provider unavailable, auto fallback")
+                    }
+                    None => {
+                        // Shouldn't happen — force_provider validates.
+                        let fallback = ps
+                            .values()
+                            .filter(|p| p.state == State::Up)
+                            .min_by_key(|p| p.cfg.priority)
+                            .map(|p| p.cfg.clone());
+                        (fallback, "forced provider not found")
+                    }
+                }
+            } else {
+                let best = ps
+                    .values()
+                    .filter(|p| p.state == State::Up)
+                    .min_by_key(|p| p.cfg.priority)
+                    .map(|p| p.cfg.clone());
+                (best, "priority selection")
+            }
         };
 
         let mut active_guard = self.active.write().await;
@@ -257,8 +345,8 @@ impl Balancer {
 
             (prev, Some(best)) => {
                 let reason = match &prev {
-                    None => "initial selection".to_string(),
-                    Some(p) => format!("'{p}' down or outranked by higher-priority provider"),
+                    None => format!("{reason_prefix}: initial selection"),
+                    Some(p) => format!("{reason_prefix}: replacing '{p}'"),
                 };
 
                 self.router
@@ -401,5 +489,193 @@ impl Balancer {
             let _ = h.await;
         }
         info!("{}", "balancer stopped".bright_white().bold());
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Public control-plane API, consumed by `src/control.rs` and the TUI.
+    // ────────────────────────────────────────────────────────────────────
+
+    pub async fn snapshot(&self) -> ControlSnapshot {
+        let ps = self.providers.read().await;
+        let active = self.active.read().await.clone();
+        let forced = self.force_override.read().await.clone();
+
+        let mut providers: Vec<ProviderSnapshot> = ps
+            .values()
+            .map(|p| ProviderSnapshot {
+                name: p.cfg.name.clone(),
+                gateway: p.cfg.gateway.to_string(),
+                interface: p.cfg.interface.clone(),
+                priority: p.cfg.priority,
+                role: p.cfg.role.as_str().to_string(),
+                state: p.state,
+                last_latency_ms: p.last_latency_ms,
+                last_check: p.last_check,
+                consecutive_failures: p.consecutive_failures,
+                consecutive_successes: p.consecutive_successes,
+            })
+            .collect();
+        providers.sort_by_key(|p| p.priority);
+
+        ControlSnapshot { active, forced, providers }
+    }
+
+    pub async fn force_provider(self: &Arc<Self>, name: &str) -> Result<()> {
+        {
+            let ps = self.providers.read().await;
+            if !ps.contains_key(name) {
+                return Err(anyhow!("unknown provider '{name}'"));
+            }
+        }
+        {
+            let mut f = self.force_override.write().await;
+            *f = Some(name.to_string());
+        }
+        info!(provider = %name, "operator override installed");
+        if let Err(e) = self.reconcile_active().await {
+            warn!(error = %e, "failed to reconcile after force");
+        }
+        Ok(())
+    }
+
+    pub async fn clear_force(self: &Arc<Self>) {
+        {
+            let mut f = self.force_override.write().await;
+            *f = None;
+        }
+        info!("operator override cleared");
+        if let Err(e) = self.reconcile_active().await {
+            warn!(error = %e, "failed to reconcile after clearing force");
+        }
+    }
+
+    pub fn recent_system(&self, limit: u32) -> Result<Vec<SystemPoint>> {
+        let limit = limit.min(10_000);
+        self.stats.recent_system(limit)
+    }
+
+    pub fn recent_traffic(&self, provider: &str, limit: u32) -> Result<Vec<TrafficPoint>> {
+        // Clamp to a sane maximum so a buggy TUI can't DoS the DB.
+        let limit = limit.min(10_000);
+        self.stats.recent_traffic(provider, limit)
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Background loops.
+    // ────────────────────────────────────────────────────────────────────
+
+    async fn traffic_loop(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
+        let interval = Duration::from_secs(self.cfg.traffic.interval_secs.max(1));
+        let retention = self.cfg.traffic.retention_hours;
+        let mut prev: HashMap<String, traffic::IfCounters> = HashMap::new();
+        let mut last_prune = Utc::now();
+
+        // Seed `prev` on the first tick; we emit deltas only after that.
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        debug!("traffic loop stopping");
+                        return;
+                    }
+                }
+            }
+
+            let snap = match traffic::snapshot().await {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(error = %e, "traffic: failed to read counters");
+                    continue;
+                }
+            };
+
+            let now = Utc::now();
+            for p in &self.cfg.providers {
+                let Some(curr) = snap.get(&p.interface).copied() else {
+                    continue;
+                };
+                if let Some(prev_c) = prev.get(&p.interface).copied() {
+                    if let Some(d) = traffic::delta(prev_c, curr) {
+                        let secs = interval.as_secs_f64();
+                        if let Err(e) = self.stats.record_traffic(
+                            &p.name,
+                            &p.interface,
+                            now,
+                            secs,
+                            &d,
+                        ) {
+                            warn!(error = %e, "traffic: failed to persist sample");
+                        }
+                    } else {
+                        debug!(
+                            iface = %p.interface,
+                            "traffic: counter reset detected, skipping sample"
+                        );
+                    }
+                }
+                prev.insert(p.interface.clone(), curr);
+            }
+
+            // Prune at most once per hour.
+            if retention > 0
+                && (now - last_prune).num_seconds() > 3600
+            {
+                match self.stats.prune_traffic(retention) {
+                    Ok(n) if n > 0 => info!(deleted = n, "traffic: pruned old samples"),
+                    Ok(_) => {}
+                    Err(e) => warn!(error = %e, "traffic: prune failed"),
+                }
+                last_prune = now;
+            }
+        }
+    }
+
+    /// Host-wide btop-style metrics: CPU (per-core + total), RAM, swap,
+    /// load average, aggregate network, disk totals, process count. Sampled
+    /// on `system.interval_secs`, written to `system_samples`, pruned hourly.
+    async fn system_loop(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
+        let interval = Duration::from_secs(self.cfg.system.interval_secs.max(1));
+        let retention = self.cfg.system.retention_hours;
+        let per_core = self.cfg.system.per_core;
+
+        let mut monitor = SysMonitor::new();
+        // sysinfo needs two refreshes to produce accurate CPU %; warm it up
+        // so the first DB row is already meaningful.
+        let _ = monitor.sample();
+
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last_prune = Utc::now();
+
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        debug!("system loop stopping");
+                        return;
+                    }
+                }
+            }
+
+            let sample = monitor.sample();
+            let now = Utc::now();
+            if let Err(e) = self.stats.record_system(now, &sample, per_core) {
+                warn!(error = %e, "system: failed to persist sample");
+            }
+
+            if retention > 0 && (now - last_prune).num_seconds() > 3600 {
+                match self.stats.prune_system(retention) {
+                    Ok(n) if n > 0 => info!(deleted = n, "system: pruned old samples"),
+                    Ok(_) => {}
+                    Err(e) => warn!(error = %e, "system: prune failed"),
+                }
+                last_prune = now;
+            }
+        }
     }
 }
