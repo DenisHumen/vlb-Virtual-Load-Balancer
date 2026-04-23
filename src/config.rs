@@ -181,11 +181,55 @@ impl Config {
         if names.len() != orig {
             bail!("providers must have unique names");
         }
+        for p in &self.providers {
+            if p.name.trim().is_empty() {
+                bail!("provider name must not be empty");
+            }
+            if p.name.chars().any(|c| c.is_whitespace()) {
+                bail!("provider name '{}' must not contain whitespace", p.name);
+            }
+            if p.interface.trim().is_empty() {
+                bail!("provider '{}' has empty interface name", p.name);
+            }
+            // Linux kernel IFNAMSIZ is 16 including NUL — enforce 15 to be safe.
+            if p.interface.len() > 15 {
+                bail!(
+                    "provider '{}' interface name '{}' exceeds Linux IFNAMSIZ-1 (15 chars)",
+                    p.name,
+                    p.interface
+                );
+            }
+            if p.interface.chars().any(|c| c.is_whitespace() || c == '/' || c == ':') {
+                bail!(
+                    "provider '{}' interface name '{}' contains forbidden characters",
+                    p.name,
+                    p.interface
+                );
+            }
+            if p.gateway.is_unspecified() {
+                bail!("provider '{}' gateway must not be 0.0.0.0", p.name);
+            }
+            if p.gateway.is_broadcast() {
+                bail!("provider '{}' gateway must not be the broadcast address", p.name);
+            }
+            if p.gateway.is_multicast() {
+                bail!("provider '{}' gateway must not be a multicast address", p.name);
+            }
+        }
         if self.health.interval_secs == 0 {
             bail!("health.interval_secs must be >= 1");
         }
         if self.health.timeout_ms < 100 {
             bail!("health.timeout_ms must be >= 100");
+        }
+        // Timeout must be strictly less than the interval, otherwise probe
+        // dispatch slips behind the ticker and thresholds become meaningless.
+        if self.health.timeout_ms >= self.health.interval_secs.saturating_mul(1000) {
+            bail!(
+                "health.timeout_ms ({}) must be < health.interval_secs*1000 ({}ms)",
+                self.health.timeout_ms,
+                self.health.interval_secs * 1000
+            );
         }
         if self.health.failure_threshold == 0 || self.health.success_threshold == 0 {
             bail!("health thresholds must be >= 1");
@@ -193,7 +237,118 @@ impl Config {
         if self.health.probe_targets.is_empty() {
             bail!("health.probe_targets must not be empty — at least one external target is required for end-to-end probing");
         }
+        for t in &self.health.probe_targets {
+            if t.is_unspecified() || t.is_loopback() || t.is_broadcast() || t.is_multicast() {
+                bail!("health.probe_targets contains invalid address {t}");
+            }
+        }
+        if self.health.status_print_secs < 5 {
+            bail!("health.status_print_secs must be >= 5");
+        }
+
+        // Routing-table reservations: 0 unspec, 253 default, 254 main,
+        // 255 local. `table_for(p) = table_base + priority`.
+        let max_prio = self.providers.iter().map(|p| p.priority).max().unwrap_or(0);
+        let first_table = self.routing.table_base;
+        let last_table = self.routing.table_base.saturating_add(max_prio);
+        if first_table == 0 {
+            bail!("routing.table_base must not be 0 (reserved — unspec)");
+        }
+        for reserved in [253u32, 254, 255] {
+            if (first_table..=last_table).contains(&reserved) {
+                bail!(
+                    "routing.table_base..={last_table} overlaps reserved table {reserved} \
+                     (253=default, 254=main, 255=local) — pick a different table_base"
+                );
+            }
+        }
+        if last_table > 0xFFFF_FFFE {
+            bail!("routing.table_base + max priority overflows u32");
+        }
+        // ip rule prefs are bounded by 0..=32766 for main and we want our
+        // rules strictly above user overrides but below the main default.
+        let max_pref = self.routing.rule_pref.saturating_add(max_prio);
+        if max_pref >= 32766 {
+            bail!(
+                "routing.rule_pref + max priority ({max_pref}) must be < 32766 (the main-table pref)"
+            );
+        }
+        // fwmark is an arbitrary 32-bit value; only ensure it's non-zero so
+        // it doesn't collide with "no mark" and stays in a safe range.
+        if self.routing.fwmark_base == 0 {
+            bail!("routing.fwmark_base must not be 0");
+        }
+        if self
+            .routing
+            .fwmark_base
+            .checked_add(max_prio)
+            .is_none()
+        {
+            bail!("routing.fwmark_base + max priority overflows u32");
+        }
+
         Ok(())
+    }
+
+    /// Human-readable summary of the loaded configuration — used by the
+    /// `vlb check` subcommand for a quick eyeball before deploying.
+    pub fn summary(&self) -> String {
+        use std::fmt::Write;
+        let mut s = String::new();
+        let _ = writeln!(s, "general:");
+        let _ = writeln!(
+            s,
+            "  lan_interface   = {}",
+            self.general.lan_interface.as_deref().unwrap_or("(unset)")
+        );
+        let _ = writeln!(
+            s,
+            "  gateway_address = {}",
+            self.general
+                .gateway_address
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "(unset)".into())
+        );
+        let _ = writeln!(s, "health:");
+        let _ = writeln!(s, "  interval={}s timeout={}ms fail={} ok={} status_every={}s",
+            self.health.interval_secs,
+            self.health.timeout_ms,
+            self.health.failure_threshold,
+            self.health.success_threshold,
+            self.health.status_print_secs);
+        let _ = writeln!(s, "  probe_targets={:?}", self.health.probe_targets);
+        let _ = writeln!(s, "routing:");
+        let _ = writeln!(
+            s,
+            "  table_base={} fwmark_base=0x{:x} rule_pref={}",
+            self.routing.table_base, self.routing.fwmark_base, self.routing.rule_pref
+        );
+        let _ = writeln!(s, "firewall:");
+        let _ = writeln!(
+            s,
+            "  manage={} disable_host_firewall={} wan_interface={:?}",
+            self.firewall.manage, self.firewall.disable_host_firewall, self.firewall.wan_interface
+        );
+        let _ = writeln!(s, "database:");
+        let _ = writeln!(s, "  path={}", self.database.path.display());
+        let _ = writeln!(s, "providers ({}):", self.providers.len());
+        let mut sorted: Vec<&Provider> = self.providers.iter().collect();
+        sorted.sort_by_key(|p| p.priority);
+        for p in sorted {
+            let _ = writeln!(
+                s,
+                "  [{}] {} -> {} via {} (role={}, table={}, mark=0x{:x}, pref={})",
+                p.priority,
+                p.name,
+                p.gateway,
+                p.interface,
+                p.role.as_str(),
+                self.table_for(p),
+                self.mark_for(p),
+                self.rule_pref_for(p),
+            );
+        }
+        s
     }
 
     /// Routing table ID for the provider — derived from its priority so the
@@ -213,5 +368,126 @@ impl Config {
     /// the main table (32766) so we don't collide with kernel defaults.
     pub fn rule_pref_for(&self, p: &Provider) -> u32 {
         self.routing.rule_pref + p.priority
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider(name: &str, prio: u32) -> Provider {
+        Provider {
+            name: name.into(),
+            gateway: format!("10.0.0.{}", prio + 1).parse().unwrap(),
+            interface: "eth0".into(),
+            priority: prio,
+            role: ProviderRole::Primary,
+        }
+    }
+
+    fn base_cfg(providers: Vec<Provider>) -> Config {
+        Config {
+            general: General::default(),
+            health: HealthConfig::default(),
+            firewall: FirewallConfig::default(),
+            routing: RoutingConfig::default(),
+            database: DatabaseConfig::default(),
+            providers,
+        }
+    }
+
+    #[test]
+    fn validate_ok_minimal() {
+        let cfg = base_cfg(vec![provider("p0", 0)]);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_requires_priority_zero() {
+        let cfg = base_cfg(vec![provider("p1", 1)]);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_priority() {
+        let cfg = base_cfg(vec![provider("a", 0), provider("b", 0)]);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_names() {
+        let mut p1 = provider("same", 0);
+        let mut p2 = provider("same", 1);
+        p1.name = "dup".into();
+        p2.name = "dup".into();
+        let cfg = base_cfg(vec![p1, p2]);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_whitespace_in_name() {
+        let mut p = provider("bad name", 0);
+        p.name = "bad name".into();
+        let cfg = base_cfg(vec![p]);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_long_interface() {
+        let mut p = provider("p", 0);
+        p.interface = "a".repeat(20);
+        let cfg = base_cfg(vec![p]);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_timeout_ge_interval() {
+        let mut cfg = base_cfg(vec![provider("p", 0)]);
+        cfg.health.interval_secs = 1;
+        cfg.health.timeout_ms = 1500;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_reserved_table() {
+        let mut cfg = base_cfg(vec![provider("p", 0)]);
+        cfg.routing.table_base = 254; // main
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_rule_pref_too_high() {
+        let mut cfg = base_cfg(vec![provider("p", 0)]);
+        cfg.routing.rule_pref = 32766;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_invalid_probe_targets() {
+        let mut cfg = base_cfg(vec![provider("p", 0)]);
+        cfg.health.probe_targets = vec!["127.0.0.1".parse().unwrap()];
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn mark_table_pref_derivations() {
+        let providers = vec![provider("a", 0), provider("b", 2)];
+        let cfg = base_cfg(providers.clone());
+        assert_eq!(cfg.table_for(&providers[0]), 200);
+        assert_eq!(cfg.table_for(&providers[1]), 202);
+        assert_eq!(cfg.mark_for(&providers[0]), 0x200);
+        assert_eq!(cfg.mark_for(&providers[1]), 0x202);
+        assert_eq!(cfg.rule_pref_for(&providers[0]), 32000);
+        assert_eq!(cfg.rule_pref_for(&providers[1]), 32002);
+    }
+
+    #[test]
+    fn summary_contains_providers() {
+        let cfg = base_cfg(vec![provider("alpha", 0), provider("beta", 1)]);
+        cfg.validate().unwrap();
+        let s = cfg.summary();
+        assert!(s.contains("alpha"));
+        assert!(s.contains("beta"));
+        assert!(s.contains("table=200"));
     }
 }

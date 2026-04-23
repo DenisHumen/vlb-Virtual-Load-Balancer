@@ -113,6 +113,86 @@ impl Stats {
         )?;
         Ok(())
     }
+
+    /// Aggregated, human-readable report across the trailing `hours` window.
+    /// Used by the `vlb stats` CLI subcommand; the query runs read-only and
+    /// does not block probe writers for any meaningful duration.
+    pub fn report(&self, hours: u32, recent: u32) -> Result<String> {
+        use std::fmt::Write;
+        let conn = self.conn.lock().unwrap();
+        let window = format!("-{hours} hours");
+
+        let mut s = String::new();
+        let _ = writeln!(s, "vlb stats — last {hours}h window");
+        let _ = writeln!(s, "{}", "=".repeat(72));
+
+        // Per-provider / per-kind aggregates.
+        let mut stmt = conn.prepare(
+            "SELECT provider, kind,
+                    COUNT(*) AS total,
+                    SUM(success) AS ok,
+                    ROUND(AVG(CAST(success AS REAL)) * 100, 2) AS pct,
+                    ROUND(AVG(latency_ms), 2) AS avg_ms
+             FROM health_checks
+             WHERE ts >= datetime('now', ?1)
+             GROUP BY provider, kind
+             ORDER BY provider, kind",
+        )?;
+        let _ = writeln!(
+            s,
+            "{:<18} {:<10} {:>8} {:>8} {:>8} {:>10}",
+            "provider", "kind", "total", "ok", "pct%", "avg_ms"
+        );
+        let _ = writeln!(s, "{}", "-".repeat(72));
+        let mut rows = stmt.query(params![window])?;
+        let mut any_health = false;
+        while let Some(row) = rows.next()? {
+            any_health = true;
+            let provider: String = row.get(0)?;
+            let kind: String = row.get(1)?;
+            let total: i64 = row.get(2)?;
+            let ok: i64 = row.get::<_, Option<i64>>(3)?.unwrap_or(0);
+            let pct: f64 = row.get::<_, Option<f64>>(4)?.unwrap_or(0.0);
+            let avg_ms: Option<f64> = row.get(5)?;
+            let avg_str = avg_ms
+                .map(|v| format!("{v:.2}"))
+                .unwrap_or_else(|| "--".into());
+            let _ = writeln!(
+                s,
+                "{provider:<18} {kind:<10} {total:>8} {ok:>8} {pct:>8.2} {avg_str:>10}"
+            );
+        }
+        if !any_health {
+            let _ = writeln!(s, "(no health-check samples in window)");
+        }
+
+        // Recent failovers.
+        let _ = writeln!(s);
+        let _ = writeln!(s, "recent failovers (last {recent}):");
+        let _ = writeln!(s, "{}", "-".repeat(72));
+        let mut stmt = conn.prepare(
+            "SELECT ts, from_provider, to_provider, reason
+             FROM failover_events
+             ORDER BY id DESC
+             LIMIT ?1",
+        )?;
+        let mut rows = stmt.query(params![recent])?;
+        let mut any_fo = false;
+        while let Some(row) = rows.next()? {
+            any_fo = true;
+            let ts: String = row.get(0)?;
+            let from: Option<String> = row.get(1)?;
+            let to: String = row.get(2)?;
+            let reason: String = row.get(3)?;
+            let from_s = from.as_deref().unwrap_or("(none)");
+            let _ = writeln!(s, "{ts}  {from_s} -> {to}   {reason}");
+        }
+        if !any_fo {
+            let _ = writeln!(s, "(no failover events recorded)");
+        }
+
+        Ok(s)
+    }
 }
 
 const SCHEMA: &str = r#"
@@ -164,3 +244,55 @@ FROM health_checks
 WHERE ts >= datetime('now', '-1 hour')
 GROUP BY provider;
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Provider, ProviderRole};
+    use std::net::Ipv4Addr;
+
+    fn mk_providers() -> Vec<Provider> {
+        vec![Provider {
+            name: "p0".into(),
+            gateway: Ipv4Addr::new(10, 0, 0, 1),
+            interface: "eth0".into(),
+            priority: 0,
+            role: ProviderRole::Primary,
+        }]
+    }
+
+    #[test]
+    fn open_and_record_health_in_tempfile() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vlb-test-{}-{}.db",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let stats = Stats::open(&tmp, &mk_providers()).unwrap();
+        stats
+            .record_health(&HealthRecord {
+                provider: "p0".into(),
+                timestamp: Utc::now(),
+                success: true,
+                latency_ms: Some(1.2),
+                kind: "gateway",
+            })
+            .unwrap();
+        stats
+            .record_failover(&FailoverRecord {
+                timestamp: Utc::now(),
+                from_provider: None,
+                to_provider: "p0".into(),
+                reason: "bootstrap".into(),
+            })
+            .unwrap();
+        stats.record_state_change("p0", "up").unwrap();
+        let report = stats.report(24, 5).unwrap();
+        assert!(report.contains("p0"));
+        assert!(report.contains("bootstrap"));
+        drop(stats);
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp.with_extension("db-wal"));
+        let _ = std::fs::remove_file(tmp.with_extension("db-shm"));
+    }
+}

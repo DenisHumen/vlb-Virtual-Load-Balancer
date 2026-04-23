@@ -1,6 +1,7 @@
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
+use tokio::time::timeout as tokio_timeout;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ProbeOutcome {
@@ -28,6 +29,11 @@ impl ProbeOutcome {
 /// per-provider routing table — this is how we probe each upstream's
 /// *internet* reachability independently, even for providers that are not
 /// currently the owner of the main default route.
+///
+/// The ping binary is additionally wrapped in a `tokio::time::timeout` as a
+/// safety net: `-W` already bounds the ICMP wait, but a stuck ping process
+/// (e.g. DNS lookup on a hostile resolver in some distributions, or a
+/// blocked syscall) would otherwise hang the probe task indefinitely.
 async fn ping_once(target: Ipv4Addr, timeout: Duration, mark: Option<u32>) -> ProbeOutcome {
     // iputils ping accepts a float for `-W`; 0.2 s is the minimum we allow
     // so probes cannot accidentally degenerate into instant-fail spinning.
@@ -41,12 +47,24 @@ async fn ping_once(target: Ipv4Addr, timeout: Duration, mark: Option<u32>) -> Pr
         cmd.args(["-m", m.as_str()]);
     }
     cmd.arg(&target_str);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+
+    // Hard wall-clock cap: ping's own -W + a generous slack. If we ever hit
+    // this branch it means ping itself is misbehaving, not just that the
+    // target is unreachable — we treat it as a failed probe either way.
+    let hard_deadline = timeout
+        .saturating_mul(2)
+        .saturating_add(Duration::from_millis(500));
 
     let started = Instant::now();
-    let result = cmd.kill_on_drop(true).output().await;
+    let result = tokio_timeout(hard_deadline, cmd.kill_on_drop(true).output()).await;
 
     match result {
-        Ok(out) if out.status.success() => ProbeOutcome::Success { latency: started.elapsed() },
+        Ok(Ok(out)) if out.status.success() => {
+            ProbeOutcome::Success { latency: started.elapsed() }
+        }
         _ => ProbeOutcome::Failed,
     }
 }
@@ -74,4 +92,20 @@ pub async fn check_internet_via(
         }
     }
     ProbeOutcome::Failed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outcome_helpers() {
+        let ok = ProbeOutcome::Success { latency: Duration::from_millis(5) };
+        assert!(ok.is_success());
+        assert_eq!(ok.latency_ms(), Some(5.0));
+
+        let fail = ProbeOutcome::Failed;
+        assert!(!fail.is_success());
+        assert_eq!(fail.latency_ms(), None);
+    }
 }

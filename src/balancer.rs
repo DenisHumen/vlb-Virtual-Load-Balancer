@@ -4,7 +4,7 @@ use colored::Colorize;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{watch, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
@@ -97,21 +97,23 @@ impl Balancer {
         }))
     }
 
-    pub fn spawn_tasks(self: &Arc<Self>) {
+    pub fn spawn_tasks(self: &Arc<Self>, shutdown: watch::Receiver<bool>) {
         let provider_names: Vec<String> =
             self.cfg.providers.iter().map(|p| p.name.clone()).collect();
         for name in provider_names {
             let me = Arc::clone(self);
-            let handle = tokio::spawn(async move { me.health_loop(name).await });
+            let rx = shutdown.clone();
+            let handle = tokio::spawn(async move { me.health_loop(name, rx).await });
             self.handles.lock().unwrap().push(handle);
         }
 
         let me = Arc::clone(self);
-        let handle = tokio::spawn(async move { me.status_loop().await });
+        let rx = shutdown.clone();
+        let handle = tokio::spawn(async move { me.status_loop(rx).await });
         self.handles.lock().unwrap().push(handle);
     }
 
-    async fn health_loop(self: Arc<Self>, name: String) {
+    async fn health_loop(self: Arc<Self>, name: String, mut shutdown: watch::Receiver<bool>) {
         let interval = Duration::from_secs(self.cfg.health.interval_secs);
         let timeout = Duration::from_millis(self.cfg.health.timeout_ms);
         let mut ticker = tokio::time::interval(interval);
@@ -127,7 +129,15 @@ impl Balancer {
         };
 
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        tracing::debug!(provider = %name, "health loop stopping");
+                        return;
+                    }
+                }
+            }
 
             // (1) Next-hop reachability — a dead ISP router, a dead cable,
             //     or a power outage upstream of us all show up here first.
@@ -294,17 +304,27 @@ impl Balancer {
         }
     }
 
-    async fn status_loop(self: Arc<Self>) {
+    async fn status_loop(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
         // Short warm-up so the first snapshot shows real probe results.
-        tokio::time::sleep(Duration::from_secs(
+        let warmup = Duration::from_secs(
             self.cfg.health.interval_secs + self.cfg.health.success_threshold as u64,
-        ))
-        .await;
+        );
+        tokio::select! {
+            _ = tokio::time::sleep(warmup) => {}
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() { return; }
+            }
+        }
 
         let interval = Duration::from_secs(self.cfg.health.status_print_secs.max(5));
         loop {
             self.print_status().await;
-            tokio::time::sleep(interval).await;
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() { return; }
+                }
+            }
         }
     }
 
@@ -374,8 +394,11 @@ impl Balancer {
 
     pub async fn shutdown(&self) {
         let handles = std::mem::take(&mut *self.handles.lock().unwrap());
-        for h in handles {
+        for h in &handles {
             h.abort();
+        }
+        for h in handles {
+            let _ = h.await;
         }
         info!("{}", "balancer stopped".bright_white().bold());
     }

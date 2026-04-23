@@ -17,20 +17,26 @@ pub fn init() {
 }
 
 pub fn print_banner() {
-    let line = "═".repeat(58);
+    let version = env!("CARGO_PKG_VERSION");
+    let width = 58usize;
+    let line = "═".repeat(width);
+    let line1 = center_line(width, &format!("VIRTUAL LOAD BALANCER  ·  v{version}"));
+    let line2 = center_line(width, "multi-provider failover gateway  ·  rust");
+
     println!("{}", format!("╔{line}╗").bright_cyan().bold());
-    println!(
-        "{}",
-        "║           VIRTUAL LOAD BALANCER  ·  v0.1.0               ║"
-            .bright_cyan()
-            .bold()
-    );
-    println!(
-        "{}",
-        "║       multi-provider failover gateway  ·  rust          ║"
-            .bright_cyan()
-            .bold()
-    );
+    println!("{}", format!("║{line1}║").bright_cyan().bold());
+    println!("{}", format!("║{line2}║").bright_cyan().bold());
     println!("{}", format!("╚{line}╝").bright_cyan().bold());
     println!();
+}
+
+fn center_line(width: usize, text: &str) -> String {
+    let text_len = text.chars().count();
+    if text_len >= width {
+        return text.chars().take(width).collect();
+    }
+    let total_pad = width - text_len;
+    let left = total_pad / 2;
+    let right = total_pad - left;
+    format!("{}{}{}", " ".repeat(left), text, " ".repeat(right))
 }
