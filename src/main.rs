@@ -257,8 +257,63 @@ async fn diag(config: &Config) -> Result<()> {
     // 2. control port reachability.
     println!("-- control port --");
     match control::send(&config.control.listen, &control::Request::Status).await {
-        Ok(_) => println!("  {} reachable — daemon is up", config.control.listen),
+        Ok(control::Response::Status { snapshot }) => {
+            println!("  {} reachable — daemon is up", config.control.listen);
+            println!(
+                "  active provider     : {}",
+                snapshot.active.as_deref().unwrap_or("(none)")
+            );
+            println!(
+                "  operator override   : {}",
+                snapshot.forced.as_deref().unwrap_or("(none)")
+            );
+            println!("  providers:");
+            for p in &snapshot.providers {
+                println!(
+                    "    {:<16} state={:<8} latency={}",
+                    p.name,
+                    p.state.as_label(),
+                    p.last_latency_ms
+                        .map(|ms| format!("{ms:.1}ms"))
+                        .unwrap_or_else(|| "—".into())
+                );
+            }
+        }
+        Ok(other) => println!("  unexpected response: {other:?}"),
         Err(e) => println!("  {} UNREACHABLE: {e}", config.control.listen),
+    }
+    println!();
+
+    // 2b. Actual kernel default route(s). This is the ground truth for
+    //     "did the force switch actually happen?".
+    println!("-- kernel default route (ip route show default) --");
+    #[cfg(unix)]
+    {
+        match tokio::process::Command::new("ip")
+            .args(["route", "show", "default"])
+            .output()
+            .await
+        {
+            Ok(out) if out.status.success() => {
+                let s = String::from_utf8_lossy(&out.stdout);
+                if s.trim().is_empty() {
+                    println!("  (no default route installed)");
+                } else {
+                    for line in s.lines() {
+                        println!("  {line}");
+                    }
+                }
+            }
+            Ok(out) => println!(
+                "  `ip route` failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+            Err(e) => println!("  `ip route` not runnable: {e}"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        println!("  (not a Unix host — skipping)");
     }
     println!();
 

@@ -299,6 +299,19 @@ impl Balancer {
     /// priority UP) and ensure the kernel default route points at it. No-op
     /// when the best candidate is already active.
     async fn reconcile_active(self: &Arc<Self>) -> Result<()> {
+        self.reconcile_inner(false).await
+    }
+
+    /// Same as `reconcile_active`, but forces `ip route replace` even when
+    /// the target provider is already the current active. Used by operator
+    /// commands (`force`/`auto`) so that a stale kernel default route from
+    /// a competing tool (NetworkManager, netplan, DHCP) gets rewritten back
+    /// to our choice without requiring the operator to switch twice.
+    async fn reconcile_active_forced(self: &Arc<Self>) -> Result<()> {
+        self.reconcile_inner(true).await
+    }
+
+    async fn reconcile_inner(self: &Arc<Self>, always_install: bool) -> Result<()> {
         let forced = self.force_override.read().await.clone();
 
         let (best, reason_prefix): (Option<Provider>, &'static str) = {
@@ -341,7 +354,22 @@ impl Balancer {
         let mut active_guard = self.active.write().await;
         let current: Option<String> = (*active_guard).clone();
         match (current, best) {
-            (Some(cur), Some(best)) if cur == best.name => Ok(()),
+            (Some(cur), Some(best)) if cur == best.name => {
+                if always_install {
+                    // Operator-initiated: re-assert the route in case an
+                    // external tool overwrote it.
+                    self.router
+                        .set_default_route(best.gateway, &best.interface)
+                        .await?;
+                    self.router.flush_conntrack().await;
+                    info!(
+                        provider = %best.name,
+                        "{}: re-asserted default route (operator request)",
+                        "FORCE".bright_magenta().bold()
+                    );
+                }
+                Ok(())
+            }
 
             (prev, Some(best)) => {
                 let reason = match &prev {
@@ -521,10 +549,31 @@ impl Balancer {
     }
 
     pub async fn force_provider(self: &Arc<Self>, name: &str) -> Result<()> {
+        // Validate the provider exists AND is currently Up. Silently
+        // installing a force that will be overridden by the health fallback
+        // is the worst kind of operator surprise: the CLI prints "ok, forced
+        // = X" while the actual route stays on the previous active. Refuse
+        // loudly instead — the operator can try again after health recovers,
+        // or first investigate why the provider is Down.
         {
             let ps = self.providers.read().await;
-            if !ps.contains_key(name) {
-                return Err(anyhow!("unknown provider '{name}'"));
+            let entry = ps
+                .get(name)
+                .ok_or_else(|| anyhow!("unknown provider '{name}'"))?;
+            match entry.state {
+                State::Up => {}
+                State::Down => {
+                    return Err(anyhow!(
+                        "provider '{name}' is currently DOWN — refusing to force. \
+                         Check health probes; use `vlb status` for details."
+                    ));
+                }
+                State::Unknown => {
+                    return Err(anyhow!(
+                        "provider '{name}' health state is UNKNOWN (no probes yet) — \
+                         wait a few seconds and retry."
+                    ));
+                }
             }
         }
         {
@@ -532,8 +581,13 @@ impl Balancer {
             *f = Some(name.to_string());
         }
         info!(provider = %name, "operator override installed");
-        if let Err(e) = self.reconcile_active().await {
+        // Always reconcile AND force a route re-install even if the target
+        // is already the current active — this lets operators use `force`
+        // to recover from a situation where an external actor (NetworkManager,
+        // netplan apply, DHCP renew) has overwritten our default route.
+        if let Err(e) = self.reconcile_active_forced().await {
             warn!(error = %e, "failed to reconcile after force");
+            return Err(e);
         }
         Ok(())
     }
@@ -544,7 +598,7 @@ impl Balancer {
             *f = None;
         }
         info!("operator override cleared");
-        if let Err(e) = self.reconcile_active().await {
+        if let Err(e) = self.reconcile_active_forced().await {
             warn!(error = %e, "failed to reconcile after clearing force");
         }
     }
