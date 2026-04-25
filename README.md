@@ -4,8 +4,13 @@
   <img src="docs/assets/logo.png" alt="vlb logo" width="220" />
 </p>
 
-[![CI](https://github.com/denishumen/vlb/actions/workflows/ci.yml/badge.svg)](https://github.com/denishumen/vlb/actions)
-[![Release](https://github.com/denishumen/vlb/actions/workflows/release.yml/badge.svg)](https://github.com/denishumen/vlb/actions/workflows/release.yml)
+<!--
+  Once the repo is public, swap the two badges below for the live ones:
+  [![CI](https://img.shields.io/github/actions/workflow/status/DenisHumen/vlb-Virtual-Load-Balancer/ci.yml?branch=main&label=CI&logo=github)](https://github.com/DenisHumen/vlb-Virtual-Load-Balancer/actions/workflows/ci.yml)
+  [![Release](https://img.shields.io/github/actions/workflow/status/DenisHumen/vlb-Virtual-Load-Balancer/release.yml?label=release&logo=github)](https://github.com/DenisHumen/vlb-Virtual-Load-Balancer/actions/workflows/release.yml)
+-->
+[![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](https://github.com/DenisHumen/vlb-Virtual-Load-Balancer/releases)
+[![Platform: Linux](https://img.shields.io/badge/platform-linux-informational.svg)](#runtime-requirements)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust 1.88+](https://img.shields.io/badge/Rust-1.88%2B-blue.svg)](https://www.rust-lang.org)
 
@@ -82,8 +87,8 @@ fast, and gives you a real dashboard.
 
 ```bash
 # 1. clone, build
-git clone https://github.com/denishumen/vlb.git
-cd vlb
+git clone https://github.com/DenisHumen/vlb-Virtual-Load-Balancer.git
+cd vlb-Virtual-Load-Balancer
 ./scripts/vlb.sh build         # bootstraps rustup if needed
 
 # 2. copy and edit the config
