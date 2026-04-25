@@ -22,6 +22,14 @@ impl Router {
     /// won't overwrite a DHCP/netplan default at metric 100 — it adds a
     /// second default. With metric 0 ours is always chosen (lowest wins) and
     /// replaces cleanly on subsequent calls.
+    ///
+    /// We also pin `proto static`. The kernel's route-replace key includes
+    /// the protocol; if we omit it, our route ends up as `proto boot` and
+    /// won't replace a `proto static` default written by netplan/networkd —
+    /// the two defaults coexist and the kernel non-deterministically picks
+    /// one, so failback to the primary silently fails. Setting `proto
+    /// static` lets a single `ip route replace` overwrite both our previous
+    /// install and any netplan-managed default cleanly.
     pub async fn set_default_route(&self, gateway: Ipv4Addr, interface: &str) -> Result<()> {
         if self.dry_run {
             info!(%gateway, interface, "dry-run: would install default route");
@@ -35,15 +43,16 @@ impl Router {
                 "via", &gw,
                 "dev", interface,
                 "metric", "0",
+                "proto", "static",
             ])
             .status()
             .await
             .context("failed to invoke `ip route replace`")?;
 
         if !status.success() {
-            bail!("`ip route replace default via {gw} dev {interface} metric 0` failed");
+            bail!("`ip route replace default via {gw} dev {interface} metric 0 proto static` failed");
         }
-        debug!(%gateway, interface, "default route installed at metric 0");
+        debug!(%gateway, interface, "default route installed at metric 0 proto static");
         Ok(())
     }
 

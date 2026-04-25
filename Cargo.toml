@@ -37,3 +37,4 @@ chrono = { version = "0.4", features = ["serde"] }
 ratatui = "0.28"
 crossterm = "0.28"
 sysinfo = { version = "0.31", default-features = false, features = ["system", "disk", "network"] }
+libc = "0.2"

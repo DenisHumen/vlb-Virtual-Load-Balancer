@@ -11,7 +11,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, Provider};
 use crate::control;
-use crate::health::{check_gateway, check_internet_via};
+use crate::health::{check_dns_via, check_gateway, check_internet_via, ProbeTarget};
 use crate::router::Router;
 use crate::stats::{FailoverRecord, HealthRecord, Stats, SystemPoint, TrafficPoint};
 use crate::sysmon::SysMonitor;
@@ -61,6 +61,10 @@ struct ProviderState {
 
 pub struct Balancer {
     cfg: Config,
+    /// Pre-parsed probe targets (IP literals vs hostnames). Computed
+    /// once at construction so the hot health loop doesn't re-parse on
+    /// every probe interval.
+    probe_targets: Vec<ProbeTarget>,
     router: Router,
     stats: Arc<Stats>,
     providers: RwLock<HashMap<String, ProviderState>>,
@@ -101,6 +105,13 @@ impl Balancer {
         let stats = Arc::new(Stats::open(&cfg.database.path, &cfg.providers)?);
         let router = Router::new(dry_run);
 
+        let probe_targets: Vec<ProbeTarget> = cfg
+            .health
+            .probe_targets
+            .iter()
+            .map(|s| ProbeTarget::parse(s))
+            .collect();
+
         let mut providers = HashMap::with_capacity(cfg.providers.len());
         for p in &cfg.providers {
             providers.insert(
@@ -124,6 +135,7 @@ impl Balancer {
 
         Ok(Arc::new(Self {
             cfg,
+            probe_targets,
             router,
             stats,
             providers: RwLock::new(providers),
@@ -218,7 +230,8 @@ impl Balancer {
             //     internet path cannot possibly be better than the next hop.
             let net_probe_opt = if gw_probe.is_success() {
                 let probe = check_internet_via(
-                    &self.cfg.health.probe_targets,
+                    &self.probe_targets,
+                    &self.cfg.health.dns_resolvers,
                     timeout,
                     mark,
                 )
@@ -235,21 +248,64 @@ impl Balancer {
                 None
             };
 
+            // (3) DNS reachability check via this provider's fwmark.
+            //     Catches the "ICMP works, UDP/53 blocked" failure mode
+            //     that some ISPs (and captive portals) trigger on unpaid
+            //     accounts. Skipped when the lower-level probes already
+            //     failed — there is nothing to add to the diagnosis.
+            let dns_probe_opt = if self.cfg.health.dns_check_enabled
+                && gw_probe.is_success()
+                && net_probe_opt.as_ref().map(|p| p.is_success()).unwrap_or(false)
+            {
+                let probe = check_dns_via(
+                    &self.cfg.health.dns_resolvers,
+                    &self.cfg.health.dns_check_name,
+                    timeout,
+                    mark,
+                )
+                .await;
+                let _ = self.stats.record_health(&HealthRecord {
+                    provider: name.clone(),
+                    timestamp: Utc::now(),
+                    success: probe.is_success(),
+                    latency_ms: probe.latency_ms(),
+                    kind: "dns",
+                });
+                Some(probe)
+            } else {
+                None
+            };
+
             let overall_ok = gw_probe.is_success()
-                && net_probe_opt.as_ref().map(|p| p.is_success()).unwrap_or(false);
+                && net_probe_opt.as_ref().map(|p| p.is_success()).unwrap_or(false)
+                && dns_probe_opt
+                    .as_ref()
+                    .map(|p| p.is_success())
+                    .unwrap_or(true);
 
             // Prefer the internet-probe latency for display — it reflects
             // the real user-facing latency through the provider, not just
             // the last LAN hop.
             let latency = net_probe_opt
+                .as_ref()
                 .and_then(|p| p.latency_ms())
                 .or_else(|| gw_probe.latency_ms());
 
             if !overall_ok && gw_probe.is_success() {
-                warn!(
-                    provider = %name,
-                    "gateway reachable but internet probe failed — provider marked as unhealthy"
-                );
+                if net_probe_opt.as_ref().map(|p| p.is_success()).unwrap_or(false)
+                    && dns_probe_opt.as_ref().map(|p| !p.is_success()).unwrap_or(false)
+                {
+                    warn!(
+                        provider = %name,
+                        "ICMP reaches the internet but DNS resolution failed — \
+                         provider marked as unhealthy (likely unpaid account / captive portal)"
+                    );
+                } else {
+                    warn!(
+                        provider = %name,
+                        "gateway reachable but internet probe failed — provider marked as unhealthy"
+                    );
+                }
             }
 
             self.apply_probe_result(&name, overall_ok, latency).await;

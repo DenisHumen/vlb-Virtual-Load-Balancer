@@ -7,8 +7,20 @@ interval_secs = 3
 timeout_ms = 1000
 failure_threshold = 2
 success_threshold = 2
-probe_targets = ["1.1.1.1", "8.8.8.8"]
+# External targets to probe through each provider's fwmark. Mix IPs and
+# hostnames: hostnames (e.g. "google.com") are resolved through the
+# provider's own mark-bound DNS resolver and the resulting IP is then
+# pinged with the same mark — a true end-to-end test that catches
+# "selectively prohibited" upstreams which allow ICMP to popular DNS IPs
+# but return Destination Net Prohibited for general internet destinations.
+probe_targets = ["1.1.1.1", "8.8.8.8", "google.com"]
 status_print_secs = 30
+# Catch the "ICMP works but UDP/53 is blocked" failure mode (unpaid ISP
+# accounts, captive portals). Each provider's DNS is queried via its own
+# fwmark, independent of the active default route.
+dns_check_enabled = true
+dns_resolvers = ["1.1.1.1", "8.8.8.8"]
+dns_check_name = "cloudflare.com"
 
 [routing]
 table_base  = 200

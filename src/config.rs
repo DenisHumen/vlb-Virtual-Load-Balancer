@@ -42,8 +42,37 @@ pub struct HealthConfig {
     pub failure_threshold: u32,
     #[serde(default = "default_success_threshold")]
     pub success_threshold: u32,
+    /// External probe targets. Each entry is either an IPv4 literal
+    /// (e.g. `"1.1.1.1"`) or a DNS hostname (e.g. `"google.com"`).
+    /// Hostnames are resolved through the provider's own mark-bound
+    /// resolvers at probe time and the resulting IP is then pinged with
+    /// the same fwmark — a true end-to-end test that exposes the
+    /// "selectively prohibited" failure mode where an upstream router
+    /// allows ICMP to popular DNS IPs but returns
+    /// `Destination Net Prohibited` for general internet destinations.
+    /// Mix IPs and hostnames for resilience: if hostname resolution
+    /// itself flaps, the IP-based probe still works.
     #[serde(default = "default_probe_targets")]
-    pub probe_targets: Vec<Ipv4Addr>,
+    pub probe_targets: Vec<String>,
+    /// Whether to additionally verify that DNS resolution works through
+    /// each provider. Catches the "ping passes but DNS is blocked" failure
+    /// mode common with unpaid ISP accounts or captive portals — the
+    /// gateway and external IPs answer ICMP, but UDP/53 to public
+    /// resolvers is silently dropped. Default: enabled.
+    #[serde(default = "default_dns_enabled")]
+    pub dns_check_enabled: bool,
+    /// Public DNS resolvers to query. Each is contacted via the
+    /// provider-specific fwmark (same as `probe_targets`), so the check is
+    /// independent of which provider currently owns the default route.
+    /// Success means at least ONE resolver returned a valid response with
+    /// at least one answer record for `dns_check_name` within the timeout.
+    #[serde(default = "default_dns_resolvers")]
+    pub dns_resolvers: Vec<Ipv4Addr>,
+    /// Hostname to resolve. Use a high-availability, low-TTL name —
+    /// `cloudflare.com` (default) is a safe choice; never pick something
+    /// the resolver might cache forever.
+    #[serde(default = "default_dns_name")]
+    pub dns_check_name: String,
     #[serde(default = "default_status_interval")]
     pub status_print_secs: u64,
 }
@@ -56,6 +85,9 @@ impl Default for HealthConfig {
             failure_threshold: default_failure_threshold(),
             success_threshold: default_success_threshold(),
             probe_targets: default_probe_targets(),
+            dns_check_enabled: default_dns_enabled(),
+            dns_resolvers: default_dns_resolvers(),
+            dns_check_name: default_dns_name(),
             status_print_secs: default_status_interval(),
         }
     }
@@ -66,9 +98,21 @@ fn default_timeout_ms() -> u64 { 1000 }
 fn default_failure_threshold() -> u32 { 2 }
 fn default_success_threshold() -> u32 { 2 }
 fn default_status_interval() -> u64 { 30 }
-fn default_probe_targets() -> Vec<Ipv4Addr> {
+fn default_probe_targets() -> Vec<String> {
+    // Two well-known DNS IPs (cheap reachability) plus a real hostname
+    // (catches selectively prohibited upstreams that allow specific IPs
+    // but block general traffic to e.g. google.com).
+    vec![
+        "1.1.1.1".to_string(),
+        "8.8.8.8".to_string(),
+        "google.com".to_string(),
+    ]
+}
+fn default_dns_enabled() -> bool { true }
+fn default_dns_resolvers() -> Vec<Ipv4Addr> {
     vec![Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(8, 8, 8, 8)]
 }
+fn default_dns_name() -> String { "cloudflare.com".to_string() }
 
 /// Per-provider policy routing configuration.
 ///
@@ -316,8 +360,50 @@ impl Config {
             bail!("health.probe_targets must not be empty — at least one external target is required for end-to-end probing");
         }
         for t in &self.health.probe_targets {
-            if t.is_unspecified() || t.is_loopback() || t.is_broadcast() || t.is_multicast() {
-                bail!("health.probe_targets contains invalid address {t}");
+            let trimmed = t.trim();
+            if trimmed.is_empty() {
+                bail!("health.probe_targets contains an empty entry");
+            }
+            if let Ok(ip) = trimmed.parse::<Ipv4Addr>() {
+                if ip.is_unspecified() || ip.is_loopback() || ip.is_broadcast() || ip.is_multicast() {
+                    bail!("health.probe_targets contains invalid address {ip}");
+                }
+            } else {
+                // Treat as hostname — enforce a sane DNS-name shape so a
+                // typo doesn't get silently sent to the resolver every
+                // probe interval.
+                if trimmed.len() > 253 || !trimmed.contains('.') {
+                    bail!(
+                        "health.probe_targets entry {:?} is not a valid IPv4 or FQDN",
+                        trimmed
+                    );
+                }
+                if !trimmed.chars().all(|c| {
+                    c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'
+                }) {
+                    bail!(
+                        "health.probe_targets entry {:?} contains invalid characters",
+                        trimmed
+                    );
+                }
+            }
+        }
+        if self.health.dns_check_enabled || self.health.probe_targets.iter().any(|t| t.parse::<Ipv4Addr>().is_err()) {
+            // DNS resolvers are required either for the explicit DNS
+            // probe OR to resolve any hostname-based internet target.
+            if self.health.dns_resolvers.is_empty() {
+                bail!("health.dns_resolvers must not be empty when DNS-based probing is in use (dns_check_enabled or hostname probe_targets)");
+            }
+            for r in &self.health.dns_resolvers {
+                if r.is_unspecified() || r.is_loopback() || r.is_broadcast() || r.is_multicast() {
+                    bail!("health.dns_resolvers contains invalid address {r}");
+                }
+            }
+        }
+        if self.health.dns_check_enabled {
+            let n = self.health.dns_check_name.trim();
+            if n.is_empty() || n.len() > 253 || !n.contains('.') {
+                bail!("health.dns_check_name must be a non-empty FQDN (e.g. cloudflare.com)");
             }
         }
         if self.health.status_print_secs < 5 {
@@ -429,6 +515,13 @@ impl Config {
             self.health.success_threshold,
             self.health.status_print_secs);
         let _ = writeln!(s, "  probe_targets={:?}", self.health.probe_targets);
+        let _ = writeln!(
+            s,
+            "  dns_check={} resolvers={:?} name={}",
+            self.health.dns_check_enabled,
+            self.health.dns_resolvers,
+            self.health.dns_check_name
+        );
         let _ = writeln!(s, "routing:");
         let _ = writeln!(
             s,
@@ -595,8 +688,14 @@ mod tests {
     #[test]
     fn validate_rejects_invalid_probe_targets() {
         let mut cfg = base_cfg(vec![provider("p", 0)]);
-        cfg.health.probe_targets = vec!["127.0.0.1".parse().unwrap()];
+        cfg.health.probe_targets = vec!["127.0.0.1".to_string()];
         assert!(cfg.validate().is_err());
+        cfg.health.probe_targets = vec!["not a hostname!".to_string()];
+        assert!(cfg.validate().is_err());
+        cfg.health.probe_targets = vec!["nodot".to_string()];
+        assert!(cfg.validate().is_err());
+        cfg.health.probe_targets = vec!["google.com".to_string(), "1.1.1.1".to_string()];
+        cfg.validate().unwrap();
     }
 
     #[test]
