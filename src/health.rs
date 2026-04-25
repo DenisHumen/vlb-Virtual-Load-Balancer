@@ -143,10 +143,43 @@ async fn ping_burst(
         .unwrap_or(0);
 
     if received >= min_success {
-        ProbeOutcome::Success { latency: started.elapsed() }
+        // Prefer the actual round-trip time parsed from ping's `rtt
+        // min/avg/max/mdev = ... ms` summary line — `started.elapsed()`
+        // would otherwise report ~2 s for a 3-packet burst (1-second
+        // inter-packet interval), which is wall-clock time, not
+        // network latency. Fall back to elapsed only if parsing fails.
+        let latency = parse_rtt_avg_ms(stdout)
+            .map(Duration::from_secs_f64)
+            .unwrap_or_else(|| started.elapsed());
+        ProbeOutcome::Success { latency }
     } else {
         ProbeOutcome::Failed
     }
+}
+
+/// Parse the average RTT (in **seconds**) out of iputils ping's summary
+/// line: `rtt min/avg/max/mdev = 9.342/9.362/9.374/0.014 ms`. Some
+/// distributions print `round-trip` instead of `rtt`. Returns `None` if
+/// the line is absent or malformed (e.g. all packets lost — no rtt line
+/// is emitted at all).
+fn parse_rtt_avg_ms(stdout: &str) -> Option<f64> {
+    for line in stdout.lines() {
+        let l = line.trim();
+        if !(l.starts_with("rtt ") || l.starts_with("round-trip ")) {
+            continue;
+        }
+        // Format: "rtt min/avg/max/mdev = A/B/C/D ms"
+        let eq_pos = l.find('=')?;
+        let rest = l[eq_pos + 1..].trim();
+        // Strip trailing " ms" (or " ms\n", already trimmed).
+        let rest = rest.trim_end_matches("ms").trim();
+        let mut parts = rest.split('/');
+        let _min = parts.next()?;
+        let avg = parts.next()?.trim().parse::<f64>().ok()?;
+        // Convert milliseconds → seconds for the Duration constructor.
+        return Some(avg / 1000.0);
+    }
+    None
 }
 
 /// Ping the provider's next-hop gateway. No fwmark: the gateway lives on a
@@ -764,6 +797,25 @@ mod tests {
             dns_extract_first_a(&multi, 0xBEEF, qsize_m),
             Some(Ipv4Addr::new(10, 20, 30, 40))
         );
+    }
+
+    #[test]
+    fn parse_rtt_avg_handles_iputils_summary() {
+        let s = "PING 1.1.1.1 (1.1.1.1) 56(84) bytes of data.\n\n\
+                 --- 1.1.1.1 ping statistics ---\n\
+                 3 packets transmitted, 3 received, 0% packet loss, time 2003ms\n\
+                 rtt min/avg/max/mdev = 9.342/9.362/9.374/0.014 ms\n";
+        let avg = parse_rtt_avg_ms(s).expect("avg present");
+        assert!((avg - 0.009362).abs() < 1e-9, "got {avg}");
+
+        // BSD-style header.
+        let s2 = "round-trip min/avg/max/stddev = 1.000/2.500/4.000/0.5 ms\n";
+        let avg2 = parse_rtt_avg_ms(s2).expect("avg present");
+        assert!((avg2 - 0.0025).abs() < 1e-9, "got {avg2}");
+
+        // No rtt line (100% loss).
+        let s3 = "3 packets transmitted, 0 received, 100% packet loss, time 2003ms\n";
+        assert_eq!(parse_rtt_avg_ms(s3), None);
     }
 
     #[test]
