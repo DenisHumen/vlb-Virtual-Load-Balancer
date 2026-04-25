@@ -63,9 +63,9 @@ die()  { printf '%b[err]%b %s\n' "$C_RED" "$C_RST" "$*" >&2; exit 1; }
 require_cargo() { command -v cargo >/dev/null || die "cargo not found — install Rust toolchain"; }
 
 # Minimum Rust version required to build the project. Must match `rust-version`
-# in Cargo.toml. Transitive deps (clap_lex 1.1, anstream 1.0, serde 1.0.228)
-# use Cargo `edition2024`, which was stabilised in Rust 1.85.
-VLB_MIN_RUST="1.85.0"
+# in Cargo.toml. Transitive deps (darling 0.23, instability 0.3.12 pulled by
+# ratatui) require 1.88 or newer.
+VLB_MIN_RUST="1.88.0"
 
 # Compare two dotted versions; returns 0 iff $1 >= $2.
 version_ge() {

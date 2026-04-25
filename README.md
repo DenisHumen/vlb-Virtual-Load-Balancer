@@ -3,7 +3,7 @@
 [![CI](https://github.com/denishumen/vlb/actions/workflows/ci.yml/badge.svg)](https://github.com/denishumen/vlb/actions)
 [![Release](https://github.com/denishumen/vlb/actions/workflows/release.yml/badge.svg)](https://github.com/denishumen/vlb/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Rust 1.85+](https://img.shields.io/badge/Rust-1.85%2B-blue.svg)](https://www.rust-lang.org)
+[![Rust 1.88+](https://img.shields.io/badge/Rust-1.88%2B-blue.svg)](https://www.rust-lang.org)
 
 Multi-uplink failover gateway for Linux. Turns one box into an active/standby
 router across several upstream ISPs: probes every provider independently,
@@ -302,7 +302,7 @@ cargo test --release
 cargo clippy --release --all-targets -- -D warnings
 ```
 
-MSRV is **1.85**. The launcher script (`scripts/vlb.sh`) bootstraps
+MSRV is **1.88**. The launcher script (`scripts/vlb.sh`) bootstraps
 `rustup` automatically on hosts without a recent toolchain.
 
 ---
