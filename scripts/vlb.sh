@@ -28,7 +28,7 @@
 #   help               Show this help
 #
 # Environment:
-#   VLB_CONFIG   path to the TOML config (default: vlb.example.toml)
+#   VLB_CONFIG   path to the TOML config (default: examples/vlb.example.toml)
 #   VLB_BIN      path to the vlb binary   (default: ./target/release/vlb)
 #   VLB_LOG      path to the log file     (default: /var/log/vlb.log or /tmp/vlb.log)
 #   VLB_PID      path to the pid file     (default: /run/vlb.pid or /tmp/vlb.pid)
@@ -39,7 +39,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_DIR=$(cd -- "${SCRIPT_DIR}/.." && pwd)
 cd "${REPO_DIR}"
 
-VLB_CONFIG=${VLB_CONFIG:-"${REPO_DIR}/vlb.example.toml"}
+VLB_CONFIG=${VLB_CONFIG:-"${REPO_DIR}/examples/vlb.example.toml"}
 VLB_BIN=${VLB_BIN:-"${REPO_DIR}/target/release/vlb"}
 
 # Choose writable locations based on effective UID so the script is usable

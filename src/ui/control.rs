@@ -72,7 +72,9 @@ pub enum Request {
     },
 }
 
-fn default_limit() -> u32 { 120 }
+fn default_limit() -> u32 {
+    120
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
@@ -100,11 +102,7 @@ pub struct SystemPointWire {
     pub sample: SysSample,
 }
 
-pub async fn serve(
-    listen: String,
-    balancer: Arc<Balancer>,
-    mut shutdown: watch::Receiver<bool>,
-) {
+pub async fn serve(listen: String, balancer: Arc<Balancer>, mut shutdown: watch::Receiver<bool>) {
     let listener = match TcpListener::bind(&listen).await {
         Ok(l) => l,
         Err(e) => {
@@ -177,7 +175,9 @@ async fn handle(stream: TcpStream, balancer: Arc<Balancer>) -> Result<()> {
         Ok(Err(e)) => return Err(e.into()),
         Err(_) => {
             // Timeout: write an error and bail.
-            let resp = Response::Error { error: "request timed out".into() };
+            let resp = Response::Error {
+                error: "request timed out".into(),
+            };
             let body = serde_json::to_string(&resp)?;
             writer.write_all(body.as_bytes()).await.ok();
             writer.write_all(b"\n").await.ok();
@@ -190,7 +190,9 @@ async fn handle(stream: TcpStream, balancer: Arc<Balancer>) -> Result<()> {
 
     let response: Response = match serde_json::from_str::<Request>(line.trim()) {
         Ok(req) => dispatch(req, &balancer).await,
-        Err(e) => Response::Error { error: format!("invalid request: {e}") },
+        Err(e) => Response::Error {
+            error: format!("invalid request: {e}"),
+        },
     };
 
     let body = serde_json::to_string(&response)?;
@@ -202,33 +204,41 @@ async fn handle(stream: TcpStream, balancer: Arc<Balancer>) -> Result<()> {
 
 async fn dispatch(req: Request, balancer: &Arc<Balancer>) -> Response {
     match req {
-        Request::Status => Response::Status { snapshot: balancer.snapshot().await },
+        Request::Status => Response::Status {
+            snapshot: balancer.snapshot().await,
+        },
         Request::Force { provider } => match balancer.force_provider(&provider).await {
-            Ok(()) => Response::Ok { message: format!("forced provider = {provider}") },
-            Err(e) => Response::Error { error: e.to_string() },
+            Ok(()) => Response::Ok {
+                message: format!("forced provider = {provider}"),
+            },
+            Err(e) => Response::Error {
+                error: e.to_string(),
+            },
         },
         Request::Auto => {
             balancer.clear_force().await;
-            Response::Ok { message: "automatic selection restored".into() }
-        }
-        Request::Traffic { provider, limit } => {
-            match balancer.recent_traffic(&provider, limit) {
-                Ok(points) => Response::Traffic {
-                    points: points
-                        .into_iter()
-                        .map(|p| TrafficPointWire {
-                            ts: p.ts.to_rfc3339(),
-                            interval_s: p.interval_s,
-                            rx_bytes: p.rx_bytes,
-                            rx_packets: p.rx_packets,
-                            tx_bytes: p.tx_bytes,
-                            tx_packets: p.tx_packets,
-                        })
-                        .collect(),
-                },
-                Err(e) => Response::Error { error: e.to_string() },
+            Response::Ok {
+                message: "automatic selection restored".into(),
             }
         }
+        Request::Traffic { provider, limit } => match balancer.recent_traffic(&provider, limit) {
+            Ok(points) => Response::Traffic {
+                points: points
+                    .into_iter()
+                    .map(|p| TrafficPointWire {
+                        ts: p.ts.to_rfc3339(),
+                        interval_s: p.interval_s,
+                        rx_bytes: p.rx_bytes,
+                        rx_packets: p.rx_packets,
+                        tx_bytes: p.tx_bytes,
+                        tx_packets: p.tx_packets,
+                    })
+                    .collect(),
+            },
+            Err(e) => Response::Error {
+                error: e.to_string(),
+            },
+        },
         Request::System { limit } => match balancer.recent_system(limit) {
             Ok(points) => Response::System {
                 points: points
@@ -239,7 +249,9 @@ async fn dispatch(req: Request, balancer: &Arc<Balancer>) -> Response {
                     })
                     .collect(),
             },
-            Err(e) => Response::Error { error: e.to_string() },
+            Err(e) => Response::Error {
+                error: e.to_string(),
+            },
         },
     }
 }

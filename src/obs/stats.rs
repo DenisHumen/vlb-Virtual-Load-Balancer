@@ -80,7 +80,8 @@ impl Stats {
         )
         .context("failed to set sqlite pragmas")?;
 
-        conn.execute_batch(SCHEMA).context("failed to apply stats schema")?;
+        conn.execute_batch(SCHEMA)
+            .context("failed to apply stats schema")?;
 
         for p in providers {
             conn.execute(
@@ -101,7 +102,9 @@ impl Stats {
             )?;
         }
 
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     pub fn record_health(&self, r: &HealthRecord) -> Result<()> {
@@ -221,11 +224,7 @@ impl Stats {
     /// Latest N traffic samples for a single provider, oldest-first. Used
     /// by the TUI to draw sparklines without having to keep in-memory
     /// buffers duplicated between the daemon and the viewer.
-    pub fn recent_traffic(
-        &self,
-        provider: &str,
-        limit: u32,
-    ) -> Result<Vec<TrafficPoint>> {
+    pub fn recent_traffic(&self, provider: &str, limit: u32) -> Result<Vec<TrafficPoint>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT ts, interval_s, rx_bytes, rx_packets, tx_bytes, tx_packets
@@ -377,7 +376,8 @@ impl Stats {
     /// Aggregated, human-readable report across the trailing `hours` window.
     /// Used by the `vlb stats` CLI subcommand; the query runs read-only and
     /// does not block probe writers for any meaningful duration.
-    pub fn report(&self, hours: u32, recent: u32) -> Result<String> {        use std::fmt::Write;
+    pub fn report(&self, hours: u32, recent: u32) -> Result<String> {
+        use std::fmt::Write;
         let conn = self.conn.lock().unwrap();
         let window = format!("-{hours} hours");
 
@@ -474,7 +474,9 @@ impl Stats {
                 let max_load: Option<f64> = row.get(5)?;
                 let mem_total: Option<i64> = row.get(6)?;
                 let max_swap: Option<i64> = row.get(7)?;
-                match (avg_cpu, max_cpu, avg_mem, max_mem, avg_load, max_load, mem_total, max_swap) {
+                match (
+                    avg_cpu, max_cpu, avg_mem, max_mem, avg_load, max_load, mem_total, max_swap,
+                ) {
                     (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f), Some(g), Some(h)) => {
                         Some((a, b, c, d, e, f, g, h))
                     }
@@ -491,12 +493,17 @@ impl Stats {
             sys_agg
         {
             let mem_total_f = mem_total as f64;
-            let avg_mem_pct = if mem_total_f > 0.0 { avg_mem / mem_total_f * 100.0 } else { 0.0 };
-            let max_mem_pct = if mem_total_f > 0.0 { max_mem / mem_total_f * 100.0 } else { 0.0 };
-            let _ = writeln!(
-                s,
-                "cpu   avg {avg_cpu:>6.2}%  max {max_cpu:>6.2}%"
-            );
+            let avg_mem_pct = if mem_total_f > 0.0 {
+                avg_mem / mem_total_f * 100.0
+            } else {
+                0.0
+            };
+            let max_mem_pct = if mem_total_f > 0.0 {
+                max_mem / mem_total_f * 100.0
+            } else {
+                0.0
+            };
+            let _ = writeln!(s, "cpu   avg {avg_cpu:>6.2}%  max {max_cpu:>6.2}%");
             let _ = writeln!(
                 s,
                 "mem   avg {avg_mem_pct:>6.2}%  max {max_mem_pct:>6.2}%  (total {})",
@@ -514,7 +521,8 @@ impl Stats {
 
         // Recent failovers.
         let _ = writeln!(s);
-        let _ = writeln!(s, "recent failovers (last {recent}):");        let _ = writeln!(s, "{}", "-".repeat(72));
+        let _ = writeln!(s, "recent failovers (last {recent}):");
+        let _ = writeln!(s, "{}", "-".repeat(72));
         let mut stmt = conn.prepare(
             "SELECT ts, from_provider, to_provider, reason
              FROM failover_events
@@ -686,6 +694,71 @@ mod tests {
         let report = stats.report(24, 5).unwrap();
         assert!(report.contains("p0"));
         assert!(report.contains("bootstrap"));
+        drop(stats);
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp.with_extension("db-wal"));
+        let _ = std::fs::remove_file(tmp.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn traffic_roundtrip_and_prune() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vlb-traffic-{}-{}.db",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let stats = Stats::open(&tmp, &mk_providers()).unwrap();
+
+        let delta = crate::traffic::IfCounters {
+            rx_bytes: 1024,
+            rx_packets: 8,
+            tx_bytes: 2048,
+            tx_packets: 16,
+        };
+        stats
+            .record_traffic("p0", "eth0", Utc::now(), 1.0, &delta)
+            .unwrap();
+        let totals = stats.traffic_totals(1).unwrap();
+        assert_eq!(totals.len(), 1);
+        assert_eq!(totals[0].provider, "p0");
+        assert_eq!(totals[0].rx_bytes, 1024);
+        assert_eq!(totals[0].tx_bytes, 2048);
+
+        let recent = stats.recent_traffic("p0", 10).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].rx_bytes, 1024);
+
+        // 0-hour retention is a no-op
+        assert_eq!(stats.prune_traffic(0).unwrap(), 0);
+
+        drop(stats);
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp.with_extension("db-wal"));
+        let _ = std::fs::remove_file(tmp.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn system_record_and_recent() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vlb-sys-{}-{}.db",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let stats = Stats::open(&tmp, &mk_providers()).unwrap();
+        let sample = SysSample {
+            cpu_total: 12.5,
+            cpu_per_core: vec![10.0, 15.0],
+            mem_total: 1024,
+            mem_used: 512,
+            mem_available: 512,
+            ..Default::default()
+        };
+        stats.record_system(Utc::now(), &sample, true).unwrap();
+        let recent = stats.recent_system(10).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert!((recent[0].sample.cpu_total - 12.5).abs() < 0.001);
+        assert_eq!(recent[0].sample.cpu_per_core, vec![10.0, 15.0]);
+
         drop(stats);
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(tmp.with_extension("db-wal"));

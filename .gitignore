@@ -1,5 +1,24 @@
+# Build artefacts
 /target
+**/*.rs.bk
+
+# Local state databases
 *.db
 *.db-wal
 *.db-shm
+
+# Local config (operators copy vlb.example.toml → vlb.toml and edit secrets)
 vlb.toml
+
+# Helper scripts that aren't part of the release
+provaider
+todo.md
+
+# Editor / agent metadata
+.claude/
+.idea/
+.vscode/
+
+# OS junk
+.DS_Store
+Thumbs.db

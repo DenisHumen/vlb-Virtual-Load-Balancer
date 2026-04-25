@@ -3,17 +3,13 @@ use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::time::timeout as tokio_timeout;
 
-/// Where an internet probe should connect. Strings from `probe_targets`
-/// in the config are parsed into one of these: literal IPv4 addresses go
-/// to `Ip`, anything else is treated as a DNS name and resolved through
-/// the provider's own resolver chain (fwmark-bound) at probe time.
+/// Probe destination as configured in `health.probe_targets`.
 ///
-/// Hostnames are essential for catching the "selectively prohibited"
-/// failure mode: some misbehaving upstream routers (e.g. an ISP
-/// enforcement box on an unpaid account) return ICMP echoes for popular
-/// public DNS IPs (1.1.1.1, 8.8.8.8) but reply with
-/// `Destination Net Prohibited` for general internet destinations like
-/// `google.com`. A pure-IP probe list would never see the failure.
+/// IPv4 literals stay literal. Anything else is a hostname and gets
+/// resolved through the provider's own DNS (with the same fwmark) right
+/// before we ping it. We need hostnames because some broken uplinks let
+/// 1.1.1.1 / 8.8.8.8 through fine but return "Destination Net Prohibited"
+/// for everything else — a pure-IP probe list never sees that.
 #[derive(Debug, Clone)]
 pub enum ProbeTarget {
     Ip(Ipv4Addr),
@@ -21,10 +17,6 @@ pub enum ProbeTarget {
 }
 
 impl ProbeTarget {
-    /// Parse a config string. IPv4 literal → `Ip`, otherwise `Hostname`
-    /// after a lowercase + trim normalisation. Validation of acceptable
-    /// hostnames lives in `config.rs`; here we accept whatever the
-    /// caller already validated.
     pub fn parse(s: &str) -> Self {
         let trimmed = s.trim();
         if let Ok(ip) = trimmed.parse::<Ipv4Addr>() {
@@ -54,27 +46,20 @@ impl ProbeOutcome {
     }
 }
 
-/// Burst of ICMP echos via the system `ping` binary.
+/// Burst of ICMP echoes through the system `ping`.
 ///
-/// `mark`, if set, becomes the socket's `SO_MARK` via `ping -m <mark>`. The
-/// kernel then consults `ip rule fwmark <mark> lookup <table>` to select a
-/// per-provider routing table — this is how we probe each upstream's
-/// *internet* reachability independently, even for providers that are not
-/// currently the owner of the main default route.
+/// When `mark` is set we pass `-m <mark>`; the kernel then looks up the
+/// route via `ip rule fwmark`, so we always go out through the chosen
+/// provider's table no matter who owns the default route right now.
 ///
-/// We send `count` echoes and require at least `min_success` replies to
-/// consider the target reachable. This is deliberately stricter than a
-/// single-packet probe: real-world flaky uplinks (e.g. an upstream router
-/// alternating between forwarding and answering with
-/// `Destination Net Prohibited` because the customer's plan has expired)
-/// will randomly pass a 1-of-1 probe but consistently fail a "≥2 of 3"
-/// probe. ICMP error responses (`prohibited`, `unreachable`) do **not**
-/// increment ping's received counter, so a partially blocked link is
-/// detected reliably.
+/// We send `count` packets and need at least `min_success` of them to
+/// come back. One packet is too forgiving — flaky links (e.g. upstream
+/// alternating between OK and "Destination Net Prohibited" because of an
+/// unpaid account) win a coin-flip probe half the time. ICMP error
+/// replies don't count as `received`, so this naturally rejects them.
 ///
-/// The ping binary is additionally wrapped in a `tokio::time::timeout` as a
-/// safety net: `-W` already bounds each ICMP wait, but a stuck ping
-/// process would otherwise hang the probe task indefinitely.
+/// The whole call is also wrapped in `tokio::time::timeout` in case ping
+/// itself wedges — `-W` only bounds the ICMP wait, not the process.
 async fn ping_burst(
     target: Ipv4Addr,
     per_packet_timeout: Duration,
@@ -84,13 +69,13 @@ async fn ping_burst(
 ) -> ProbeOutcome {
     let count = count.max(1);
     let min_success = min_success.clamp(1, count);
-    // iputils ping accepts a float for `-W`; 0.2 s is the floor we allow so
-    // probes can't accidentally degenerate into instant-fail spinning.
+    // iputils takes a float for -W; floor at 200 ms so we can't degrade
+    // into a busy spin if someone sets timeout_ms = 0 in config.
     let pkt_to = per_packet_timeout.as_secs_f64().max(0.2);
     let pkt_to_str = format!("{:.2}", pkt_to);
     let count_str = count.to_string();
-    // Overall deadline = N * per-packet timeout + a slack tick. Without
-    // `-w`, ping would otherwise wait `count` seconds between packets.
+    // Overall deadline. ping waits 1s between packets by default, so we
+    // have to give it room or -w cuts the burst short.
     let deadline_secs = (pkt_to * count as f64).ceil() as u64 + 1;
     let deadline_str = deadline_secs.to_string();
     let target_str = target.to_string();
@@ -98,10 +83,14 @@ async fn ping_burst(
 
     let mut cmd = Command::new("ping");
     cmd.args([
-        "-c", &count_str,
-        "-W", &pkt_to_str,
-        "-w", &deadline_str,
-        "-n", "-q",
+        "-c",
+        &count_str,
+        "-W",
+        &pkt_to_str,
+        "-w",
+        &deadline_str,
+        "-n",
+        "-q",
     ]);
     if let Some(ref m) = mark_str {
         cmd.args(["-m", m.as_str()]);
@@ -126,9 +115,8 @@ async fn ping_burst(
         _ => return ProbeOutcome::Failed,
     };
 
-    // Parse "<n> packets transmitted, <m> received". On systems where ping
-    // exits non-zero because some packets were lost, the summary is still
-    // printed — so we ignore exit status entirely and rely on the count.
+    // ping prints the summary even when it exits non-zero (partial loss),
+    // so we ignore the exit status and trust the count.
     let stdout = std::str::from_utf8(&out.stdout).unwrap_or("");
     let received: u32 = stdout
         .lines()
@@ -143,11 +131,9 @@ async fn ping_burst(
         .unwrap_or(0);
 
     if received >= min_success {
-        // Prefer the actual round-trip time parsed from ping's `rtt
-        // min/avg/max/mdev = ... ms` summary line — `started.elapsed()`
-        // would otherwise report ~2 s for a 3-packet burst (1-second
-        // inter-packet interval), which is wall-clock time, not
-        // network latency. Fall back to elapsed only if parsing fails.
+        // Use the actual avg RTT from ping's summary line. started.elapsed()
+        // would report ~2s for a 3-packet burst (1s spacing), which has
+        // nothing to do with network latency.
         let latency = parse_rtt_avg_ms(stdout)
             .map(Duration::from_secs_f64)
             .unwrap_or_else(|| started.elapsed());
@@ -157,69 +143,48 @@ async fn ping_burst(
     }
 }
 
-/// Parse the average RTT (in **seconds**) out of iputils ping's summary
-/// line: `rtt min/avg/max/mdev = 9.342/9.362/9.374/0.014 ms`. Some
-/// distributions print `round-trip` instead of `rtt`. Returns `None` if
-/// the line is absent or malformed (e.g. all packets lost — no rtt line
-/// is emitted at all).
+/// Pull the avg RTT (in seconds) out of `rtt min/avg/max/mdev = A/B/C/D ms`.
+/// Some systems use `round-trip` instead of `rtt`. None if the line is
+/// missing (e.g. 100% loss — no rtt line is printed at all).
 fn parse_rtt_avg_ms(stdout: &str) -> Option<f64> {
     for line in stdout.lines() {
         let l = line.trim();
         if !(l.starts_with("rtt ") || l.starts_with("round-trip ")) {
             continue;
         }
-        // Format: "rtt min/avg/max/mdev = A/B/C/D ms"
         let eq_pos = l.find('=')?;
-        let rest = l[eq_pos + 1..].trim();
-        // Strip trailing " ms" (or " ms\n", already trimmed).
-        let rest = rest.trim_end_matches("ms").trim();
+        let rest = l[eq_pos + 1..].trim().trim_end_matches("ms").trim();
         let mut parts = rest.split('/');
         let _min = parts.next()?;
         let avg = parts.next()?.trim().parse::<f64>().ok()?;
-        // Convert milliseconds → seconds for the Duration constructor.
+        // ms → s for Duration::from_secs_f64.
         return Some(avg / 1000.0);
     }
     None
 }
 
-/// Ping the provider's next-hop gateway. No fwmark: the gateway lives on a
-/// directly-connected subnet and is resolved via the main table's interface
-/// route, so we always reach it the same way regardless of which provider
-/// currently owns the default.
+/// Ping the provider's next-hop on the LAN. No fwmark needed — the
+/// gateway is directly connected, the main table always reaches it.
 pub async fn check_gateway(gateway: Ipv4Addr, timeout: Duration) -> ProbeOutcome {
-    // Gateway lives on the directly-connected LAN; one packet is enough,
-    // and flapping is essentially impossible. Cheaper for the hot path.
+    // Single packet is fine here: it's a LAN hop, won't flap.
     ping_burst(gateway, timeout, 1, 1, None).await
 }
 
-/// Ping external targets via a specific provider, forced by fwmark.
+/// End-to-end internet probe via a specific provider's fwmark.
 ///
-/// Targets fall into two classes:
-///   - `Ip(addr)`        — pinged directly with the provider's mark.
-///   - `Hostname(name)`  — first resolved via the provider's mark-bound
-///     DNS (so the resolution itself proves the provider's UDP/53 path
-///     is alive), then the resulting IPv4 is pinged with the same mark.
+/// `Ip` targets are pinged directly. `Hostname` targets are first
+/// resolved through the provider's own DNS (also fwmarked), then the
+/// resulting IP is pinged with the same mark. Each target gets a 3/2
+/// burst (3 packets, need at least 2 replies).
 ///
-/// Each target is hit with a 3-packet burst, requiring at least 2 echo
-/// replies. This catches the "intermittent prohibited" failure mode
-/// where an upstream router (e.g. an ISP enforcement box for an unpaid
-/// account) answers some echoes normally and others with
-/// `Destination Net Prohibited` — a single-packet probe would flap
-/// depending on which half of the cycle it lands in.
+/// Pass rules:
+///   * if any hostname targets are configured, at least one of them
+///     must succeed — otherwise a happy 1.1.1.1 reply would mask an
+///     uplink that selectively blocks everything else;
+///   * if only IP targets are configured, any one of them passing wins.
 ///
-/// Success semantics are deliberately asymmetric:
-///   - If **any hostname** target is configured, **at least one
-///     hostname target must succeed**. Hostname probes are the only
-///     reliable way to detect "selectively prohibited" uplinks that
-///     allow ICMP to popular public DNS IPs (1.1.1.1, 8.8.8.8) but
-///     block general destinations like `google.com`. Without this
-///     rule, an early-success on the IP probe would short-circuit and
-///     mask the failure.
-///   - If only IP targets are configured, "any one IP succeeds" wins.
-///
-/// All targets are evaluated each probe cycle (no early return) so a
-/// later success can rescue an earlier hiccup, and the reported latency
-/// comes from the first successful target encountered.
+/// All targets run concurrently and we evaluate them all (no early
+/// return), so a later success can rescue an earlier flap.
 pub async fn check_internet_via(
     targets: &[ProbeTarget],
     resolvers: &[Ipv4Addr],
@@ -230,11 +195,8 @@ pub async fn check_internet_via(
         return ProbeOutcome::Failed;
     }
 
-    // Run every target's probe concurrently. Sequential evaluation would
-    // serialise N×~3 s ping bursts plus DNS round-trips and easily blow
-    // past `interval_secs`, starving the rest of the health loop. Each
-    // task is independent, owns its own DNS socket and ping subprocess,
-    // so concurrency is safe — the mark is just a u32 we copy in.
+    // Concurrent: serial would stack N×~3s bursts plus DNS RTTs and blow
+    // through interval_secs. Each subtask is independent.
     let resolvers_owned: Vec<Ipv4Addr> = resolvers.to_vec();
     let mut tasks: Vec<tokio::task::JoinHandle<TargetResult>> = Vec::with_capacity(targets.len());
     for t in targets {
@@ -244,7 +206,10 @@ pub async fn check_internet_via(
             match target {
                 ProbeTarget::Ip(ip) => {
                     let outcome = ping_burst(ip, timeout, 3, 2, Some(mark)).await;
-                    TargetResult { is_hostname: false, outcome }
+                    TargetResult {
+                        is_hostname: false,
+                        outcome,
+                    }
                 }
                 ProbeTarget::Hostname(name) => {
                     let ip = match resolve_a_via(&resolvers, &name, timeout, mark).await {
@@ -257,7 +222,10 @@ pub async fn check_internet_via(
                         }
                     };
                     let outcome = ping_burst(ip, timeout, 3, 2, Some(mark)).await;
-                    TargetResult { is_hostname: true, outcome }
+                    TargetResult {
+                        is_hostname: true,
+                        outcome,
+                    }
                 }
             }
         }));
@@ -269,11 +237,10 @@ pub async fn check_internet_via(
     let mut first_success_latency: Option<Duration> = None;
 
     for h in tasks {
+        // A panicked subtask counts as a failed probe — we never want a
+        // panic to silently pass health.
         let res = match h.await {
             Ok(r) => r,
-            // A panic in a probe task is treated as a failed probe — we
-            // never want a panic to bypass the health checks. The panic
-            // itself will already be logged by Tokio's default handler.
             Err(_) => continue,
         };
         if res.is_hostname {
@@ -303,9 +270,8 @@ struct TargetResult {
     outcome: ProbeOutcome,
 }
 
-/// Build a minimal DNS query (UDP wire format) for an A record. Returns
-/// `(packet, txid)`. The transaction id is randomised so concurrent probes
-/// can't accidentally accept each other's replies if the resolver is slow.
+/// Build a minimal DNS A-query in wire format. The transaction id is
+/// random so concurrent probes won't pick up each other's replies.
 #[cfg(target_os = "linux")]
 fn build_dns_query(name: &str, txid: u16) -> Vec<u8> {
     let mut buf = Vec::with_capacity(32 + name.len());
@@ -316,7 +282,7 @@ fn build_dns_query(name: &str, txid: u16) -> Vec<u8> {
     buf.extend_from_slice(&0u16.to_be_bytes()); // ancount
     buf.extend_from_slice(&0u16.to_be_bytes()); // nscount
     buf.extend_from_slice(&0u16.to_be_bytes()); // arcount
-    // QNAME: sequence of length-prefixed labels, terminated by 0.
+                                                // QNAME: sequence of length-prefixed labels, terminated by 0.
     for label in name.split('.').filter(|l| !l.is_empty()) {
         let bytes = label.as_bytes();
         let len = bytes.len().min(63) as u8;
@@ -329,10 +295,9 @@ fn build_dns_query(name: &str, txid: u16) -> Vec<u8> {
     buf
 }
 
-/// Inspect a DNS reply: must match `txid`, have RCODE=0 (NOERROR) and
-/// at least one answer record. We don't bother parsing the answer section
-/// fully — the answer count alone is enough to distinguish "resolver alive
-/// AND returned data" from "resolver replied with REFUSED/NXDOMAIN/empty".
+/// Quick reply check: matching txid, response bit set, NOERROR, at
+/// least one answer. Good enough to tell "resolver works" from
+/// "resolver returned REFUSED / NXDOMAIN / silence".
 #[cfg(target_os = "linux")]
 fn dns_reply_ok(reply: &[u8], txid: u16) -> bool {
     if reply.len() < 12 {
@@ -351,12 +316,10 @@ fn dns_reply_ok(reply: &[u8], txid: u16) -> bool {
     ancount > 0
 }
 
-/// One DNS A-query against a single resolver, optionally bound to a
-/// per-provider fwmark via `SO_MARK`. The kernel then routes the packet
-/// through the corresponding `ip rule fwmark <mark>` table — same
-/// mechanism `ping -m` uses for ICMP. This catches the failure mode where
-/// the link is up (ICMP works), but the ISP has cut UDP/53 because the
-/// account is unpaid or the captive portal is intercepting traffic.
+/// One DNS A-query against a single resolver, optionally bound to the
+/// given fwmark via SO_MARK so the query goes out through the right
+/// provider. Catches the case where ICMP works but UDP/53 is dropped
+/// (unpaid account, captive portal).
 #[cfg(target_os = "linux")]
 async fn dns_query_once(
     resolver: Ipv4Addr,
@@ -374,11 +337,10 @@ async fn dns_query_once(
         return ProbeOutcome::Failed;
     }
     if let Some(m) = mark {
-        // SO_MARK is a privileged socket option (CAP_NET_ADMIN). The vlb
-        // daemon already runs as root for ip-rule/iptables management, so
-        // setting it here is allowed; on a non-privileged process this
-        // setsockopt would fail with EPERM and the probe is treated as
-        // failed — better than silently routing through the wrong path.
+        // SO_MARK needs CAP_NET_ADMIN. The daemon already runs as root for
+        // ip-rule / iptables, so we have it. If we ever lose it,
+        // setsockopt returns EPERM and we report Failed instead of
+        // silently routing the wrong way.
         let fd = std_sock.as_raw_fd();
         let val: libc::c_int = m as libc::c_int;
         let rc = unsafe {
@@ -405,15 +367,18 @@ async fn dns_query_once(
     let dst = std::net::SocketAddr::from((resolver, 53u16));
 
     let started = Instant::now();
-    if tokio_timeout(timeout, sock.send_to(&pkt, dst)).await.is_err() {
+    if tokio_timeout(timeout, sock.send_to(&pkt, dst))
+        .await
+        .is_err()
+    {
         return ProbeOutcome::Failed;
     }
 
     let mut buf = [0u8; 1500];
     match tokio_timeout(timeout, sock.recv_from(&mut buf)).await {
-        Ok(Ok((n, _))) if dns_reply_ok(&buf[..n], txid) => {
-            ProbeOutcome::Success { latency: started.elapsed() }
-        }
+        Ok(Ok((n, _))) if dns_reply_ok(&buf[..n], txid) => ProbeOutcome::Success {
+            latency: started.elapsed(),
+        },
         _ => ProbeOutcome::Failed,
     }
 }
@@ -428,11 +393,9 @@ async fn dns_query_once(
     ProbeOutcome::Failed
 }
 
-/// DNS reachability check via a specific provider's fwmark. Tries each
-/// resolver in order, returning success on the first one that gives a
-/// valid answer for `name`. Fails only if **all** resolvers fail to
-/// respond or return errors — single-resolver hiccups must not flap the
-/// state machine.
+/// Send DNS A-queries through the provider's mark, return the IP of the
+/// first responsive resolver. Fails only if **all** resolvers are
+/// unreachable or unable to answer.
 pub async fn check_dns_via(
     resolvers: &[Ipv4Addr],
     name: &str,
@@ -448,13 +411,9 @@ pub async fn check_dns_via(
     ProbeOutcome::Failed
 }
 
-/// Resolve `name` to an IPv4 address through the first responsive
-/// resolver in `resolvers`, with the query routed via the provider's
-/// `mark`. Returns `None` if every resolver fails, returns no answers,
-/// or sends a malformed packet. This is the building block that lets
-/// `check_internet_via` ping arbitrary hostnames per-provider without
-/// depending on the system resolver (which would always use whichever
-/// provider currently owns the default route).
+/// Resolve `name` to IPv4 through the provider's mark. Used by
+/// `check_internet_via` so hostname probes don't depend on the system
+/// resolver (which always uses whichever provider owns the default).
 #[cfg(target_os = "linux")]
 async fn resolve_a_via(
     resolvers: &[Ipv4Addr],
@@ -480,11 +439,8 @@ async fn resolve_a_via(
     None
 }
 
-/// Send one DNS A-query and parse the first A record from the answer
-/// section. Mirrors `dns_query_once` but extracts the rdata instead of
-/// only checking ancount, so callers can use the resolved IP for
-/// downstream probes (e.g. ICMP). Returns `None` on any malformation,
-/// timeout, or empty answer set.
+/// Send a DNS A-query and pull out the first A record's IP. Like
+/// `dns_query_once` but returns the rdata, not just a yes/no.
 #[cfg(target_os = "linux")]
 async fn dns_resolve_a_once(
     resolver: Ipv4Addr,
@@ -522,7 +478,10 @@ async fn dns_resolve_a_once(
     let qsize = pkt.len() - 12;
     let dst = std::net::SocketAddr::from((resolver, 53u16));
 
-    if tokio_timeout(timeout, sock.send_to(&pkt, dst)).await.is_err() {
+    if tokio_timeout(timeout, sock.send_to(&pkt, dst))
+        .await
+        .is_err()
+    {
         return None;
     }
 
@@ -534,12 +493,10 @@ async fn dns_resolve_a_once(
     dns_extract_first_a(&buf[..n], txid, qsize)
 }
 
-/// Walk a DNS reply's answer section and return the first A record's
-/// IPv4 payload. Tolerant of compressed names (RFC 1035 §4.1.4): a
-/// pointer is detected via the high two bits being 11 and consumes 2
-/// bytes; uncompressed names walk length-prefixed labels until a 0
-/// terminator. Returns `None` on any out-of-bounds read, wrong txid,
-/// non-response flag, non-NOERROR rcode, or absence of A/IN records.
+/// Walk the answer section, return the first A record's IPv4. Handles
+/// DNS name compression (RFC 1035 §4.1.4): a pointer is two bytes whose
+/// top two bits are `11`. Returns None on any malformed data, wrong
+/// txid, non-response, non-NOERROR, or absence of an A record.
 #[cfg(target_os = "linux")]
 fn dns_extract_first_a(reply: &[u8], txid: u16, qsize: usize) -> Option<Ipv4Addr> {
     if reply.len() < 12 + qsize {
@@ -614,7 +571,9 @@ mod tests {
 
     #[test]
     fn outcome_helpers() {
-        let ok = ProbeOutcome::Success { latency: Duration::from_millis(5) };
+        let ok = ProbeOutcome::Success {
+            latency: Duration::from_millis(5),
+        };
         assert!(ok.is_success());
         assert_eq!(ok.latency_ms(), Some(5.0));
 
@@ -655,9 +614,7 @@ mod tests {
         );
         // Partial loss.
         assert_eq!(
-            extract(
-                "3 packets transmitted, 1 received, 66% packet loss, time 2003ms\n"
-            ),
+            extract("3 packets transmitted, 1 received, 66% packet loss, time 2003ms\n"),
             1
         );
         // ICMP errors counted separately by ping — they are NOT in the
@@ -670,9 +627,7 @@ mod tests {
         );
         // Total loss.
         assert_eq!(
-            extract(
-                "3 packets transmitted, 0 received, 100% packet loss, time 2003ms\n"
-            ),
+            extract("3 packets transmitted, 0 received, 100% packet loss, time 2003ms\n"),
             0
         );
         // Empty/garbage.
@@ -688,7 +643,7 @@ mod tests {
         assert_eq!(&pkt[..2], &[0xBE, 0xEF]);
         assert_eq!(&pkt[2..4], &[0x01, 0x00]); // RD set
         assert_eq!(&pkt[4..6], &[0x00, 0x01]); // qdcount = 1
-        // QNAME: 1 'a' 2 'b' 'c' 0
+                                               // QNAME: 1 'a' 2 'b' 'c' 0
         assert_eq!(&pkt[12..18], &[1, b'a', 2, b'b', b'c', 0]);
         // QTYPE = A (1), QCLASS = IN (1).
         assert_eq!(&pkt[18..22], &[0x00, 0x01, 0x00, 0x01]);
@@ -730,10 +685,13 @@ mod tests {
         buf.extend_from_slice(&1u16.to_be_bytes()); // ancount
         buf.extend_from_slice(&0u16.to_be_bytes()); // nscount
         buf.extend_from_slice(&0u16.to_be_bytes()); // arcount
-        // Question: x.io / A / IN
+                                                    // Question: x.io / A / IN
         let qname_offset = buf.len() as u16;
-        buf.push(1); buf.push(b'x');
-        buf.push(2); buf.push(b'i'); buf.push(b'o');
+        buf.push(1);
+        buf.push(b'x');
+        buf.push(2);
+        buf.push(b'i');
+        buf.push(b'o');
         buf.push(0);
         buf.extend_from_slice(&1u16.to_be_bytes()); // qtype
         buf.extend_from_slice(&1u16.to_be_bytes()); // qclass
@@ -772,8 +730,11 @@ mod tests {
         multi.extend_from_slice(&0u16.to_be_bytes());
         multi.extend_from_slice(&0u16.to_be_bytes());
         let qname_offset_m = multi.len() as u16;
-        multi.push(1); multi.push(b'a');
-        multi.push(2); multi.push(b'i'); multi.push(b'o');
+        multi.push(1);
+        multi.push(b'a');
+        multi.push(2);
+        multi.push(b'i');
+        multi.push(b'o');
         multi.push(0);
         multi.extend_from_slice(&1u16.to_be_bytes());
         multi.extend_from_slice(&1u16.to_be_bytes());

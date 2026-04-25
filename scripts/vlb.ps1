@@ -24,7 +24,7 @@ $ErrorActionPreference = 'Stop'
 $RepoDir = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 Set-Location $RepoDir
 
-$VlbConfig = if ($env:VLB_CONFIG) { $env:VLB_CONFIG } else { Join-Path $RepoDir 'vlb.example.toml' }
+$VlbConfig = if ($env:VLB_CONFIG) { $env:VLB_CONFIG } else { Join-Path $RepoDir 'examples/vlb.example.toml' }
 $VlbBin    = if ($env:VLB_BIN)    { $env:VLB_BIN }    else { Join-Path $RepoDir 'target\release\vlb.exe' }
 $VlbPid    = if ($env:VLB_PID)    { $env:VLB_PID }    else { Join-Path $env:TEMP 'vlb.pid' }
 $VlbLog    = if ($env:VLB_LOG)    { $env:VLB_LOG }    else { Join-Path $env:TEMP 'vlb.log' }

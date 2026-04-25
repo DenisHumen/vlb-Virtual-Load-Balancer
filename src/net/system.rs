@@ -75,10 +75,7 @@ async fn tune_sysctl() -> Result<()> {
     }
 
     // Persist knobs across reboots.
-    let persisted: String = knobs
-        .iter()
-        .map(|(k, v)| format!("{k} = {v}\n"))
-        .collect();
+    let persisted: String = knobs.iter().map(|(k, v)| format!("{k} = {v}\n")).collect();
     if let Err(e) = tokio::fs::write("/etc/sysctl.d/99-vlb.conf", persisted).await {
         warn!(error = %e, "failed to persist sysctl settings (non-fatal)");
     }
@@ -98,12 +95,22 @@ async fn which(bin: &str) -> bool {
 
 async fn disable_host_firewall() {
     if which("ufw").await {
-        let _ = Command::new("ufw").arg("--force").arg("disable").status().await;
+        let _ = Command::new("ufw")
+            .arg("--force")
+            .arg("disable")
+            .status()
+            .await;
         warn!("ufw disabled (disable_host_firewall=true)");
     }
     if which("firewall-cmd").await {
-        let _ = Command::new("systemctl").args(["stop", "firewalld"]).status().await;
-        let _ = Command::new("systemctl").args(["disable", "firewalld"]).status().await;
+        let _ = Command::new("systemctl")
+            .args(["stop", "firewalld"])
+            .status()
+            .await;
+        let _ = Command::new("systemctl")
+            .args(["disable", "firewalld"])
+            .status()
+            .await;
         warn!("firewalld stopped & disabled (disable_host_firewall=true)");
     }
 }
@@ -126,7 +133,16 @@ async fn configure_nat(cfg: &Config) -> Result<()> {
 
         // Idempotency: `-C` checks whether the rule already exists.
         let check = Command::new("iptables")
-            .args(["-t", "nat", "-C", "POSTROUTING", "-o", &iface, "-j", "MASQUERADE"])
+            .args([
+                "-t",
+                "nat",
+                "-C",
+                "POSTROUTING",
+                "-o",
+                &iface,
+                "-j",
+                "MASQUERADE",
+            ])
             .status()
             .await;
         if matches!(check, Ok(s) if s.success()) {
@@ -135,7 +151,16 @@ async fn configure_nat(cfg: &Config) -> Result<()> {
         }
 
         let add = Command::new("iptables")
-            .args(["-t", "nat", "-A", "POSTROUTING", "-o", &iface, "-j", "MASQUERADE"])
+            .args([
+                "-t",
+                "nat",
+                "-A",
+                "POSTROUTING",
+                "-o",
+                &iface,
+                "-j",
+                "MASQUERADE",
+            ])
             .status()
             .await
             .context("failed to invoke iptables for MASQUERADE rule")?;
@@ -185,10 +210,15 @@ async fn setup_policy_routing(cfg: &Config) -> Result<()> {
         //     handles both "no route yet" and "route from a prior run".
         let route = Command::new("ip")
             .args([
-                "route", "replace", "default",
-                "via", &gw,
-                "dev", &p.interface,
-                "table", &table_str,
+                "route",
+                "replace",
+                "default",
+                "via",
+                &gw,
+                "dev",
+                &p.interface,
+                "table",
+                &table_str,
             ])
             .status()
             .await
@@ -220,10 +250,7 @@ async fn setup_policy_routing(cfg: &Config) -> Result<()> {
         // (3) Install a fresh rule: fwmark M lookup T at pref P.
         let add = Command::new("ip")
             .args([
-                "rule", "add",
-                "pref", &pref_str,
-                "fwmark", &mark_str,
-                "lookup", &table_str,
+                "rule", "add", "pref", &pref_str, "fwmark", &mark_str, "lookup", &table_str,
             ])
             .status()
             .await

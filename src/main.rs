@@ -3,16 +3,38 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tokio::sync::watch;
 
+// Source layout (kept flat at the crate root via `#[path]` so every
+// `use crate::xxx::Item` keeps working without churn):
+//
+//   core/  — orchestration core (balancer state machine, config schema)
+//   net/   — kernel-facing networking (router, system bring-up, probes,
+//            /proc/net/dev sampling)
+//   obs/   — observability (tracing init, SQLite stats, host metrics)
+//   ui/    — operator-facing surfaces (TUI, control protocol)
+#[path = "core/balancer.rs"]
 mod balancer;
+#[path = "core/config.rs"]
 mod config;
-mod control;
+
+#[path = "net/health.rs"]
 mod health;
-mod logger;
+#[path = "net/router.rs"]
 mod router;
-mod stats;
+#[path = "net/system.rs"]
 mod system;
-mod sysmon;
+#[path = "net/traffic.rs"]
 mod traffic;
+
+#[path = "obs/logger.rs"]
+mod logger;
+#[path = "obs/stats.rs"]
+mod stats;
+#[path = "obs/sysmon.rs"]
+mod sysmon;
+
+#[path = "ui/control.rs"]
+mod control;
+#[path = "ui/tui.rs"]
 mod tui;
 
 use crate::balancer::Balancer;
@@ -119,11 +141,7 @@ async fn main() -> Result<()> {
         Command::Force { provider } => {
             let config = Config::load(&cli.config)?;
             config.validate()?;
-            let resp = control::send(
-                &config.control.listen,
-                &Request::Force { provider },
-            )
-            .await?;
+            let resp = control::send(&config.control.listen, &Request::Force { provider }).await?;
             print_response(&resp);
             Ok(())
         }
@@ -137,8 +155,7 @@ async fn main() -> Result<()> {
         Command::System { limit } => {
             let config = Config::load(&cli.config)?;
             config.validate()?;
-            let resp =
-                control::send(&config.control.listen, &Request::System { limit }).await?;
+            let resp = control::send(&config.control.listen, &Request::System { limit }).await?;
             print_response(&resp);
             Ok(())
         }
@@ -344,11 +361,10 @@ async fn diag(config: &Config) -> Result<()> {
                     Err(e) => println!("  traffic {:<14} query error: {e}", p.name),
                 }
             }
-            let sys_row: rusqlite::Result<(i64, Option<String>)> = conn.query_row(
-                "SELECT COUNT(*), MAX(ts) FROM system_samples",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            );
+            let sys_row: rusqlite::Result<(i64, Option<String>)> =
+                conn.query_row("SELECT COUNT(*), MAX(ts) FROM system_samples", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                });
             match sys_row {
                 Ok((n, ts)) => println!(
                     "  system                rows={:>6}  last={}",

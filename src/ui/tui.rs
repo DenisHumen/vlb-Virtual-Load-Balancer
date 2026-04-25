@@ -97,9 +97,7 @@ impl App {
                     self.selected = self.snapshot.providers.len().saturating_sub(1);
                 }
             }
-            Ok(Response::Error { error }) => {
-                self.set_message(format!("status error: {error}"))
-            }
+            Ok(Response::Error { error }) => self.set_message(format!("status error: {error}")),
             Ok(_) => self.set_message("unexpected response to status"),
             Err(e) => self.set_message(format!("refresh failed: {e}")),
         }
@@ -107,7 +105,10 @@ impl App {
         for p in self.snapshot.providers.clone() {
             match control::send(
                 &self.listen,
-                &Request::Traffic { provider: p.name.clone(), limit: 180 },
+                &Request::Traffic {
+                    provider: p.name.clone(),
+                    limit: 180,
+                },
             )
             .await
             {
@@ -128,8 +129,17 @@ impl App {
     }
 
     async fn force_selected(&mut self) {
-        let Some(p) = self.selected_provider().cloned() else { return };
-        match control::send(&self.listen, &Request::Force { provider: p.name.clone() }).await {
+        let Some(p) = self.selected_provider().cloned() else {
+            return;
+        };
+        match control::send(
+            &self.listen,
+            &Request::Force {
+                provider: p.name.clone(),
+            },
+        )
+        .await
+        {
             Ok(Response::Ok { message }) => self.set_message(message),
             Ok(Response::Error { error }) => self.set_message(format!("error: {error}")),
             Ok(_) => self.set_message("unexpected response"),
@@ -236,9 +246,13 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
 
 fn state_style(state: State) -> Style {
     match state {
-        State::Up => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        State::Up => Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
         State::Down => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        State::Unknown => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        State::Unknown => Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
     }
 }
 
@@ -295,7 +309,9 @@ fn draw_system(f: &mut ratatui::Frame, area: Rect, app: &App) {
     f.render_widget(
         Gauge::default()
             .gauge_style(
-                Style::default().fg(level_color(cpu_pct as f64)).bg(Color::Black),
+                Style::default()
+                    .fg(level_color(cpu_pct as f64))
+                    .bg(Color::Black),
             )
             .percent(cpu_pct as u16)
             .label(format!("CPU  {cpu_pct:5.1}%")),
@@ -304,7 +320,9 @@ fn draw_system(f: &mut ratatui::Frame, area: Rect, app: &App) {
     f.render_widget(
         Gauge::default()
             .gauge_style(
-                Style::default().fg(level_color(mem_pct as f64)).bg(Color::Black),
+                Style::default()
+                    .fg(level_color(mem_pct as f64))
+                    .bg(Color::Black),
             )
             .percent(mem_pct as u16)
             .label(format!(
@@ -317,7 +335,9 @@ fn draw_system(f: &mut ratatui::Frame, area: Rect, app: &App) {
     f.render_widget(
         Gauge::default()
             .gauge_style(
-                Style::default().fg(level_color(swap_pct as f64)).bg(Color::Black),
+                Style::default()
+                    .fg(level_color(swap_pct as f64))
+                    .bg(Color::Black),
             )
             .percent(swap_pct as u16)
             .label(format!(
@@ -330,7 +350,9 @@ fn draw_system(f: &mut ratatui::Frame, area: Rect, app: &App) {
     f.render_widget(
         Gauge::default()
             .gauge_style(
-                Style::default().fg(level_color(disk_pct as f64)).bg(Color::Black),
+                Style::default()
+                    .fg(level_color(disk_pct as f64))
+                    .bg(Color::Black),
             )
             .percent(disk_pct as u16)
             .label(format!(
@@ -400,8 +422,7 @@ fn draw_per_core_grid(f: &mut ratatui::Frame, area: Rect, cores: &[f32]) {
     let rows_needed = cores.len().div_ceil(cols);
     let rows_n = rows_needed.min(area.height as usize).max(1);
 
-    let row_constraints: Vec<Constraint> =
-        (0..rows_n).map(|_| Constraint::Length(1)).collect();
+    let row_constraints: Vec<Constraint> = (0..rows_n).map(|_| Constraint::Length(1)).collect();
     let row_rects = Layout::default()
         .direction(Direction::Vertical)
         .constraints(row_constraints)
@@ -423,7 +444,9 @@ fn draw_per_core_grid(f: &mut ratatui::Frame, area: Rect, cores: &[f32]) {
             let g = Gauge::default()
                 .percent(pct as u16)
                 .gauge_style(
-                    Style::default().fg(level_color(pct as f64)).bg(Color::Black),
+                    Style::default()
+                        .fg(level_color(pct as f64))
+                        .bg(Color::Black),
                 )
                 .label(format!("c{idx:<2}{pct:>4.0}%"));
             f.render_widget(g, *cell_rect);
@@ -438,7 +461,11 @@ fn draw_cpu_history(f: &mut ratatui::Frame, area: Rect, app: &App) {
         .map(|p| p.sample.cpu_total.clamp(0.0, 100.0) as u64)
         .collect();
     let spark = Sparkline::default()
-        .block(Block::default().borders(Borders::TOP).title(" cpu history "))
+        .block(
+            Block::default()
+                .borders(Borders::TOP)
+                .title(" cpu history "),
+        )
         .max(100)
         .style(Style::default().fg(Color::Cyan))
         .data(&data);
@@ -496,7 +523,9 @@ fn draw_providers(f: &mut ratatui::Frame, area: Rect, app: &App) {
             ]);
             if i == app.selected {
                 row = row.style(
-                    Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
                 );
             }
             row
@@ -527,11 +556,7 @@ fn draw_traffic(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let Some(selected) = app.selected_provider() else {
         return;
     };
-    let points = app
-        .traffic
-        .get(&selected.name)
-        .cloned()
-        .unwrap_or_default();
+    let points = app.traffic.get(&selected.name).cloned().unwrap_or_default();
 
     let rx: Vec<(f64, f64)> = points
         .iter()

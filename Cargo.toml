@@ -1,13 +1,17 @@
 [package]
-name = "virtual-load-balancer"
-version = "0.1.0"
+name = "vlb"
+version = "0.0.1-alpha"
 edition = "2021"
-# MSRV 1.85 — required because our transitive deps (clap_lex 1.1, anstream 1.0,
-# serde 1.0.228, etc.) have adopted Cargo `edition2024`. The launcher script
-# (`scripts/vlb.sh`) will bootstrap rustup/stable automatically if needed.
+# Pinned to stable 1.85+ because several transitive crates (clap_lex 1.1,
+# anstream 1.0, serde 1.0.228) require Cargo `edition2024`. The launcher
+# script bootstraps rustup if a host has an older toolchain.
 rust-version = "1.85"
-description = "High-performance multi-provider failover gateway for Linux"
+description = "Multi-uplink failover gateway for Linux: per-provider health probes (ICMP+DNS, fwmark-bound), automatic default-route switching, conntrack flushing, SQLite stats, TUI."
 license = "MIT"
+repository = "https://github.com/denishumen/vlb"
+readme = "README.md"
+keywords = ["networking", "failover", "gateway", "linux", "policy-routing"]
+categories = ["command-line-utilities", "network-programming"]
 
 [[bin]]
 name = "vlb"

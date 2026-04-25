@@ -1,0 +1,32 @@
+services:
+  vlb:
+    build:
+      # Build context is the repo root so the Dockerfile can COPY src/.
+      # Run with: `docker compose -f docker/docker-compose.yml up -d --build`
+      # or `(cd docker && docker compose up -d --build)`.
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: vlb:0.0.1-alpha
+    container_name: vlb
+    restart: unless-stopped
+    # vlb writes ip rules, ip routes, iptables and uses SO_MARK for probes.
+    # Running with host networking + NET_ADMIN/NET_RAW gives it the same
+    # view the host kernel has, which is what every command above needs.
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    volumes:
+      - ../vlb.toml:/etc/vlb/vlb.toml:ro
+      - ../data:/var/lib/vlb
+    environment:
+      RUST_LOG: info
+    command: ["run", "--config", "/etc/vlb/vlb.toml"]
+    healthcheck:
+      test: ["CMD", "vlb", "--config", "/etc/vlb/vlb.toml", "status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

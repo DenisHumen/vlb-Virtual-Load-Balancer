@@ -1,26 +1,25 @@
 //! btop-style host metrics sampler.
 //!
-//! Collects the same set of signals btop / htop display: per-core CPU
-//! utilisation, total/used memory, swap, load average, disk totals and
-//! aggregate network I/O. The sampler is deliberately cheap — it uses a
-//! single `sysinfo::System` instance refreshed on every tick, not a new
-//! allocation each call.
+//! Collects the things btop / htop show: per-core CPU, mem/swap, load
+//! averages, disk totals, aggregate network I/O. Cheap on purpose —
+//! reuses a single `sysinfo::System` across ticks instead of allocating.
 //!
-//! The heavy `sysinfo::System` state (`Arc<Mutex<…>>`) is owned by the
-//! background loop in `balancer::system_loop`; this module only offers the
-//! value types and a stateless `sample()` helper for tests.
+//! The actual `Arc<Mutex<System>>` lives in `balancer::system_loop`.
+//! This module just defines the value types and a stateless `sample()`
+//! helper for tests.
 
 use serde::{Deserialize, Serialize};
-use sysinfo::{CpuRefreshKind, MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+use sysinfo::{
+    CpuRefreshKind, MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System,
+};
 
-/// Flattened system snapshot that goes to the DB, the control port and
-/// the TUI. All numeric fields are intentionally plain primitives so the
-/// struct serialises cleanly to JSON and SQLite.
+/// Flat system snapshot for the DB, control port and TUI. Plain
+/// primitives only so it serialises cleanly to JSON/SQLite.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SysSample {
-    /// Aggregate CPU usage in the range [0, 100].
+    /// Total CPU usage, 0..=100.
     pub cpu_total: f32,
-    /// Per-core usage (percent) — same ordering as `/proc/stat`.
+    /// Per-core usage (percent), in /proc/stat order.
     pub cpu_per_core: Vec<f32>,
 
     /// Memory in bytes.
@@ -191,7 +190,9 @@ impl SysMonitor {
 }
 
 impl Default for SysMonitor {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -205,7 +206,10 @@ mod tests {
         let _ = m.sample();
         std::thread::sleep(std::time::Duration::from_millis(50));
         let s = m.sample();
-        assert!(s.mem_total > 0, "total memory must be > 0 on any running host");
+        assert!(
+            s.mem_total > 0,
+            "total memory must be > 0 on any running host"
+        );
         assert!(s.cpu_total >= 0.0 && s.cpu_total <= 100.0 * s.cpu_per_core.len() as f32);
         assert!(s.mem_pct() >= 0.0 && s.mem_pct() <= 100.0);
         // load average is always available on Linux/macOS; on Windows

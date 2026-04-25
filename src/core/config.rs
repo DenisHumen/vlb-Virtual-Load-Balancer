@@ -93,11 +93,21 @@ impl Default for HealthConfig {
     }
 }
 
-fn default_interval() -> u64 { 3 }
-fn default_timeout_ms() -> u64 { 1000 }
-fn default_failure_threshold() -> u32 { 2 }
-fn default_success_threshold() -> u32 { 2 }
-fn default_status_interval() -> u64 { 30 }
+fn default_interval() -> u64 {
+    3
+}
+fn default_timeout_ms() -> u64 {
+    1000
+}
+fn default_failure_threshold() -> u32 {
+    2
+}
+fn default_success_threshold() -> u32 {
+    2
+}
+fn default_status_interval() -> u64 {
+    30
+}
 fn default_probe_targets() -> Vec<String> {
     // Two well-known DNS IPs (cheap reachability) plus a real hostname
     // (catches selectively prohibited upstreams that allow specific IPs
@@ -108,11 +118,15 @@ fn default_probe_targets() -> Vec<String> {
         "google.com".to_string(),
     ]
 }
-fn default_dns_enabled() -> bool { true }
+fn default_dns_enabled() -> bool {
+    true
+}
 fn default_dns_resolvers() -> Vec<Ipv4Addr> {
     vec![Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(8, 8, 8, 8)]
 }
-fn default_dns_name() -> String { "cloudflare.com".to_string() }
+fn default_dns_name() -> String {
+    "cloudflare.com".to_string()
+}
 
 /// Per-provider policy routing configuration.
 ///
@@ -142,9 +156,15 @@ impl Default for RoutingConfig {
     }
 }
 
-fn default_table_base() -> u32 { 200 }
-fn default_fwmark_base() -> u32 { 0x200 }
-fn default_rule_pref() -> u32 { 32000 }
+fn default_table_base() -> u32 {
+    200
+}
+fn default_fwmark_base() -> u32 {
+    0x200
+}
+fn default_rule_pref() -> u32 {
+    32000
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct FirewallConfig {
@@ -157,11 +177,17 @@ pub struct FirewallConfig {
 
 impl Default for FirewallConfig {
     fn default() -> Self {
-        Self { manage: true, disable_host_firewall: false, wan_interface: None }
+        Self {
+            manage: true,
+            disable_host_firewall: false,
+            wan_interface: None,
+        }
     }
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct DatabaseConfig {
@@ -170,10 +196,16 @@ pub struct DatabaseConfig {
 }
 
 impl Default for DatabaseConfig {
-    fn default() -> Self { Self { path: default_db_path() } }
+    fn default() -> Self {
+        Self {
+            path: default_db_path(),
+        }
+    }
 }
 
-fn default_db_path() -> PathBuf { PathBuf::from("/var/lib/vlb/stats.db") }
+fn default_db_path() -> PathBuf {
+    PathBuf::from("/var/lib/vlb/stats.db")
+}
 
 /// Where the balancer's control server listens. The TUI and the CLI
 /// `vlb force` / `vlb status` subcommands connect here. Default is a
@@ -185,10 +217,16 @@ pub struct ControlConfig {
 }
 
 impl Default for ControlConfig {
-    fn default() -> Self { Self { listen: default_control_listen() } }
+    fn default() -> Self {
+        Self {
+            listen: default_control_listen(),
+        }
+    }
 }
 
-fn default_control_listen() -> String { "127.0.0.1:7650".to_string() }
+fn default_control_listen() -> String {
+    "127.0.0.1:7650".to_string()
+}
 
 /// Traffic counter sampling. We read `/proc/net/dev` for each provider
 /// interface and derive per-tick rx/tx deltas, both in bytes and packets.
@@ -213,8 +251,12 @@ impl Default for TrafficConfig {
     }
 }
 
-fn default_traffic_interval() -> u64 { 2 }
-fn default_traffic_retention() -> u32 { 72 }
+fn default_traffic_interval() -> u64 {
+    2
+}
+fn default_traffic_retention() -> u32 {
+    72
+}
 
 /// Host-wide system metrics sampling (btop-style: CPU/RAM/swap/load/disks).
 /// The same DB that stores traffic also stores system samples, so the TUI
@@ -244,8 +286,12 @@ impl Default for SystemConfig {
     }
 }
 
-fn default_system_interval() -> u64 { 2 }
-fn default_system_retention() -> u32 { 72 }
+fn default_system_interval() -> u64 {
+    2
+}
+fn default_system_retention() -> u32 {
+    72
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Provider {
@@ -321,7 +367,10 @@ impl Config {
                     p.interface
                 );
             }
-            if p.interface.chars().any(|c| c.is_whitespace() || c == '/' || c == ':') {
+            if p.interface
+                .chars()
+                .any(|c| c.is_whitespace() || c == '/' || c == ':')
+            {
                 bail!(
                     "provider '{}' interface name '{}' contains forbidden characters",
                     p.name,
@@ -332,10 +381,16 @@ impl Config {
                 bail!("provider '{}' gateway must not be 0.0.0.0", p.name);
             }
             if p.gateway.is_broadcast() {
-                bail!("provider '{}' gateway must not be the broadcast address", p.name);
+                bail!(
+                    "provider '{}' gateway must not be the broadcast address",
+                    p.name
+                );
             }
             if p.gateway.is_multicast() {
-                bail!("provider '{}' gateway must not be a multicast address", p.name);
+                bail!(
+                    "provider '{}' gateway must not be a multicast address",
+                    p.name
+                );
             }
         }
         if self.health.interval_secs == 0 {
@@ -365,7 +420,8 @@ impl Config {
                 bail!("health.probe_targets contains an empty entry");
             }
             if let Ok(ip) = trimmed.parse::<Ipv4Addr>() {
-                if ip.is_unspecified() || ip.is_loopback() || ip.is_broadcast() || ip.is_multicast() {
+                if ip.is_unspecified() || ip.is_loopback() || ip.is_broadcast() || ip.is_multicast()
+                {
                     bail!("health.probe_targets contains invalid address {ip}");
                 }
             } else {
@@ -378,9 +434,10 @@ impl Config {
                         trimmed
                     );
                 }
-                if !trimmed.chars().all(|c| {
-                    c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'
-                }) {
+                if !trimmed
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+                {
                     bail!(
                         "health.probe_targets entry {:?} contains invalid characters",
                         trimmed
@@ -388,7 +445,13 @@ impl Config {
                 }
             }
         }
-        if self.health.dns_check_enabled || self.health.probe_targets.iter().any(|t| t.parse::<Ipv4Addr>().is_err()) {
+        if self.health.dns_check_enabled
+            || self
+                .health
+                .probe_targets
+                .iter()
+                .any(|t| t.parse::<Ipv4Addr>().is_err())
+        {
             // DNS resolvers are required either for the explicit DNS
             // probe OR to resolve any hostname-based internet target.
             if self.health.dns_resolvers.is_empty() {
@@ -442,12 +505,7 @@ impl Config {
         if self.routing.fwmark_base == 0 {
             bail!("routing.fwmark_base must not be 0");
         }
-        if self
-            .routing
-            .fwmark_base
-            .checked_add(max_prio)
-            .is_none()
-        {
+        if self.routing.fwmark_base.checked_add(max_prio).is_none() {
             bail!("routing.fwmark_base + max priority overflows u32");
         }
 
@@ -457,14 +515,12 @@ impl Config {
         if self.control.listen.trim().is_empty() {
             bail!("control.listen must not be empty");
         }
-        let parsed_listen: std::net::SocketAddr = self
-            .control
-            .listen
-            .parse()
-            .map_err(|_| anyhow::anyhow!(
+        let parsed_listen: std::net::SocketAddr = self.control.listen.parse().map_err(|_| {
+            anyhow::anyhow!(
                 "control.listen '{}' is not a valid IP:port (example: 127.0.0.1:7650)",
                 self.control.listen
-            ))?;
+            )
+        })?;
         // The control protocol is unauthenticated. Binding it to anything
         // other than a loopback address would let any host on the network
         // force a provider over to themselves or read traffic stats. We
@@ -508,19 +564,20 @@ impl Config {
                 .unwrap_or_else(|| "(unset)".into())
         );
         let _ = writeln!(s, "health:");
-        let _ = writeln!(s, "  interval={}s timeout={}ms fail={} ok={} status_every={}s",
+        let _ = writeln!(
+            s,
+            "  interval={}s timeout={}ms fail={} ok={} status_every={}s",
             self.health.interval_secs,
             self.health.timeout_ms,
             self.health.failure_threshold,
             self.health.success_threshold,
-            self.health.status_print_secs);
+            self.health.status_print_secs
+        );
         let _ = writeln!(s, "  probe_targets={:?}", self.health.probe_targets);
         let _ = writeln!(
             s,
             "  dns_check={} resolvers={:?} name={}",
-            self.health.dns_check_enabled,
-            self.health.dns_resolvers,
-            self.health.dns_check_name
+            self.health.dns_check_enabled, self.health.dns_resolvers, self.health.dns_check_name
         );
         let _ = writeln!(s, "routing:");
         let _ = writeln!(
@@ -736,5 +793,55 @@ mod tests {
         assert!(s.contains("alpha"));
         assert!(s.contains("beta"));
         assert!(s.contains("table=200"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_fwmark() {
+        let mut cfg = base_cfg(vec![provider("p", 0)]);
+        cfg.routing.fwmark_base = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_main_and_local_tables() {
+        for t in [253u32, 254, 255] {
+            let mut cfg = base_cfg(vec![provider("p", 0)]);
+            cfg.routing.table_base = t;
+            assert!(
+                cfg.validate().is_err(),
+                "table {t} should have been rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_dns_resolver_loopback() {
+        let mut cfg = base_cfg(vec![provider("p", 0)]);
+        cfg.health.dns_check_enabled = true;
+        cfg.health.dns_resolvers = vec!["127.0.0.1".parse().unwrap()];
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn toml_parse_minimal() {
+        let raw = r#"
+[general]
+lan_interface = "eth0"
+gateway_address = "10.0.0.1"
+
+[health]
+probe_targets = ["1.1.1.1", "google.com"]
+
+[[providers]]
+name = "p"
+gateway = "10.0.0.2"
+interface = "eth0"
+priority = 0
+role = "primary"
+"#;
+        let parsed: Config = toml::from_str(raw).expect("parse");
+        parsed.validate().unwrap();
+        assert_eq!(parsed.providers.len(), 1);
+        assert_eq!(parsed.providers[0].name, "p");
     }
 }

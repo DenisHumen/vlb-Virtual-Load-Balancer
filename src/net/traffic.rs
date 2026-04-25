@@ -53,7 +53,9 @@ pub async fn snapshot() -> Result<HashMap<String, IfCounters>> {
 pub fn parse_proc_net_dev(raw: &str) -> HashMap<String, IfCounters> {
     let mut out = HashMap::new();
     for line in raw.lines().skip(2) {
-        let Some((name, rest)) = line.split_once(':') else { continue };
+        let Some((name, rest)) = line.split_once(':') else {
+            continue;
+        };
         let name = name.trim().to_string();
         if name.is_empty() {
             continue;
@@ -110,15 +112,29 @@ mod tests {
 
     #[test]
     fn delta_detects_reset() {
-        let prev = IfCounters { rx_bytes: 100, ..Default::default() };
-        let curr = IfCounters { rx_bytes: 50, ..Default::default() };
+        let prev = IfCounters {
+            rx_bytes: 100,
+            ..Default::default()
+        };
+        let curr = IfCounters {
+            rx_bytes: 50,
+            ..Default::default()
+        };
         assert!(delta(prev, curr).is_none());
     }
 
     #[test]
     fn delta_subtracts() {
-        let prev = IfCounters { rx_bytes: 100, tx_bytes: 200, ..Default::default() };
-        let curr = IfCounters { rx_bytes: 150, tx_bytes: 260, ..Default::default() };
+        let prev = IfCounters {
+            rx_bytes: 100,
+            tx_bytes: 200,
+            ..Default::default()
+        };
+        let curr = IfCounters {
+            rx_bytes: 150,
+            tx_bytes: 260,
+            ..Default::default()
+        };
         let d = delta(prev, curr).unwrap();
         assert_eq!(d.rx_bytes, 50);
         assert_eq!(d.tx_bytes, 60);

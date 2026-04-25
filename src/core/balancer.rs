@@ -34,11 +34,17 @@ impl State {
         }
     }
 
-    pub fn as_label(self) -> &'static str { self.as_str() }
+    pub fn as_label(self) -> &'static str {
+        self.as_str()
+    }
 
     fn colored(self) -> String {
         match self {
-            State::Up => format!("{} {}", "●".bright_green().bold(), "UP".bright_green().bold()),
+            State::Up => format!(
+                "{} {}",
+                "●".bright_green().bold(),
+                "UP".bright_green().bold()
+            ),
             State::Down => format!("{} {}", "●".bright_red().bold(), "DOWN".bright_red().bold()),
             State::Unknown => format!(
                 "{} {}",
@@ -187,9 +193,8 @@ impl Balancer {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-        // Snapshot the provider's immutable runtime parameters — they come
-        // from config and never change after startup, so we can cache them
-        // outside the lock.
+        // Snapshot config-only fields once — they don't change at runtime
+        // and we don't want to take the lock on every probe tick.
         let (provider_cfg, mark) = {
             let ps = self.providers.read().await;
             let Some(entry) = ps.get(&name) else { return };
@@ -207,10 +212,9 @@ impl Balancer {
                 }
             }
 
-            // (1) Next-hop reachability — a dead ISP router, a dead cable,
-            //     or a power outage upstream of us all show up here first.
-            //     No fwmark: gateway is directly connected, main-table's
-            //     interface route resolves it regardless of active default.
+            // 1. Next-hop check. Catches dead ISP router / dead cable
+            //    /power outage upstream of us. No fwmark needed: the
+            //    gateway is on the LAN, main table reaches it directly.
             let gw_probe = check_gateway(provider_cfg.gateway, timeout).await;
             let _ = self.stats.record_health(&HealthRecord {
                 provider: name.clone(),
@@ -220,14 +224,10 @@ impl Balancer {
                 kind: "gateway",
             });
 
-            // (2) End-to-end internet check for THIS provider, regardless of
-            //     whether it's currently active. The fwmark forces the ping
-            //     through the provider's dedicated routing table, so we
-            //     catch "gateway answers but uplink is dead" for every
-            //     provider independently — that's the key requirement.
-            //
-            //     Skipped when the gateway probe already failed, since the
-            //     internet path cannot possibly be better than the next hop.
+            // 2. Internet check via this provider's fwmark, no matter
+            //    who owns the default route right now. Skipped when the
+            //    gateway is already down — there's nothing further to
+            //    learn.
             let net_probe_opt = if gw_probe.is_success() {
                 let probe = check_internet_via(
                     &self.probe_targets,
@@ -248,14 +248,15 @@ impl Balancer {
                 None
             };
 
-            // (3) DNS reachability check via this provider's fwmark.
-            //     Catches the "ICMP works, UDP/53 blocked" failure mode
-            //     that some ISPs (and captive portals) trigger on unpaid
-            //     accounts. Skipped when the lower-level probes already
-            //     failed — there is nothing to add to the diagnosis.
+            // 3. DNS check (ICMP works but UDP/53 is dropped — unpaid
+            //    accounts, captive portals). Skipped if the link is
+            //    already known to be broken at a lower layer.
             let dns_probe_opt = if self.cfg.health.dns_check_enabled
                 && gw_probe.is_success()
-                && net_probe_opt.as_ref().map(|p| p.is_success()).unwrap_or(false)
+                && net_probe_opt
+                    .as_ref()
+                    .map(|p| p.is_success())
+                    .unwrap_or(false)
             {
                 let probe = check_dns_via(
                     &self.cfg.health.dns_resolvers,
@@ -277,7 +278,10 @@ impl Balancer {
             };
 
             let overall_ok = gw_probe.is_success()
-                && net_probe_opt.as_ref().map(|p| p.is_success()).unwrap_or(false)
+                && net_probe_opt
+                    .as_ref()
+                    .map(|p| p.is_success())
+                    .unwrap_or(false)
                 && dns_probe_opt
                     .as_ref()
                     .map(|p| p.is_success())
@@ -292,8 +296,14 @@ impl Balancer {
                 .or_else(|| gw_probe.latency_ms());
 
             if !overall_ok && gw_probe.is_success() {
-                if net_probe_opt.as_ref().map(|p| p.is_success()).unwrap_or(false)
-                    && dns_probe_opt.as_ref().map(|p| !p.is_success()).unwrap_or(false)
+                if net_probe_opt
+                    .as_ref()
+                    .map(|p| p.is_success())
+                    .unwrap_or(false)
+                    && dns_probe_opt
+                        .as_ref()
+                        .map(|p| !p.is_success())
+                        .unwrap_or(false)
                 {
                     warn!(
                         provider = %name,
@@ -346,7 +356,11 @@ impl Balancer {
         };
 
         if prev != new {
-            info!("provider {} is now {}", name.bright_white().bold(), new.colored());
+            info!(
+                "provider {} is now {}",
+                name.bright_white().bold(),
+                new.colored()
+            );
             let _ = self.stats.record_state_change(name, new.as_str());
         }
     }
@@ -543,10 +557,7 @@ impl Balancer {
             let (dot, state_label) = match p.state {
                 State::Up => ("●".bright_green().bold(), "UP     ".bright_green().bold()),
                 State::Down => ("●".bright_red().bold(), "DOWN   ".bright_red().bold()),
-                State::Unknown => (
-                    "●".bright_yellow().bold(),
-                    "UNKNOWN".bright_yellow().bold(),
-                ),
+                State::Unknown => ("●".bright_yellow().bold(), "UNKNOWN".bright_yellow().bold()),
             };
             let latency = p
                 .last_latency_ms
@@ -611,26 +622,23 @@ impl Balancer {
             .collect();
         providers.sort_by_key(|p| p.priority);
 
-        ControlSnapshot { active, forced, providers }
+        ControlSnapshot {
+            active,
+            forced,
+            providers,
+        }
     }
 
     pub async fn force_provider(self: &Arc<Self>, name: &str) -> Result<()> {
-        // Validate that the provider exists. We deliberately do NOT refuse
-        // to install the pin when the provider is Down or Unknown — operator
-        // intent wins over our health view. Two concrete reasons:
+        // We accept a force pin even if the provider is currently Down or
+        // Unknown. Operator intent wins over our health view: probes can
+        // lag for a few ticks after start, and `force` is the documented
+        // escape hatch when our probes and reality disagree (e.g. the
+        // probe target is blocked but real traffic works).
         //
-        //   1. Health probes can lag by several ticks after boot. Rejecting
-        //      a force on Unknown meant the TUI's `f` key did nothing for the
-        //      first few seconds after start, which is exactly when operators
-        //      reach for it most.
-        //   2. `force` is the documented escape hatch when our probes and
-        //      reality disagree (e.g. the probe target is blocked by the
-        //      upstream ISP but real traffic works). Refusing the force in
-        //      that case is the worst kind of user-hostile behaviour.
-        //
-        // If the forced provider happens to be Down, `reconcile_inner`
-        // transparently falls back to the best healthy provider until the
-        // pin's target recovers, then re-installs the pinned route.
+        // If the pinned provider happens to be Down, `reconcile_inner`
+        // falls back to the best healthy one until the pin recovers and
+        // then puts the pinned route back.
         let (exists, state) = {
             let ps = self.providers.read().await;
             match ps.get(name) {
@@ -713,7 +721,8 @@ impl Balancer {
             self.cfg
                 .providers
                 .iter()
-                .filter_map(|p| seen.insert(p.interface.clone()).then(|| p.interface.clone()))
+                .filter(|p| seen.insert(p.interface.clone()))
+                .map(|p| p.interface.clone())
                 .collect()
         };
         info!(
@@ -796,9 +805,7 @@ impl Balancer {
             }
 
             // Prune at most once per hour.
-            if retention > 0
-                && (now - last_prune).num_seconds() > 3600
-            {
+            if retention > 0 && (now - last_prune).num_seconds() > 3600 {
                 match self.stats.prune_traffic(retention) {
                     Ok(n) if n > 0 => info!(deleted = n, "traffic: pruned old samples"),
                     Ok(_) => {}

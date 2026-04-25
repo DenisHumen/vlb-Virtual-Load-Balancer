@@ -1,0 +1,15 @@
+# Build cache and dev artefacts that don't belong in the image.
+target/
+data/
+*.db
+*.db-*
+.git/
+.github/
+.idea/
+.vscode/
+.claude/
+provaider
+todo.md
+output.txt
+systemd/
+docker/

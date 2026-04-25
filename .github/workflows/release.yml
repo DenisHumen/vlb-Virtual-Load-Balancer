@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build release ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+        include:
+          - target: x86_64-unknown-linux-gnu
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            cross: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85.0
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --locked
+
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      - name: Strip binary
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            sudo apt-get update
+            sudo apt-get install -y binutils-aarch64-linux-gnu
+            aarch64-linux-gnu-strip target/${{ matrix.target }}/release/vlb || true
+          else
+            strip target/${{ matrix.target }}/release/vlb
+          fi
+
+      - name: Package
+        id: package
+        run: |
+          tag=${GITHUB_REF#refs/tags/}
+          name="vlb-${tag}-${{ matrix.target }}"
+          mkdir -p dist
+          tar -C target/${{ matrix.target }}/release \
+              -czf "dist/${name}.tar.gz" vlb
+          (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
+          echo "asset=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=dist/${name}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vlb-${{ matrix.target }}
+          path: dist/*
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref, '-alpha') || contains(github.ref, '-beta') || contains(github.ref, '-rc') }}
