@@ -1,17 +1,17 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{RwLock, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, Provider};
 use crate::control;
-use crate::health::{check_dns_via, check_gateway, check_internet_via, ProbeTarget};
+use crate::health::{ProbeTarget, check_dns_via, check_gateway, check_internet_via};
 use crate::router::Router;
 use crate::stats::{FailoverRecord, HealthRecord, Stats, SystemPoint, TrafficPoint};
 use crate::sysmon::SysMonitor;

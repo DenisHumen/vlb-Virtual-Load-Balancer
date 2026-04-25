@@ -210,7 +210,7 @@ async fn run(cli: Cli) -> Result<()> {
 async fn wait_for_shutdown() {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         match signal(SignalKind::terminate()) {
             Ok(mut sigterm) => {
                 tokio::select! {

@@ -72,7 +72,7 @@ async fn ping_burst(
     // iputils takes a float for -W; floor at 200 ms so we can't degrade
     // into a busy spin if someone sets timeout_ms = 0 in config.
     let pkt_to = per_packet_timeout.as_secs_f64().max(0.2);
-    let pkt_to_str = format!("{:.2}", pkt_to);
+    let pkt_to_str = format!("{pkt_to:.2}");
     let count_str = count.to_string();
     // Overall deadline. ping waits 1s between packets by default, so we
     // have to give it room or -w cuts the burst short.
@@ -282,7 +282,7 @@ fn build_dns_query(name: &str, txid: u16) -> Vec<u8> {
     buf.extend_from_slice(&0u16.to_be_bytes()); // ancount
     buf.extend_from_slice(&0u16.to_be_bytes()); // nscount
     buf.extend_from_slice(&0u16.to_be_bytes()); // arcount
-                                                // QNAME: sequence of length-prefixed labels, terminated by 0.
+    // QNAME: sequence of length-prefixed labels, terminated by 0.
     for label in name.split('.').filter(|l| !l.is_empty()) {
         let bytes = label.as_bytes();
         let len = bytes.len().min(63) as u8;
@@ -643,7 +643,7 @@ mod tests {
         assert_eq!(&pkt[..2], &[0xBE, 0xEF]);
         assert_eq!(&pkt[2..4], &[0x01, 0x00]); // RD set
         assert_eq!(&pkt[4..6], &[0x00, 0x01]); // qdcount = 1
-                                               // QNAME: 1 'a' 2 'b' 'c' 0
+        // QNAME: 1 'a' 2 'b' 'c' 0
         assert_eq!(&pkt[12..18], &[1, b'a', 2, b'b', b'c', 0]);
         // QTYPE = A (1), QCLASS = IN (1).
         assert_eq!(&pkt[18..22], &[0x00, 0x01, 0x00, 0x01]);
@@ -685,7 +685,7 @@ mod tests {
         buf.extend_from_slice(&1u16.to_be_bytes()); // ancount
         buf.extend_from_slice(&0u16.to_be_bytes()); // nscount
         buf.extend_from_slice(&0u16.to_be_bytes()); // arcount
-                                                    // Question: x.io / A / IN
+        // Question: x.io / A / IN
         let qname_offset = buf.len() as u16;
         buf.push(1);
         buf.push(b'x');

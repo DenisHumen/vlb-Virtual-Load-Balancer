@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::net::Ipv4Addr;
 use tokio::process::Command;
 use tracing::{debug, info};

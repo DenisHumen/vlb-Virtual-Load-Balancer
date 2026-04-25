@@ -18,8 +18,9 @@ use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -28,7 +29,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Axis, Block, Borders, Cell, Chart, Dataset, Gauge, GraphType, Paragraph, Row, Sparkline, Table,
 };
-use ratatui::Terminal;
 use std::collections::HashMap;
 use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
@@ -171,10 +171,10 @@ async fn run_app(
         terminal.draw(|f| draw(f, &app))?;
 
         let remaining = tick.saturating_sub(app.last_refresh.elapsed());
-        if event::poll(remaining.max(Duration::from_millis(50)))? {
-            if let Event::Key(k) = event::read()? {
-                handle_key(&mut app, k).await;
-            }
+        if event::poll(remaining.max(Duration::from_millis(50)))?
+            && let Event::Key(k) = event::read()?
+        {
+            handle_key(&mut app, k).await;
         }
 
         if app.last_refresh.elapsed() >= tick {

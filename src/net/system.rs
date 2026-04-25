@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::process::Command as StdCommand;
 use tokio::process::Command;
 use tracing::{info, warn};

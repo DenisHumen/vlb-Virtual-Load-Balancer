@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::{Semaphore, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::balancer::{Balancer, ControlSnapshot};

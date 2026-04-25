@@ -1,6 +1,6 @@
 use colored::Colorize;
-use tracing_subscriber::fmt::time::ChronoLocal;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::time::ChronoLocal;
 
 pub fn init() {
     let filter = EnvFilter::try_from_default_env()

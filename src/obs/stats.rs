@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -59,12 +59,12 @@ pub struct SystemPoint {
 
 impl Stats {
     pub fn open(path: &Path, providers: &[Provider]) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).with_context(|| {
-                    format!("failed to create stats directory {}", parent.display())
-                })?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create stats directory {}", parent.display())
+            })?;
         }
 
         let conn = Connection::open(path)

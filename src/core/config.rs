@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -412,7 +412,9 @@ impl Config {
             bail!("health thresholds must be >= 1");
         }
         if self.health.probe_targets.is_empty() {
-            bail!("health.probe_targets must not be empty — at least one external target is required for end-to-end probing");
+            bail!(
+                "health.probe_targets must not be empty — at least one external target is required for end-to-end probing"
+            );
         }
         for t in &self.health.probe_targets {
             let trimmed = t.trim();
@@ -429,19 +431,13 @@ impl Config {
                 // typo doesn't get silently sent to the resolver every
                 // probe interval.
                 if trimmed.len() > 253 || !trimmed.contains('.') {
-                    bail!(
-                        "health.probe_targets entry {:?} is not a valid IPv4 or FQDN",
-                        trimmed
-                    );
+                    bail!("health.probe_targets entry {trimmed:?} is not a valid IPv4 or FQDN");
                 }
                 if !trimmed
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
                 {
-                    bail!(
-                        "health.probe_targets entry {:?} contains invalid characters",
-                        trimmed
-                    );
+                    bail!("health.probe_targets entry {trimmed:?} contains invalid characters");
                 }
             }
         }
@@ -455,7 +451,9 @@ impl Config {
             // DNS resolvers are required either for the explicit DNS
             // probe OR to resolve any hostname-based internet target.
             if self.health.dns_resolvers.is_empty() {
-                bail!("health.dns_resolvers must not be empty when DNS-based probing is in use (dns_check_enabled or hostname probe_targets)");
+                bail!(
+                    "health.dns_resolvers must not be empty when DNS-based probing is in use (dns_check_enabled or hostname probe_targets)"
+                );
             }
             for r in &self.health.dns_resolvers {
                 if r.is_unspecified() || r.is_loopback() || r.is_broadcast() || r.is_multicast() {

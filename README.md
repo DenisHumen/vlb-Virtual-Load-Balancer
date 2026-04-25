@@ -1,5 +1,9 @@
 # vlb — Virtual Load Balancer
 
+<p align="center">
+  <img src="docs/assets/logo.png" alt="vlb logo" width="220" />
+</p>
+
 [![CI](https://github.com/denishumen/vlb/actions/workflows/ci.yml/badge.svg)](https://github.com/denishumen/vlb/actions)
 [![Release](https://github.com/denishumen/vlb/actions/workflows/release.yml/badge.svg)](https://github.com/denishumen/vlb/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -250,6 +254,8 @@ vlb diag   [--config <path>]                # interfaces, DB, ports
 
 ## TUI hotkeys
 
+![vlb TUI dashboard](docs/assets/tui.png)
+
 | Key     | Action                                    |
 |---------|-------------------------------------------|
 | `↑`/`↓` | Move selection                            |
@@ -372,6 +378,8 @@ runs as root. If you're running by hand, prefix with `sudo`.
 ├── docker/
 │   ├── Dockerfile
 │   └── docker-compose.yml
+├── docs/
+│   └── assets/               # logo, screenshots used by README
 ├── examples/
 │   └── vlb.example.toml      # annotated reference config
 ├── scripts/
