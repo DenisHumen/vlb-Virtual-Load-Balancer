@@ -118,6 +118,12 @@ Safe to re-run: it is the update path as well as the install path. Your
 or the service fails to come back, it rolls back to the previous binary and
 tells you why.
 
+It adopts whatever is already there. If a `vlb` systemd unit exists, the
+installer reads its `ExecStart` and updates *that* binary with *that* config
+— so a box running out of `/opt/vlb` with its config beside it is updated in
+place, rather than having a second copy quietly installed at the default
+paths while the running one stays stale.
+
 On a machine with no existing config it installs the annotated example and
 stops short of starting the service, so it cannot bring up a gateway pointed
 at example addresses.

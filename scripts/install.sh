@@ -34,6 +34,43 @@ CONFIG_PATH="${CONFIG_DIR}/vlb.toml"
 UNIT_PATH=/etc/systemd/system/vlb.service
 SERVICE=vlb
 
+# Adopt an existing deployment wherever it happens to live.
+#
+# The defaults above are what `install-service` sets up, but a box that was
+# brought up by hand — say, running the binary straight out of a git checkout
+# with a config beside it — will have neither. Installing to the default
+# paths there would leave the *actual* running binary untouched: the update
+# would report success and change nothing that matters.
+#
+# So if a unit already exists, believe it rather than the defaults, and read
+# both paths out of its ExecStart line.
+adopt_existing_unit() {
+    local unit_file exec_line
+    unit_file=$(systemctl show -p FragmentPath --value "$SERVICE" 2>/dev/null || true)
+    [[ -n "$unit_file" && -r "$unit_file" ]] || return 0
+
+    exec_line=$(systemctl show -p ExecStart --value "$SERVICE" 2>/dev/null || true)
+    [[ -n "$exec_line" ]] || return 0
+
+    UNIT_PATH="$unit_file"
+
+    # ExecStart renders as `{ path=/usr/local/bin/vlb ; argv[]=... }`.
+    local found_bin found_cfg
+    found_bin=$(sed -n 's/.*path=\([^ ;]*\).*/\1/p' <<<"$exec_line" | head -1)
+    found_cfg=$(grep -o -- '--config[= ][^ ;]*' <<<"$exec_line" \
+                  | head -1 | sed 's/--config[= ]//' || true)
+
+    if [[ -n "$found_bin" && "$found_bin" != "$BIN_PATH" ]]; then
+        warn "the ${SERVICE} unit runs ${found_bin}, not ${BIN_PATH} — updating that instead"
+        BIN_PATH="$found_bin"
+    fi
+    if [[ -n "$found_cfg" && "$found_cfg" != "$CONFIG_PATH" ]]; then
+        log "the ${SERVICE} unit uses ${found_cfg} — keeping that config"
+        CONFIG_PATH="$found_cfg"
+        CONFIG_DIR=$(dirname "$found_cfg")
+    fi
+}
+
 C_RED=$'\033[0;31m'; C_GRN=$'\033[0;32m'; C_YLW=$'\033[0;33m'; C_CYN=$'\033[0;36m'; C_RST=$'\033[0m'
 [[ -t 1 ]] || { C_RED=; C_GRN=; C_YLW=; C_CYN=; C_RST=; }
 
@@ -69,6 +106,8 @@ case "$(uname -m)" in
 esac
 
 log "host: $(uname -m) → ${TARGET}"
+
+command -v systemctl >/dev/null && adopt_existing_unit
 
 # ── locate the release ───────────────────────────────────────────────────
 
