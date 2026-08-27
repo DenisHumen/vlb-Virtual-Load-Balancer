@@ -13,19 +13,14 @@ env:
 
 jobs:
   build:
-    name: Build release ${{ matrix.target }}
+    name: Build ${{ matrix.target }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         target:
-          - x86_64-unknown-linux-gnu
-          - aarch64-unknown-linux-gnu
-        include:
-          - target: x86_64-unknown-linux-gnu
-            cross: false
-          - target: aarch64-unknown-linux-gnu
-            cross: true
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
 
     steps:
       - uses: actions/checkout@v4
@@ -42,26 +37,67 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Install cross
-        if: matrix.cross
         run: cargo install cross --locked
 
-      - name: Build (native)
-        if: ${{ !matrix.cross }}
-        run: cargo build --release --locked --target ${{ matrix.target }}
-
-      - name: Build (cross)
-        if: matrix.cross
+      # Statically linked against musl rather than dynamically against glibc.
+      #
+      # This is not a preference, it is a correctness requirement for a
+      # binary we ask people to download onto arbitrary servers. GitHub's
+      # `ubuntu-latest` runner is Ubuntu 24.04, so a plain `cargo build`
+      # produces something that demands GLIBC_2.39 and refuses to start on
+      # Debian 12 (2.36), Ubuntu 22.04 (2.35), Ubuntu 20.04 (2.31) — that is
+      # to say, on most machines actually running in production.
+      #
+      # `relocation-model=static` matters as much as `crt-static`: without
+      # it the musl target emits a static-PIE that still carries a PT_INTERP
+      # for /lib/ld-musl-*.so.1, and the kernel refuses to exec it on any
+      # glibc host. With both, the result is a genuinely dependency-free
+      # binary, verified to run on Debian 11/12, Ubuntu 20.04, Alpine and
+      # Rocky 9.
+      - name: Build
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static -C relocation-model=static"
         run: cross build --release --locked --target ${{ matrix.target }}
 
-      - name: Strip binary
+      - name: Verify the binary is actually static
         run: |
-          if [ "${{ matrix.cross }}" = "true" ]; then
-            sudo apt-get update
-            sudo apt-get install -y binutils-aarch64-linux-gnu
-            aarch64-linux-gnu-strip target/${{ matrix.target }}/release/vlb || true
-          else
-            strip target/${{ matrix.target }}/release/vlb
+          bin="target/${{ matrix.target }}/release/vlb"
+          file "$bin"
+          # A dynamic dependency here would mean the artifact is unusable on
+          # some subset of hosts, which is exactly what this job exists to
+          # prevent. Fail loudly rather than publish it.
+          if file "$bin" | grep -q "dynamically linked"; then
+            echo "::error::${bin} is dynamically linked; it would not run on all target hosts"
+            exit 1
           fi
+          if file "$bin" | grep -q "interpreter"; then
+            echo "::error::${bin} carries a PT_INTERP; it would not exec on a glibc-only host"
+            exit 1
+          fi
+
+      - name: Strip
+        run: |
+          case "${{ matrix.target }}" in
+            x86_64-*)  strip target/${{ matrix.target }}/release/vlb || true ;;
+            aarch64-*)
+              sudo apt-get update
+              sudo apt-get install -y binutils-aarch64-linux-gnu
+              aarch64-linux-gnu-strip target/${{ matrix.target }}/release/vlb || true
+              ;;
+          esac
+
+      - name: Smoke-test the x86_64 build on an old distro
+        if: startsWith(matrix.target, 'x86_64')
+        run: |
+          # Ubuntu 20.04 carries glibc 2.31 — the oldest thing anyone is
+          # plausibly still running. If the binary starts there, it starts
+          # anywhere. Alpine additionally proves there is no glibc assumption
+          # baked in at all.
+          for image in ubuntu:20.04 debian:bullseye alpine:3.19; do
+            echo "--- $image"
+            docker run --rm -v "$PWD/target/${{ matrix.target }}/release:/b:ro" \
+              "$image" /b/vlb --version
+          done
 
       - name: Package
         id: package
@@ -72,8 +108,6 @@ jobs:
           tar -C target/${{ matrix.target }}/release \
               -czf "dist/${name}.tar.gz" vlb
           (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
-          echo "asset=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
-          echo "checksum=dist/${name}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
 
       - name: Upload artefacts
         uses: actions/upload-artifact@v4

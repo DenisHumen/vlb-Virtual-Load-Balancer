@@ -71,7 +71,7 @@ quorum = "majority"
 # symptom, so that acts immediately.
 failure_threshold = 2
 
-user_agent = "vlb/0.1.0 (uplink-canary)"
+user_agent = "vlb/0.1.1 (uplink-canary)"
 
 # The two plain-HTTP endpoints are the industry-standard captive-portal
 # probes (what Android and Firefox use). Plain HTTP is exactly what an

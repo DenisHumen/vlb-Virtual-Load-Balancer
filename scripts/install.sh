@@ -59,9 +59,12 @@ case "$(uname -s)" in
     *) die "vlb is Linux-only (this host reports $(uname -s))" ;;
 esac
 
+# Releases are statically linked against musl, so the architecture is the
+# only thing that varies. A glibc build would inherit the glibc version of
+# the CI runner that produced it and refuse to start on older servers.
 case "$(uname -m)" in
-    x86_64|amd64)  TARGET=x86_64-unknown-linux-gnu ;;
-    aarch64|arm64) TARGET=aarch64-unknown-linux-gnu ;;
+    x86_64|amd64)  TARGET=x86_64-unknown-linux-musl ;;
+    aarch64|arm64) TARGET=aarch64-unknown-linux-musl ;;
     *) die "no published build for $(uname -m); build from source with 'cargo build --release'" ;;
 esac
 

@@ -67,10 +67,15 @@ struct GhAsset {
 ///
 /// Must match the `matrix.target` values in `.github/workflows/release.yml`,
 /// which is what names the published assets.
+///
+/// Releases are statically linked against musl regardless of what this host
+/// actually uses, so the triple is chosen by architecture alone. A glibc
+/// build would carry the glibc version of whatever runner produced it —
+/// currently 2.39 — and refuse to start on most machines in production.
 pub fn host_target() -> Result<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("linux", "x86_64") => Ok("x86_64-unknown-linux-gnu"),
-        ("linux", "aarch64") => Ok("aarch64-unknown-linux-gnu"),
+        ("linux", "x86_64") => Ok("x86_64-unknown-linux-musl"),
+        ("linux", "aarch64") => Ok("aarch64-unknown-linux-musl"),
         (os, arch) => bail!(
             "no published release artifact for {os}/{arch}. vlb ships Linux \
              x86_64 and aarch64 builds; on anything else, build from source \
@@ -653,6 +658,31 @@ mod tests {
             "https://github.com/other/path"
         );
         assert!(resolve_location(&base, "../relative").is_err());
+    }
+
+    /// The updater builds an asset name from [`host_target`], and the release
+    /// workflow builds the same name from its `matrix.target`. If the two
+    /// ever disagree, `vlb update` silently stops finding its own releases —
+    /// a failure that only shows up in the field, months later, on the day
+    /// somebody actually needs to upgrade. Pin them together here by reading
+    /// the workflow.
+    #[test]
+    fn release_workflow_publishes_the_targets_the_updater_looks_for() {
+        let workflow = include_str!("../../.github/workflows/release.yml");
+        for target in ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"] {
+            assert!(
+                workflow.contains(target),
+                "release.yml does not build {target}, but the updater asks for it"
+            );
+        }
+        // And the reverse: no glibc target should reappear, since those
+        // binaries inherit the runner's glibc version and will not start on
+        // most production hosts.
+        assert!(
+            !workflow.contains("unknown-linux-gnu"),
+            "release.yml builds a glibc target again — those artifacts require \
+             the CI runner's glibc version and fail to start on older servers"
+        );
     }
 
     #[test]
