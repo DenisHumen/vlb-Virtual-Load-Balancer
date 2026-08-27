@@ -244,8 +244,36 @@ elif command -v systemctl >/dev/null; then
         systemctl enable --now "$SERVICE" || { rollback; die "could not start ${SERVICE}"; }
     fi
 
-    # Give it a moment to bind its control port and run a first probe round.
-    sleep 3
+    # Wait for the gateway to actually be carrying traffic again, rather than
+    # merely for systemd to report the process as started. A provider is only
+    # selected after `success_threshold` consecutive probe rounds — six
+    # seconds at the shipped defaults, longer on slow links — so a fixed
+    # short sleep would report "no provider yet" on a perfectly healthy
+    # update and leave the operator unsure whether something broke.
+    # Both the command substitution and the test below need explicit
+    # handling under `set -euo pipefail`. Immediately after a restart the
+    # control socket is not listening yet, so `vlb status` exits non-zero;
+    # with pipefail that propagates out of the assignment and `set -e` kills
+    # the script — which looked exactly like a failed update even though the
+    # service had come back fine. Likewise a bare `[[ … ]] && break` aborts
+    # the script on the iterations where the condition is false.
+    ACTIVE=""
+    for _ in $(seq 1 30); do
+        if ! systemctl is-active --quiet "$SERVICE"; then
+            rollback
+            die "${SERVICE} stopped after the restart; rolled back to the previous binary.
+Logs: journalctl -u ${SERVICE} -n 50"
+        fi
+        ACTIVE=$("$BIN_PATH" --config "$CONFIG_PATH" status 2>/dev/null \
+                   | grep -m1 '"active"' \
+                   | sed 's/.*"active"[^:]*: *//; s/^"//; s/",\{0,1\}$//; s/,$//' \
+                 || true)
+        if [[ -n "$ACTIVE" && "$ACTIVE" != "null" ]]; then
+            break
+        fi
+        sleep 1
+    done
+
     if ! systemctl is-active --quiet "$SERVICE"; then
         rollback
         die "${SERVICE} is not running after the restart; rolled back.
@@ -253,15 +281,14 @@ Logs: journalctl -u ${SERVICE} -n 50"
     fi
     ok "${SERVICE} is active"
 
-    # The real check: does the daemon answer, and has it chosen a provider?
-    if ACTIVE=$("$BIN_PATH" --config "$CONFIG_PATH" status 2>/dev/null \
-                 | grep -m1 '"active"' | sed 's/.*: *"\{0,1\}//; s/"\{0,1\},\{0,1\}$//'); then
-        if [[ -n "$ACTIVE" && "$ACTIVE" != "null" ]]; then
-            ok "active provider: ${ACTIVE}"
-        else
-            warn "the daemon is up but has not selected a provider yet — this is normal
-      for the first few seconds. Watch it with: sudo vlb --config ${CONFIG_PATH} tui"
-        fi
+    if [[ -n "$ACTIVE" && "$ACTIVE" != "null" ]]; then
+        ok "carrying traffic via: ${ACTIVE}"
+    else
+        # Not fatal: the daemon is up and will select a provider as soon as
+        # one passes. But it does mean no uplink is healthy right now, which
+        # the operator needs to hear rather than discover later.
+        warn "the daemon is running but no provider has passed its checks in 30s.
+      Investigate with:  sudo vlb --config ${CONFIG_PATH} probe"
     fi
 fi
 
