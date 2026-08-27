@@ -55,10 +55,17 @@ jobs:
   failover-lab:
     name: Failover lab (docker)
     runs-on: ubuntu-latest
-    # Spins up two simulated ISPs and breaks them in seven different ways,
-    # asserting on the kernel's routing table and on whether real traffic
-    # reaches the origin. Slower than the unit suite, so it runs in parallel
-    # with it rather than after.
+    # Ubuntu 24.04 containers matching the deployment target: two simulated
+    # ISPs broken in eight ways, plus the operational cases that actually
+    # take gateways down — competing netplan/networkd routes, a missing
+    # conntrack, operator commands racing a switchover, a restart, and a soak
+    # over repeated failover cycles. Assertions run from a LAN client behind
+    # the gateway, so they measure what users experience.
+    #
+    # Slower than the unit suite, so it runs in parallel with it. The timeout
+    # is generous because the soak and throttle scenarios are wall-clock
+    # bound by design, not by CPU.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 

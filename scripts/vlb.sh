@@ -22,6 +22,9 @@
 #   stats              Print a stats report (default: last 1h)
 #   system             Fetch recent host metric samples (JSON)
 #   diag               Diagnostic dump (interfaces, DB rows, control port)
+#   probe              Time every health layer per provider (sizes your timeouts)
+#   update             Install the newest release from GitHub
+#   test               fmt + clippy + unit tests; `test --lab` adds the docker lab
 #   logs               Tail the daemon log file
 #   install-service    Install + enable systemd/vlb.service (Linux, root)
 #   uninstall-service  Disable + remove the installed systemd unit
@@ -315,7 +318,7 @@ cmd_test() {
     ok "all checks passed — safe to push"
 }
 
-cmd_help() { sed -n '2,34p' "$0"; }
+cmd_help() { sed -n '2,37p' "$0"; }
 
 cmd_up() {
     # "just start everything" — build if needed, start daemon, show status.

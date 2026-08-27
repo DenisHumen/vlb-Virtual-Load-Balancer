@@ -73,9 +73,9 @@ except Exception: sys.exit(0)
 for p in d.get('snapshot', {}).get('providers', []):
     if p['name'] == '$1':
         v = p.get('$2')
-        # `or ''` would swallow legitimate falsy values -- priority 0 is the
-        # primary provider, and printing it as empty made the priority-gap
-        # assertion fail against correct behaviour.
+        # A bare 'or' default would swallow legitimate falsy values: priority 0
+        # is the primary provider, and printing it as empty made the
+        # priority-gap assertion fail against correct behaviour.
         print('' if v is None else v)
 "
 }
@@ -114,11 +114,36 @@ real_traffic_works() {
         | grep -q 'vlb-canary-v1-do-not-edit'
 }
 
+# Wait until `$1` has been the active provider for several consecutive
+# seconds, not merely for one sample.
+#
+# A single reading is not enough at lab startup: the origin's nginx and
+# dnsmasq are still warming up, so a probe can legitimately fail a few
+# seconds after vlb first selects a provider. vlb then correctly fails over
+# — and a scenario that began on the strength of that first sample sees the
+# backup active and reports a failure that is really its own impatience.
+wait_until_stable() {
+    local want="$1" deadline="${2:-60}" need="${3:-4}"
+    local waited=0 streak=0
+    while [ "$waited" -lt "$deadline" ]; do
+        if [ "$(active_provider)" = "$want" ]; then
+            streak=$((streak+1))
+            [ "$streak" -ge "$need" ] && { printf '%s' "$waited"; return 0; }
+        else
+            streak=0
+        fi
+        sleep 1
+        waited=$((waited+1))
+    done
+    printf '%s' "$waited"
+    return 1
+}
+
 reset_lab() {
     isp_mode isp1 good
     isp_mode isp2 good
-    # Let the daemon settle back onto the primary before the next scenario.
-    wait_for_active isp-main 40 >/dev/null || true
+    # Settle onto the primary *and stay there* before the next scenario runs.
+    wait_until_stable isp-main 90 4 >/dev/null || true
 }
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -707,8 +732,8 @@ info "starting the lab"
 "${COMPOSE[@]}" up -d >/dev/null 2>&1
 
 seed_origin_payload
-info "waiting for vlb to select a provider"
-if ! wait_for_active isp-main 60 >/dev/null; then
+info "waiting for vlb to settle on the primary"
+if ! wait_until_stable isp-main 120 5 >/dev/null; then
     say "${RED}vlb never came up.${RST} Logs:"
     "${COMPOSE[@]}" logs --tail 60 vlb
     exit 1

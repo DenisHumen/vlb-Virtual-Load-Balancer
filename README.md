@@ -49,7 +49,7 @@ fast, and gives you a real dashboard.
 * **Per-provider, fwmark-bound probes**, all independent of which provider
   currently owns the default route. Each provider gets its own routing
   table (`ip rule fwmark`) so we can verify any uplink any time.
-* **Five layers of health checks** per provider:
+* **Six layers of health checks** per provider:
   1. **Gateway**: ICMP to next-hop on the LAN.
   2. **Internet**: 3-packet ICMP burst (≥2 replies needed) to a list of
      external targets — IPs *and hostnames*. Hostnames are resolved
@@ -528,7 +528,7 @@ so live flows reset and reconnect.
 | Intermittent `Destination Net Prohibited` flapping   | 3-packet burst, errors don't count as `received` |
 | Sysctl `ip_forward=0`                                 | startup check (when `firewall.manage = true`) |
 | Stale conntrack after switch                          | `conntrack -F` on every change |
-| Two coexisting default routes (DHCP + ours)           | `metric 0 proto static` replace |
+| Two coexisting default routes (DHCP + ours)           | `metric 0 proto static`, plus removal of any rival at metric 0 — `replace` alone keys on proto and leaves those in place |
 | **Account unpaid: DNS hijacked to a portal**          | **DNS integrity probe (`.invalid` must be NXDOMAIN)** |
 | **Account unpaid: HTTP answered by a billing page**   | **content canary (bytes compared, redirects rejected)** |
 | **Transparent TLS proxy**                             | **canary certificate validation fails the handshake** |
