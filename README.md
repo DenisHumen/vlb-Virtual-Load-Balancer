@@ -589,7 +589,7 @@ cases that break gateways in the field: competing default routes from
 netplan/networkd, a missing `conntrack`, operator `force`/`auto` racing a
 switchover, a daemon restart on a healthy gateway, and a soak that runs six
 full failover/failback cycles and then checks the daemon has not grown.
-62 assertions in 18 scenarios, all on Ubuntu 24.04.
+61 assertions in 18 scenarios, all on Ubuntu 24.04.
 | `dns-blocked` | ICMP fine, UDP/53 dropped                                            |
 | `portal-http` | **transparent HTTP proxy with DNS left completely honest** — every layer except the content check passes, so only the canary can see it |
 | `expired`     | **unpaid account: DNS hijacked to a portal, HTTP answered by a billing page, ICMP left working** |

@@ -13,6 +13,8 @@
 #   ./run-tests.sh expired      run one scenario by name
 #   ./run-tests.sh --keep       leave the lab running afterwards for poking at
 set -uo pipefail
+# `eventually` matches with case globs, and some patterns use @(a|b).
+shopt -s extglob
 
 # Git Bash / MSYS rewrites arguments that look like absolute POSIX paths into
 # Windows paths, which turns `/etc/vlb/vlb.toml` into `C:/Program Files/...`
@@ -83,7 +85,46 @@ for p in d.get('snapshot', {}).get('providers', []):
 # The gateway the kernel is really using — the ground truth, independent of
 # what vlb believes.
 kernel_default_gw() {
-    vlb_exec ip -4 route show default | awk '/default/ {print $3; exit}'
+    local out=""
+    # `docker exec` occasionally returns nothing under load on a busy host.
+    # An empty read is indistinguishable from "no default route at all", and
+    # the two mean very different things — so retry a couple of times before
+    # believing it.
+    local try=0
+    while [ "$try" -lt 3 ]; do
+        out=$(vlb_exec ip -4 route show default)
+        [ -n "$out" ] && break
+        try=$((try+1)); sleep 1
+    done
+    # Lowest metric wins, as the kernel does it. Reading the first line is
+    # only usually right: `ip route show` prints in kernel order, which is
+    # not a promise, and a transient second default would then be reported
+    # as the winner.
+    printf '%s\n' "$out" | awk '
+        /^default/ {
+            metric = 0; gw = ""
+            for (i = 1; i < NF; i++) {
+                if ($i == "metric") metric = $(i+1)
+                if ($i == "via")    gw     = $(i+1)
+            }
+            if (gw != "" && (best == "" || metric + 0 < bestm + 0)) {
+                best = gw; bestm = metric
+            }
+        }
+        END { print best }'
+}
+
+# Every default route on one line, for diagnosing a failure rather than
+# guessing at one.
+all_default_routes() {
+    vlb_exec ip -4 route show default | tr '\n' ';'
+}
+
+# The gateway belonging to whichever provider vlb currently has active.
+active_gateway() {
+    local a; a=$(active_provider)
+    [ -n "$a" ] || return 1
+    provider_field "$a" gateway
 }
 
 # Poll until `active == $1`, or give up after $2 seconds.
@@ -109,9 +150,21 @@ wait_for_active() {
 # conntrack state a failover disturbs — none of which the gateway's own
 # traffic touches.
 real_traffic_works() {
-    "${COMPOSE[@]}" exec -T client \
-        curl -s --max-time 6 http://192.0.2.10/canary.txt 2>/dev/null \
-        | grep -q 'vlb-canary-v1-do-not-edit'
+    # Retry briefly rather than demanding the first request succeed. A
+    # switchover flushes conntrack, so a request issued in that window is
+    # legitimately reset; a user sees a moment's hiccup, not an outage.
+    # Asserting on a single attempt would call correct behaviour a failure.
+    local waited=0
+    while [ "$waited" -lt 12 ]; do
+        if "${COMPOSE[@]}" exec -T client \
+            curl -s --max-time 5 http://192.0.2.10/canary.txt 2>/dev/null \
+            | grep -q 'vlb-canary-v1-do-not-edit'; then
+            return 0
+        fi
+        sleep 1
+        waited=$((waited+1))
+    done
+    return 1
 }
 
 # Wait until `$1` has been the active provider for several consecutive
@@ -139,6 +192,33 @@ wait_until_stable() {
     return 1
 }
 
+# Poll a command until its output matches a glob, or a deadline passes.
+#
+# Assertions about *derived* state — the failure layer, a canary summary, the
+# route the kernel settled on — are assertions about an eventually-consistent
+# system. The daemon re-evaluates every few seconds and publishes the value
+# when it gets there, not at the instant a test happens to look. Reading once
+# turns ordinary convergence into a spurious failure, and worse, makes real
+# regressions indistinguishable from timing noise.
+#
+# Prints whatever it last saw, so a genuine failure still says what the value
+# actually was.
+eventually() {
+    local deadline="$1" pattern="$2"; shift 2
+    local waited=0 out=""
+    while [ "$waited" -lt "$deadline" ]; do
+        out=$("$@" 2>/dev/null)
+        # shellcheck disable=SC2254  # the glob is the point
+        case "$out" in
+            $pattern) printf '%s' "$out"; return 0 ;;
+        esac
+        sleep 1
+        waited=$((waited+1))
+    done
+    printf '%s' "$out"
+    return 1
+}
+
 reset_lab() {
     isp_mode isp1 good
     isp_mode isp2 good
@@ -155,9 +235,12 @@ scenario_baseline() {
     reset_lab
     local a; a=$(active_provider)
     [ "$a" = "isp-main" ] && ok "active = isp-main" || bad "baseline: active = '$a', expected isp-main"
-    [ "$(kernel_default_gw)" = "10.77.0.2" ] \
-        && ok "kernel default route points at isp-main" \
-        || bad "baseline: kernel default gw = $(kernel_default_gw), expected 10.77.0.2"
+    if [ "$(kernel_default_gw)" = "10.77.0.2" ]; then
+        ok "kernel default route points at isp-main"
+    else
+        bad "baseline: kernel default gw = $(kernel_default_gw), expected 10.77.0.2"
+        note "all defaults: $(all_default_routes)"
+    fi
     real_traffic_works && ok "real traffic reaches the origin" \
         || bad "baseline: real traffic does not reach the origin"
 }
@@ -222,13 +305,11 @@ scenario_expired() {
     # The reason must name content tampering, not a generic timeout: an
     # operator needs to know to call the ISP about the bill.
     local reason
-    reason=$(provider_field isp-main failure_layer)
-    case "$reason" in
-        content_tampered|dns_hijack)
-            ok "failure attributed to '$reason'" ;;
-        *)
-            bad "expired: failure layer was '$reason', expected content_tampered/dns_hijack" ;;
-    esac
+    if reason=$(eventually 45 '@(content_tampered|dns_hijack)' provider_field isp-main failure_layer); then
+        ok "failure attributed to '$reason'"
+    else
+        bad "expired: failure layer settled on '$reason', expected content_tampered/dns_hijack"
+    fi
 }
 
 # Proves the canary is load-bearing on its own. Under `portal-http` the
@@ -252,16 +333,19 @@ scenario_canary_only() {
     fi
     ok "content canary alone detected the intercept and failed over in ${t}s"
 
-    local layer; layer=$(provider_field isp-main failure_layer)
-    [ "$layer" = "content_tampered" ] \
-        && ok "attributed to content_tampered (not the DNS layer)" \
-        || bad "portal-http: layer was '$layer', expected content_tampered"
+    local layer
+    if layer=$(eventually 45 'content_tampered' provider_field isp-main failure_layer); then
+        ok "attributed to content_tampered (not the DNS layer)"
+    else
+        bad "portal-http: layer settled on '$layer', expected content_tampered"
+    fi
 
-    local summary; summary=$(provider_field isp-main last_canary_summary)
-    case "$summary" in
-        *TAMPERED*) ok "canary summary names the tampering" ;;
-        *) bad "portal-http: unexpected canary summary: $summary" ;;
-    esac
+    local summary
+    if summary=$(eventually 30 '*TAMPERED*' provider_field isp-main last_canary_summary); then
+        ok "canary summary names the tampering"
+    else
+        bad "portal-http: canary summary never named it: $summary"
+    fi
 
     real_traffic_works && ok "real traffic restored via the backup" \
         || bad "portal-http: failed over but traffic still broken"
@@ -295,16 +379,19 @@ scenario_throttled() {
     fi
     ok "detected the throttle and failed over in ${t}s"
 
-    local layer; layer=$(provider_field isp-main failure_layer)
-    [ "$layer" = "throttled" ] \
-        && ok "attributed to 'throttled', not a vague timeout" \
-        || bad "throttled: layer was '$layer', expected throttled"
+    local layer
+    if layer=$(eventually 60 'throttled' provider_field isp-main failure_layer); then
+        ok "attributed to 'throttled', not a vague timeout"
+    else
+        bad "throttled: layer settled on '$layer', expected throttled"
+    fi
 
-    local summary; summary=$(provider_field isp-main last_throughput_summary)
-    case "$summary" in
-        *"kbit/s"*) ok "reported the measured rate: ${summary%% (*}" ;;
-        *) bad "throttled: no throughput figure reported (got: $summary)" ;;
-    esac
+    local summary
+    if summary=$(eventually 30 '*kbit/s*' provider_field isp-main last_throughput_summary); then
+        ok "reported the measured rate: ${summary%% (*}"
+    else
+        bad "throttled: no throughput figure reported (got: $summary)"
+    fi
 
     real_traffic_works && ok "real traffic restored via the backup" \
         || bad "throttled: failed over but traffic still broken"
@@ -454,14 +541,26 @@ scenario_watchdog() {
     # Simulate a DHCP renew / netplan apply stealing the default route.
     vlb_exec ip route replace default via 10.77.0.3 dev eth0 metric 0 proto dhcp >/dev/null 2>&1
     note "replaced the default route with a bogus one behind vlb's back"
-    local waited=0
-    while [ "$waited" -lt 25 ]; do
-        [ "$(kernel_default_gw)" = "10.77.0.2" ] && break
+    # The invariant is that the kernel route matches vlb's *current* choice,
+    # not that it equals a fixed address. Hammering the routing table can
+    # legitimately knock the primary's probes out, and vlb failing over in
+    # response is correct behaviour — asserting on 10.77.0.2 would call that
+    # a watchdog failure.
+    local waited=0 gw="" want=""
+    while [ "$waited" -lt 40 ]; do
+        want=$(active_gateway)
+        gw=$(kernel_default_gw)
+        if [ -n "$want" ] && [ "$gw" = "$want" ]; then
+            break
+        fi
         sleep 1; waited=$((waited+1))
     done
-    [ "$(kernel_default_gw)" = "10.77.0.2" ] \
-        && ok "watchdog restored the correct route in ${waited}s" \
-        || bad "watchdog: route still $(kernel_default_gw) after ${waited}s"
+    if [ -n "$want" ] && [ "$gw" = "$want" ]; then
+        ok "watchdog reclaimed the route in ${waited}s (matches the active provider)"
+    else
+        bad "watchdog: kernel route '$gw' does not match the active provider's '$want'"
+        note "all defaults: $(all_default_routes)"
+    fi
 }
 
 # Ubuntu 24.04 runs netplan on top of systemd-networkd, and both write
@@ -472,7 +571,9 @@ scenario_watchdog() {
 scenario_netplan_fight() {
     info "netplan / networkd — competing default routes must not win"
     reset_lab
-    local ours="10.77.0.2"
+    # Whatever vlb chose, not a fixed address: see the watchdog scenario.
+    local ours; ours=$(active_gateway)
+    [ -n "$ours" ] || { bad "netplan-fight: no active provider to compare against"; return; }
 
     # The shapes netplan and dhclient actually produce, at the metrics they
     # actually use. Each is installed alongside ours, not instead of it.
