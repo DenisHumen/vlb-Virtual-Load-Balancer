@@ -12,6 +12,7 @@
 //!   f / Enter     — force-pin selected provider
 //!   a             — release pin (auto)
 //!   r             — refresh immediately
+//!   u             — check for a new release and install it
 //!   q / Esc / ^C  — quit
 
 use anyhow::{Context, Result};
@@ -34,9 +35,12 @@ use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
 
 use crate::balancer::{ControlSnapshot, ProviderSnapshot, State};
+use crate::config::Config;
 use crate::control::{self, Request, Response, SystemPointWire, TrafficPointWire};
+use crate::update;
 
-pub async fn run(listen: String) -> Result<()> {
+pub async fn run(config: Config) -> Result<()> {
+    let listen = config.control.listen.clone();
     let initial = match control::send(&listen, &Request::Status).await {
         Ok(Response::Status { snapshot }) => snapshot,
         Ok(Response::Error { error }) => {
@@ -51,32 +55,63 @@ pub async fn run(listen: String) -> Result<()> {
     };
 
     let mut terminal = setup_terminal()?;
-    let result = run_app(&mut terminal, listen, initial).await;
+    let result = run_app(&mut terminal, config, initial).await;
     restore_terminal(&mut terminal)?;
     result
 }
 
+/// Modal state for the self-update flow. The dashboard keeps running
+/// underneath; the modal only gates the keys that would apply the update.
+#[derive(Debug, Clone, PartialEq)]
+enum UpdateState {
+    Idle,
+    /// Querying the GitHub API.
+    Checking,
+    /// A newer release exists and is waiting for a yes/no.
+    Available {
+        tag: String,
+        prerelease: bool,
+    },
+    /// Already current — shown briefly, then dismissed.
+    UpToDate {
+        tag: String,
+    },
+    Installing {
+        tag: String,
+    },
+    Done {
+        message: String,
+    },
+    Failed {
+        error: String,
+    },
+}
+
 struct App {
     listen: String,
+    config: Config,
     snapshot: ControlSnapshot,
     selected: usize,
     traffic: HashMap<String, Vec<TrafficPointWire>>,
     system: Vec<SystemPointWire>,
     last_message: Option<(String, Instant)>,
     last_refresh: Instant,
+    update: UpdateState,
     should_quit: bool,
 }
 
 impl App {
-    fn new(listen: String, snapshot: ControlSnapshot) -> Self {
+    fn new(config: Config, snapshot: ControlSnapshot) -> Self {
         Self {
-            listen,
+            listen: config.control.listen.clone(),
+            config,
             snapshot,
             selected: 0,
             traffic: HashMap::new(),
             system: Vec::new(),
             last_message: None,
             last_refresh: Instant::now(),
+            update: UpdateState::Idle,
             should_quit: false,
         }
     }
@@ -155,14 +190,105 @@ impl App {
             Err(e) => self.set_message(format!("clear failed: {e}")),
         }
     }
+
+    /// Ask GitHub what the newest release is.
+    async fn check_for_update(&mut self) {
+        self.update = UpdateState::Checking;
+        let allow_pre = self.config.update.allow_prerelease;
+        match update::check(&self.config.update.repo, allow_pre).await {
+            Ok(release) => {
+                if update::is_newer(&release.tag, update::current_version()) {
+                    self.update = UpdateState::Available {
+                        tag: release.tag,
+                        prerelease: release.prerelease,
+                    };
+                } else {
+                    self.update = UpdateState::UpToDate { tag: release.tag };
+                }
+            }
+            Err(e) => {
+                self.update = UpdateState::Failed {
+                    error: format!("{e:#}"),
+                }
+            }
+        }
+    }
+
+    /// Download, verify and install the release the operator just confirmed.
+    ///
+    /// Deliberately re-queries the API rather than caching the asset URLs
+    /// from the check: those URLs are what we are about to execute as root,
+    /// and the gap between checking and confirming can be arbitrarily long.
+    async fn apply_update(&mut self) {
+        let UpdateState::Available { tag, .. } = self.update.clone() else {
+            return;
+        };
+        self.update = UpdateState::Installing { tag: tag.clone() };
+
+        let allow_pre = self.config.update.allow_prerelease;
+        let release = match update::check(&self.config.update.repo, allow_pre).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.update = UpdateState::Failed {
+                    error: format!("{e:#}"),
+                };
+                return;
+            }
+        };
+
+        let dest = match std::env::current_exe() {
+            Ok(d) => d,
+            Err(e) => {
+                self.update = UpdateState::Failed {
+                    error: format!("cannot locate the running binary: {e}"),
+                };
+                return;
+            }
+        };
+
+        if let Err(e) = update::install(&release, &dest).await {
+            self.update = UpdateState::Failed {
+                error: format!("{e:#}"),
+            };
+            return;
+        }
+
+        let mut message = format!("installed {} to {}", release.tag, dest.display());
+        if self.config.update.restart_service {
+            let unit = self.config.update.service_name.clone();
+            if update::service_is_active(&unit).await {
+                match update::restart_service(&unit).await {
+                    Ok(()) => message.push_str(&format!("; restarted {unit}")),
+                    Err(e) => {
+                        self.update = UpdateState::Failed {
+                            error: format!("installed, but restarting {unit} failed: {e:#}"),
+                        };
+                        return;
+                    }
+                }
+            } else {
+                message.push_str(&format!("; {unit} is not active, nothing restarted"));
+            }
+        }
+        self.update = UpdateState::Done { message };
+    }
+
+    fn dismiss_update(&mut self) {
+        self.update = UpdateState::Idle;
+    }
+
+    /// Is a modal currently capturing y/n?
+    fn update_modal_open(&self) -> bool {
+        !matches!(self.update, UpdateState::Idle)
+    }
 }
 
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    listen: String,
+    config: Config,
     initial: ControlSnapshot,
 ) -> Result<()> {
-    let mut app = App::new(listen, initial);
+    let mut app = App::new(config, initial);
     app.refresh().await;
 
     let tick = Duration::from_millis(1500);
@@ -192,6 +318,39 @@ async fn handle_key(app: &mut App, key: KeyEvent) {
     if key.kind == KeyEventKind::Release {
         return;
     }
+
+    // While the update modal is open it owns the keyboard, so a stray `f`
+    // cannot force a provider over while the operator is reading a prompt
+    // about replacing the binary. Ctrl-C still quits.
+    if app.update_modal_open() {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            app.should_quit = true;
+            return;
+        }
+        match app.update.clone() {
+            UpdateState::Available { .. } => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    app.apply_update().await;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+                    app.dismiss_update();
+                }
+                _ => {}
+            },
+            // Checking / Installing are not interruptible: they run inline,
+            // so by the time a key is read the operation has finished.
+            UpdateState::Checking | UpdateState::Installing { .. } => {}
+            UpdateState::UpToDate { .. }
+            | UpdateState::Done { .. }
+            | UpdateState::Failed { .. } => {
+                // Any key dismisses an informational result.
+                app.dismiss_update();
+            }
+            UpdateState::Idle => {}
+        }
+        return;
+    }
+
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -223,6 +382,9 @@ async fn handle_key(app: &mut App, key: KeyEvent) {
             app.refresh().await;
             app.set_message("refreshed");
         }
+        KeyCode::Char('u') => {
+            app.check_for_update().await;
+        }
         _ => {}
     }
 }
@@ -242,6 +404,130 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     draw_providers(f, chunks[1], app);
     draw_traffic(f, chunks[2], app);
     draw_footer(f, chunks[3], app);
+
+    if app.update_modal_open() {
+        draw_update_modal(f, f.area(), app);
+    }
+}
+
+/// Cut a string to `max` characters, adding an ellipsis. Operates on chars,
+/// not bytes, so a multi-byte character is never split.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('\u{2026}');
+    out
+}
+
+/// Centre a box of the given size inside `area`.
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    }
+}
+
+fn draw_update_modal(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let current = update::current_version();
+    let (title, body, colour) = match &app.update {
+        UpdateState::Idle => return,
+        UpdateState::Checking => (
+            " update ",
+            vec![
+                Line::from(format!("current: {current}")),
+                Line::from(format!("repo:    {}", app.config.update.repo)),
+                Line::from(""),
+                Line::from("Querying GitHub for the latest release..."),
+            ],
+            Color::Cyan,
+        ),
+        UpdateState::Available { tag, prerelease } => (
+            " update available ",
+            vec![
+                Line::from(format!("current: {current}")),
+                Line::from(format!(
+                    "latest:  {tag}{}",
+                    if *prerelease { "  (pre-release)" } else { "" }
+                )),
+                Line::from(""),
+                Line::from("The binary will be downloaded, its SHA-256 verified against the"),
+                Line::from("published checksum, and checked as runnable before it replaces"),
+                Line::from("the current one. The previous binary is kept as vlb.bak."),
+                Line::from(if app.config.update.restart_service {
+                    format!(
+                        "The `{}` service will then be restarted - expect a brief blip.",
+                        app.config.update.service_name
+                    )
+                } else {
+                    "The service will NOT be restarted automatically.".to_string()
+                }),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  y  ", Style::default().fg(Color::Black).bg(Color::Green)),
+                    Span::raw(" install    "),
+                    Span::styled("  n  ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                    Span::raw(" cancel"),
+                ]),
+            ],
+            Color::Yellow,
+        ),
+        UpdateState::UpToDate { tag } => (
+            " up to date ",
+            vec![
+                Line::from(format!("current: {current}")),
+                Line::from(format!("latest:  {tag}")),
+                Line::from(""),
+                Line::from("Nothing to do. Press any key."),
+            ],
+            Color::Green,
+        ),
+        UpdateState::Installing { tag } => (
+            " installing ",
+            vec![
+                Line::from(format!("Installing {tag}...")),
+                Line::from(""),
+                Line::from("Downloading, verifying the checksum, swapping the binary."),
+                Line::from("Do not interrupt."),
+            ],
+            Color::Cyan,
+        ),
+        UpdateState::Done { message } => (
+            " update complete ",
+            vec![
+                Line::from(truncate(message, 90)),
+                Line::from(""),
+                Line::from("Press any key."),
+            ],
+            Color::Green,
+        ),
+        UpdateState::Failed { error } => (
+            " update failed ",
+            vec![
+                Line::from("Nothing was changed."),
+                Line::from(""),
+                Line::from(truncate(error, 180)),
+                Line::from(""),
+                Line::from("Press any key."),
+            ],
+            Color::Red,
+        ),
+    };
+
+    let height = (body.len() as u16 + 4).min(area.height);
+    let rect = centered_rect(84, height, area);
+    // Clear what is underneath so the dashboard does not bleed through.
+    f.render_widget(ratatui::widgets::Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(colour).add_modifier(Modifier::BOLD));
+    f.render_widget(Paragraph::new(body).block(block), rect);
 }
 
 fn state_style(state: State) -> Style {
@@ -481,7 +767,9 @@ fn draw_providers(f: &mut ratatui::Frame, area: Rect, app: &App) {
         Cell::from("gateway"),
         Cell::from("iface"),
         Cell::from("latency"),
+        Cell::from("canary"),
         Cell::from("last check"),
+        Cell::from("why"),
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
 
@@ -511,6 +799,27 @@ fn draw_providers(f: &mut ratatui::Frame, area: Rect, app: &App) {
                 .last_check
                 .map(|t| t.format("%H:%M:%S").to_string())
                 .unwrap_or_else(|| "--:--:--".into());
+            // The canary column is what answers "is this uplink actually
+            // carrying my traffic", as opposed to merely answering pings —
+            // so it gets its own cell instead of being buried in UP/DOWN.
+            let canary_cell = match (p.last_canary_at.is_some(), p.canary_ok) {
+                (false, _) => Cell::from("-").style(Style::default().fg(Color::DarkGray)),
+                (true, true) => Cell::from("ok").style(Style::default().fg(Color::Green)),
+                (true, false) => Cell::from("FAIL")
+                    .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            };
+            let why = p
+                .failure_layer
+                .map(|l| l.as_str().to_string())
+                .unwrap_or_default();
+            let why_cell = Cell::from(why).style(match p.failure_layer {
+                Some(l) if l.is_conclusive() => {
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                }
+                Some(_) => Style::default().fg(Color::Yellow),
+                None => Style::default(),
+            });
+
             let mut row = Row::new(vec![
                 Cell::from(marker),
                 Cell::from(p.name.clone()),
@@ -519,7 +828,9 @@ fn draw_providers(f: &mut ratatui::Frame, area: Rect, app: &App) {
                 Cell::from(p.gateway.clone()),
                 Cell::from(p.interface.clone()),
                 Cell::from(latency),
+                canary_cell,
                 Cell::from(last),
+                why_cell,
             ]);
             if i == app.selected {
                 row = row.style(
@@ -650,16 +961,35 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &App) {
         Span::raw(" auto  "),
         Span::styled("r", Style::default().fg(Color::Yellow)),
         Span::raw(" refresh  "),
+        Span::styled("u", Style::default().fg(Color::Yellow)),
+        Span::raw(" update  "),
         Span::styled("q", Style::default().fg(Color::Yellow)),
         Span::raw(" quit"),
     ]);
-    let msg = app
-        .last_message
-        .as_ref()
-        .filter(|(_, t)| t.elapsed() < Duration::from_secs(5))
-        .map(|(m, _)| m.clone())
-        .unwrap_or_default();
-    let text = vec![keys, Line::from(msg)];
+    // Prefer the selected provider's failure reason over a stale action
+    // message: when something is wrong, that is what the operator needs.
+    let detail = app.selected_provider().and_then(|p| {
+        p.failure_detail
+            .as_ref()
+            .map(|d| (p.name.clone(), p.failure_layer, d.clone()))
+    });
+    let msg_line = match detail {
+        Some((name, layer, detail)) => Line::from(vec![
+            Span::styled(
+                format!("{name} [{}] ", layer.map(|l| l.as_str()).unwrap_or("down")),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(truncate(&detail, 140)),
+        ]),
+        None => Line::from(
+            app.last_message
+                .as_ref()
+                .filter(|(_, t)| t.elapsed() < Duration::from_secs(5))
+                .map(|(m, _)| m.clone())
+                .unwrap_or_default(),
+        ),
+    };
+    let text = vec![keys, msg_line];
     let p = Paragraph::new(text).block(Block::default().borders(Borders::ALL));
     f.render_widget(p, area);
 }

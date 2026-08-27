@@ -37,3 +37,34 @@ jobs:
 
       - name: Test
         run: cargo test --release --locked
+
+      # A shipped example that does not validate is a broken first-run
+      # experience, and it is the file every operator copies. Catch it here
+      # rather than in someone's terminal.
+      - name: Validate the shipped example config
+        run: ./target/release/vlb --config examples/vlb.example.toml check
+
+      # The default canary config points at canary/canary.txt in this repo and
+      # looks for a marker inside it. A unit test pins the two together, but
+      # this also guards the file itself surviving a merge.
+      - name: Canary file sanity
+        run: |
+          head -1 canary/canary.txt | grep -qx 'vlb-canary-v1-do-not-edit' \
+            || { echo "canary/canary.txt lost its marker line"; exit 1; }
+
+  failover-lab:
+    name: Failover lab (docker)
+    runs-on: ubuntu-latest
+    # Spins up two simulated ISPs and breaks them in seven different ways,
+    # asserting on the kernel's routing table and on whether real traffic
+    # reaches the origin. Slower than the unit suite, so it runs in parallel
+    # with it rather than after.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run the failover scenarios
+        run: ./docker/test/run-tests.sh
+
+      - name: Daemon logs on failure
+        if: failure()
+        run: docker compose -f docker/test/docker-compose.yml logs --tail 400 vlb

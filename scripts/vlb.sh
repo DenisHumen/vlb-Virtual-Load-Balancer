@@ -263,7 +263,59 @@ cmd_uninstall_service() {
     ok "service removed (config at /etc/vlb kept intact)"
 }
 
-cmd_help() { sed -n '2,30p' "$0"; }
+cmd_probe()  { require_bin; require_cfg; "$VLB_BIN" --config "$VLB_CONFIG" probe "$@"; }
+
+cmd_update() {
+    # Self-update needs to write the installed binary and bounce the unit,
+    # both of which are root-only in a production install.
+    require_cfg
+    local bin="$VLB_BIN"
+    [[ -x /usr/local/bin/vlb ]] && bin=/usr/local/bin/vlb
+    [[ -x "$bin" ]] || die "no vlb binary found (looked at $VLB_BIN and /usr/local/bin/vlb)"
+    if [[ $EUID -ne 0 && -w "$bin" ]]; then
+        warn "not root: the binary can be replaced but the service cannot be restarted"
+    fi
+    "$bin" --config "$VLB_CONFIG" update "$@"
+}
+
+cmd_test() {
+    # Everything that can run without root or docker, first.
+    require_cargo
+    local lab=0
+    for a in "$@"; do [[ "$a" == "--lab" ]] && lab=1; done
+
+    log "cargo fmt --check"
+    cargo fmt --all -- --check || die "formatting differs; run: cargo fmt --all"
+    ok "formatting clean"
+
+    log "cargo clippy -D warnings"
+    cargo clippy --release --all-targets --locked -- -D warnings || die "clippy found problems"
+    ok "clippy clean"
+
+    log "cargo test"
+    cargo test --release --locked || die "unit tests failed"
+    ok "unit tests passed"
+
+    # The config that ships must itself be valid — a broken example is a
+    # broken first-run experience.
+    log "validating examples/vlb.example.toml"
+    cargo run --release --locked --quiet -- --config examples/vlb.example.toml check >/dev/null \
+        || die "examples/vlb.example.toml does not validate"
+    ok "example config validates"
+
+    if [[ $lab -eq 1 ]]; then
+        command -v docker >/dev/null || die "docker not found; --lab needs it"
+        log "running the docker failover lab (this takes a few minutes)"
+        bash "${REPO_DIR}/docker/test/run-tests.sh" || die "failover lab failed"
+        ok "failover lab passed"
+    else
+        log "skipping the docker failover lab (pass --lab to include it)"
+    fi
+
+    ok "all checks passed — safe to push"
+}
+
+cmd_help() { sed -n '2,34p' "$0"; }
 
 cmd_up() {
     # "just start everything" — build if needed, start daemon, show status.
@@ -293,6 +345,9 @@ main() {
         stats)              cmd_stats "$@" ;;
         system)             cmd_system "$@" ;;
         diag)               cmd_diag ;;
+        probe)              cmd_probe "$@" ;;
+        update)             cmd_update "$@" ;;
+        test)               cmd_test "$@" ;;
         logs)               cmd_logs ;;
         install-service)    cmd_install_service ;;
         uninstall-service)  cmd_uninstall_service ;;

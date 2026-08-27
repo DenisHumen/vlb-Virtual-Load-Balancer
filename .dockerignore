@@ -13,3 +13,6 @@ todo.md
 output.txt
 systemd/
 docker/
+# ...except the test lab's entrypoint, which docker/test/vlb/Dockerfile has to
+# COPY out of the repo-root build context.
+!docker/test/vlb/entrypoint.sh

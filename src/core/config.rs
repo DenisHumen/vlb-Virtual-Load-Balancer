@@ -3,12 +3,20 @@ use serde::Deserialize;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
+use crate::canary::{CanaryTarget, ContentExpectation, Quorum, parse_sha256};
+use crate::http::Url;
+
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub general: General,
     #[serde(default)]
     pub health: HealthConfig,
+    #[serde(default)]
+    pub canary: CanaryConfig,
+    #[serde(default)]
+    pub failover: FailoverConfig,
     #[serde(default)]
     pub firewall: FirewallConfig,
     #[serde(default)]
@@ -21,16 +29,331 @@ pub struct Config {
     pub traffic: TrafficConfig,
     #[serde(default)]
     pub system: SystemConfig,
+    #[serde(default)]
+    pub update: UpdateConfig,
     pub providers: Vec<Provider>,
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Content canary
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Content-authenticity probing.
+///
+/// This is the layer that catches an uplink which is *reachable but
+/// intercepted* — the unpaid-account case where the ISP answers every DNS
+/// query with its portal and every HTTP request with a payment page. Purely
+/// reachability-based checks (ping, "did DNS reply at all") cannot see it,
+/// because the interceptor answers all of them happily. See
+/// [`crate::canary`] for the full reasoning.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct CanaryConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// How often to run the canary, per provider. Deliberately slower than
+    /// the ICMP tick: a TLS fetch is far more expensive than a ping, and
+    /// content interception does not come and go between seconds.
+    #[serde(default = "default_canary_interval")]
+    pub interval_secs: u64,
+    /// Per-target budget covering DNS, TCP, TLS and the HTTP exchange.
+    #[serde(default = "default_canary_timeout_ms")]
+    pub timeout_ms: u64,
+    /// How many targets must verify: `any`, `majority` (default) or `all`.
+    ///
+    /// `majority` is the right default: it tolerates one endpoint being
+    /// down or blocked in your region without failing over, while an
+    /// interceptor — which necessarily breaks all of them — still trips it.
+    #[serde(default = "default_quorum")]
+    pub quorum: String,
+    /// Consecutive canary rounds that must fail before the provider is
+    /// marked unhealthy. Ignored when content came back *tampered*: that is
+    /// proof, not a symptom, and acts on the first observation.
+    #[serde(default = "default_canary_failure_threshold")]
+    pub failure_threshold: u32,
+    #[serde(default = "default_user_agent")]
+    pub user_agent: String,
+    #[serde(default = "default_canary_targets")]
+    pub targets: Vec<CanaryTargetConfig>,
+}
+
+impl Default for CanaryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: default_canary_interval(),
+            timeout_ms: default_canary_timeout_ms(),
+            quorum: default_quorum(),
+            failure_threshold: default_canary_failure_threshold(),
+            user_agent: default_user_agent(),
+            targets: default_canary_targets(),
+        }
+    }
+}
+
+fn default_canary_interval() -> u64 {
+    10
+}
+fn default_canary_timeout_ms() -> u64 {
+    4000
+}
+fn default_quorum() -> String {
+    "majority".to_string()
+}
+fn default_canary_failure_threshold() -> u32 {
+    2
+}
+fn default_user_agent() -> String {
+    concat!("vlb/", env!("CARGO_PKG_VERSION"), " (uplink-canary)").to_string()
+}
+
+/// One canary endpoint as written in TOML. Exactly one `expect_*` field may
+/// be set; none means "the status code is the whole contract".
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct CanaryTargetConfig {
+    pub url: String,
+    #[serde(default = "default_expect_status")]
+    pub expect_status: u16,
+    /// Body must contain this marker. Robust against line-ending changes,
+    /// and a portal page will never contain it.
+    pub expect_contains: Option<String>,
+    /// Body must equal this string byte for byte.
+    pub expect_exact: Option<String>,
+    /// SHA-256 of the body, as 64 hex characters. Strictest option.
+    pub expect_sha256: Option<String>,
+}
+
+fn default_expect_status() -> u16 {
+    200
+}
+
+/// Built-in canary set.
+///
+/// Two plain-HTTP endpoints plus one HTTPS endpoint, chosen so the three
+/// fail for *different* reasons and one blocked endpoint cannot cause a
+/// false failover:
+///
+/// * the plain-HTTP pair are the industry-standard captive-portal probes
+///   (the ones Android and Firefox use). Plain HTTP is what an intercepting
+///   ISP rewrites, so these trip first and loudest;
+/// * the HTTPS one additionally proves the TLS chain — a transparent proxy
+///   cannot present a valid certificate for `raw.githubusercontent.com`,
+///   so it fails the handshake instead of serving a portal page.
+fn default_canary_targets() -> Vec<CanaryTargetConfig> {
+    vec![
+        CanaryTargetConfig {
+            url: "http://connectivitycheck.gstatic.com/generate_204".into(),
+            expect_status: 204,
+            expect_contains: None,
+            expect_exact: None,
+            expect_sha256: None,
+        },
+        CanaryTargetConfig {
+            url: "http://detectportal.firefox.com/success.txt".into(),
+            expect_status: 200,
+            expect_contains: None,
+            expect_exact: Some("success\n".into()),
+            expect_sha256: None,
+        },
+        CanaryTargetConfig {
+            url: "https://raw.githubusercontent.com/DenisHumen/vlb-Virtual-Load-Balancer/main/canary/canary.txt".into(),
+            expect_status: 200,
+            expect_contains: Some(CANARY_MARKER.into()),
+            expect_exact: None,
+            expect_sha256: None,
+        },
+    ]
+}
+
+/// Marker string embedded in `canary/canary.txt` in this repository.
+/// Kept as a constant so the file and the default config cannot drift.
+pub const CANARY_MARKER: &str = "vlb-canary-v1-do-not-edit";
+
+impl CanaryConfig {
+    pub fn quorum_parsed(&self) -> Result<Quorum> {
+        match self.quorum.trim().to_ascii_lowercase().as_str() {
+            "any" => Ok(Quorum::Any),
+            "majority" => Ok(Quorum::Majority),
+            "all" => Ok(Quorum::All),
+            other => bail!("canary.quorum must be one of any|majority|all, got {other:?}"),
+        }
+    }
+
+    /// Turn the TOML shape into runtime targets, validating as we go.
+    pub fn targets_parsed(&self) -> Result<Vec<CanaryTarget>> {
+        let mut out = Vec::with_capacity(self.targets.len());
+        for t in &self.targets {
+            let url = Url::parse(&t.url)
+                .with_context(|| format!("canary target {:?} has an invalid url", t.url))?;
+
+            let set = [
+                t.expect_contains.is_some(),
+                t.expect_exact.is_some(),
+                t.expect_sha256.is_some(),
+            ];
+            if set.iter().filter(|b| **b).count() > 1 {
+                bail!(
+                    "canary target {} sets more than one of expect_contains / \
+                     expect_exact / expect_sha256 — pick exactly one",
+                    t.url
+                );
+            }
+
+            let expect = if let Some(s) = &t.expect_contains {
+                if s.is_empty() {
+                    bail!("canary target {} has an empty expect_contains", t.url);
+                }
+                ContentExpectation::Contains(s.clone())
+            } else if let Some(s) = &t.expect_exact {
+                ContentExpectation::Exact(s.clone().into_bytes())
+            } else if let Some(s) = &t.expect_sha256 {
+                ContentExpectation::Sha256(parse_sha256(s).with_context(|| {
+                    format!("canary target {} has an invalid expect_sha256", t.url)
+                })?)
+            } else {
+                ContentExpectation::StatusOnly
+            };
+
+            if !(100..=599).contains(&t.expect_status) {
+                bail!(
+                    "canary target {} has an out-of-range expect_status {}",
+                    t.url,
+                    t.expect_status
+                );
+            }
+            // A canary that expects a redirect would defeat its own purpose:
+            // a redirect is exactly the portal signature we look for.
+            if (300..400).contains(&t.expect_status) {
+                bail!(
+                    "canary target {} expects a {} redirect — a redirect is the \
+                     captive-portal signature this probe exists to detect, so it \
+                     can never be the expected result",
+                    t.url,
+                    t.expect_status
+                );
+            }
+
+            out.push(CanaryTarget {
+                url,
+                expect_status: t.expect_status,
+                expect,
+            });
+        }
+        Ok(out)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Failover behaviour
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Switching policy: how eagerly we leave a provider and how carefully we
+/// come back to it.
+///
+/// The two directions are intentionally asymmetric. Leaving a broken uplink
+/// is urgent and unconditional — users are offline right now. Returning to a
+/// recovered one is not urgent at all, and doing it too eagerly is how you
+/// get a flapping gateway that resets every TCP connection each time an ISP
+/// twitches. So failback waits for a sustained clean run.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct FailoverConfig {
+    /// How long a higher-priority provider must stay continuously healthy —
+    /// every layer, including the canary — before we move back to it.
+    #[serde(default = "default_failback_stable_secs")]
+    pub failback_stable_secs: u64,
+    /// After this many switches inside `flap_window_secs`, the failback
+    /// wait is doubled (repeatedly, up to `max_failback_stable_secs`) so a
+    /// genuinely unstable uplink stops yo-yoing the gateway.
+    #[serde(default = "default_flap_threshold")]
+    pub flap_threshold: u32,
+    #[serde(default = "default_flap_window_secs")]
+    pub flap_window_secs: u64,
+    #[serde(default = "default_max_failback_stable_secs")]
+    pub max_failback_stable_secs: u64,
+    /// Periodically re-read the kernel default route and re-install ours if
+    /// something else (DHCP renew, netplan apply, NetworkManager) replaced
+    /// it. 0 disables the watchdog.
+    #[serde(default = "default_route_watchdog_secs")]
+    pub route_watchdog_secs: u64,
+}
+
+impl Default for FailoverConfig {
+    fn default() -> Self {
+        Self {
+            failback_stable_secs: default_failback_stable_secs(),
+            flap_threshold: default_flap_threshold(),
+            flap_window_secs: default_flap_window_secs(),
+            max_failback_stable_secs: default_max_failback_stable_secs(),
+            route_watchdog_secs: default_route_watchdog_secs(),
+        }
+    }
+}
+
+fn default_failback_stable_secs() -> u64 {
+    30
+}
+fn default_flap_threshold() -> u32 {
+    3
+}
+fn default_flap_window_secs() -> u64 {
+    600
+}
+fn default_max_failback_stable_secs() -> u64 {
+    900
+}
+fn default_route_watchdog_secs() -> u64 {
+    15
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Self-update
+// ─────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateConfig {
+    /// `owner/repo` on GitHub to pull releases from.
+    #[serde(default = "default_update_repo")]
+    pub repo: String,
+    /// Allow `vlb update` to install a pre-release (`-alpha`, `-rc`) build.
+    #[serde(default)]
+    pub allow_prerelease: bool,
+    /// Restart the systemd unit after a successful install.
+    #[serde(default = "default_true")]
+    pub restart_service: bool,
+    #[serde(default = "default_update_service")]
+    pub service_name: String,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            repo: default_update_repo(),
+            allow_prerelease: false,
+            restart_service: true,
+            service_name: default_update_service(),
+        }
+    }
+}
+
+fn default_update_repo() -> String {
+    "DenisHumen/vlb-Virtual-Load-Balancer".to_string()
+}
+fn default_update_service() -> String {
+    "vlb".to_string()
+}
+
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct General {
     pub lan_interface: Option<String>,
     pub gateway_address: Option<Ipv4Addr>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct HealthConfig {
     #[serde(default = "default_interval")]
     pub interval_secs: u64,
@@ -75,6 +398,17 @@ pub struct HealthConfig {
     pub dns_check_name: String,
     #[serde(default = "default_status_interval")]
     pub status_print_secs: u64,
+    /// Ask each resolver for a random name under `.invalid`, which RFC 6761
+    /// guarantees can never exist. An honest resolver says NXDOMAIN; an
+    /// intercepting one invents an address. This is the cheapest possible
+    /// detector for the DNS half of an unpaid-account hijack.
+    #[serde(default = "default_true")]
+    pub dns_integrity_check: bool,
+    /// Retention for rows in `health_checks`. Without this the table grows
+    /// without bound — at a 3 s interval with 4 probe kinds and 3 providers
+    /// that is over 100 M rows a year. 0 disables pruning.
+    #[serde(default = "default_health_retention")]
+    pub retention_hours: u32,
 }
 
 impl Default for HealthConfig {
@@ -89,6 +423,8 @@ impl Default for HealthConfig {
             dns_resolvers: default_dns_resolvers(),
             dns_check_name: default_dns_name(),
             status_print_secs: default_status_interval(),
+            dns_integrity_check: true,
+            retention_hours: default_health_retention(),
         }
     }
 }
@@ -107,6 +443,9 @@ fn default_success_threshold() -> u32 {
 }
 fn default_status_interval() -> u64 {
     30
+}
+fn default_health_retention() -> u32 {
+    72
 }
 fn default_probe_targets() -> Vec<String> {
     // Two well-known DNS IPs (cheap reachability) plus a real hostname
@@ -137,6 +476,7 @@ fn default_dns_name() -> String {
 /// provider's *internet* reachability independently, regardless of which
 /// provider currently owns the main default route.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RoutingConfig {
     #[serde(default = "default_table_base")]
     pub table_base: u32,
@@ -167,6 +507,7 @@ fn default_rule_pref() -> u32 {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct FirewallConfig {
     #[serde(default = "default_true")]
     pub manage: bool,
@@ -190,6 +531,7 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct DatabaseConfig {
     #[serde(default = "default_db_path")]
     pub path: PathBuf,
@@ -211,6 +553,7 @@ fn default_db_path() -> PathBuf {
 /// `vlb force` / `vlb status` subcommands connect here. Default is a
 /// localhost-only TCP port — no auth, so do NOT expose externally.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ControlConfig {
     #[serde(default = "default_control_listen")]
     pub listen: String,
@@ -231,6 +574,7 @@ fn default_control_listen() -> String {
 /// Traffic counter sampling. We read `/proc/net/dev` for each provider
 /// interface and derive per-tick rx/tx deltas, both in bytes and packets.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct TrafficConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -262,6 +606,7 @@ fn default_traffic_retention() -> u32 {
 /// The same DB that stores traffic also stores system samples, so the TUI
 /// can render everything from a single live query.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SystemConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -294,6 +639,7 @@ fn default_system_retention() -> u32 {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Provider {
     pub name: String,
     pub gateway: Ipv4Addr,
@@ -332,9 +678,12 @@ impl Config {
         if self.providers.is_empty() {
             bail!("at least one provider must be configured");
         }
-        if !self.providers.iter().any(|p| p.priority == 0) {
-            bail!("at least one provider must have priority = 0 (primary)");
-        }
+        // Priorities only need to be unique. Gaps are explicitly fine — a
+        // 0 / 2 pair is a perfectly good "primary, then this one", and
+        // leaving room in between lets you slot a provider in later without
+        // renumbering (which would move its routing table and fwmark).
+        // Nothing requires a provider at priority 0; the lowest number
+        // present simply wins.
         let mut priorities: Vec<u32> = self.providers.iter().map(|p| p.priority).collect();
         priorities.sort_unstable();
         let original_len = priorities.len();
@@ -539,6 +888,91 @@ impl Config {
             bail!("system.interval_secs must be >= 1 when system.enabled = true");
         }
 
+        // ── canary ──────────────────────────────────────────────────────
+        if self.canary.enabled {
+            if self.canary.targets.is_empty() {
+                bail!(
+                    "canary.enabled = true but canary.targets is empty — either add \
+                     targets or set canary.enabled = false. Note that disabling the \
+                     canary removes the only check that can detect an uplink which \
+                     is reachable but intercepted (unpaid account / captive portal)."
+                );
+            }
+            if self.canary.interval_secs == 0 {
+                bail!("canary.interval_secs must be >= 1");
+            }
+            if self.canary.timeout_ms < 200 {
+                bail!("canary.timeout_ms must be >= 200");
+            }
+            // Each round must fit inside its own interval, or rounds pile up
+            // and the effective detection time silently doubles.
+            if self.canary.timeout_ms >= self.canary.interval_secs.saturating_mul(1000) {
+                bail!(
+                    "canary.timeout_ms ({}) must be < canary.interval_secs*1000 ({}ms), \
+                     otherwise a slow round overruns the next one",
+                    self.canary.timeout_ms,
+                    self.canary.interval_secs * 1000
+                );
+            }
+            if self.canary.failure_threshold == 0 {
+                bail!("canary.failure_threshold must be >= 1");
+            }
+            // Parse eagerly so `vlb check` reports a bad url or digest now,
+            // rather than the daemon discovering it at the first probe.
+            let quorum = self.canary.quorum_parsed()?;
+            let targets = self.canary.targets_parsed()?;
+            let required = quorum.required(targets.len());
+            if required > targets.len() {
+                bail!(
+                    "canary.quorum = {:?} needs {required} passing targets but only {} \
+                     are configured",
+                    self.canary.quorum,
+                    targets.len()
+                );
+            }
+            // A single target under `majority`/`all` means any hiccup at that
+            // one endpoint fails the provider over. Allowed, but say so.
+            if targets.len() == 1 && !matches!(quorum, Quorum::Any) {
+                tracing::warn!(
+                    "canary has a single target with quorum = {:?}: an outage at that \
+                     one endpoint will fail providers over. Two or more targets are \
+                     strongly recommended.",
+                    self.canary.quorum
+                );
+            }
+            if self.canary.user_agent.trim().is_empty() {
+                bail!("canary.user_agent must not be empty");
+            }
+        }
+
+        // ── failover ────────────────────────────────────────────────────
+        if self.failover.flap_threshold == 0 {
+            bail!("failover.flap_threshold must be >= 1");
+        }
+        if self.failover.max_failback_stable_secs < self.failover.failback_stable_secs {
+            bail!(
+                "failover.max_failback_stable_secs ({}) must be >= \
+                 failover.failback_stable_secs ({})",
+                self.failover.max_failback_stable_secs,
+                self.failover.failback_stable_secs
+            );
+        }
+
+        // ── update ──────────────────────────────────────────────────────
+        let repo = self.update.repo.trim();
+        if repo.is_empty() || repo.matches('/').count() != 1 {
+            bail!("update.repo must be in `owner/name` form, got {repo:?}");
+        }
+        if !repo
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
+        {
+            bail!("update.repo {repo:?} contains characters that are not valid in a GitHub path");
+        }
+        if self.update.service_name.trim().is_empty() {
+            bail!("update.service_name must not be empty");
+        }
+
         Ok(())
     }
 
@@ -576,6 +1010,62 @@ impl Config {
             s,
             "  dns_check={} resolvers={:?} name={}",
             self.health.dns_check_enabled, self.health.dns_resolvers, self.health.dns_check_name
+        );
+        let _ = writeln!(
+            s,
+            "  dns_integrity_check={} retention={}h",
+            self.health.dns_integrity_check, self.health.retention_hours
+        );
+        let _ = writeln!(s, "canary (content authenticity):");
+        if !self.canary.enabled {
+            let _ = writeln!(
+                s,
+                "  DISABLED — an intercepted-but-reachable uplink will NOT be detected"
+            );
+        } else {
+            let _ = writeln!(
+                s,
+                "  interval={}s timeout={}ms quorum={} fail_after={}",
+                self.canary.interval_secs,
+                self.canary.timeout_ms,
+                self.canary.quorum,
+                self.canary.failure_threshold
+            );
+            match self.canary.targets_parsed() {
+                Ok(targets) => {
+                    for t in &targets {
+                        let _ = writeln!(
+                            s,
+                            "  - {} (expect HTTP {}, {})",
+                            t.url,
+                            t.expect_status,
+                            t.expect.describe()
+                        );
+                    }
+                }
+                Err(e) => {
+                    let _ = writeln!(s, "  <invalid: {e}>");
+                }
+            }
+        }
+        let _ = writeln!(s, "failover:");
+        let _ = writeln!(
+            s,
+            "  failback_stable={}s flap_threshold={} flap_window={}s max_failback={}s watchdog={}s",
+            self.failover.failback_stable_secs,
+            self.failover.flap_threshold,
+            self.failover.flap_window_secs,
+            self.failover.max_failback_stable_secs,
+            self.failover.route_watchdog_secs
+        );
+        let _ = writeln!(s, "update:");
+        let _ = writeln!(
+            s,
+            "  repo={} allow_prerelease={} restart_service={} unit={}",
+            self.update.repo,
+            self.update.allow_prerelease,
+            self.update.restart_service,
+            self.update.service_name
         );
         let _ = writeln!(s, "routing:");
         let _ = writeln!(
@@ -664,6 +1154,15 @@ mod tests {
         Config {
             general: General::default(),
             health: HealthConfig::default(),
+            // Tests run offline: the canary would try real network I/O, so
+            // it is off by default here and enabled explicitly where a test
+            // is specifically about canary validation.
+            canary: CanaryConfig {
+                enabled: false,
+                ..CanaryConfig::default()
+            },
+            failover: FailoverConfig::default(),
+            update: UpdateConfig::default(),
             firewall: FirewallConfig::default(),
             routing: RoutingConfig::default(),
             database: DatabaseConfig::default(),
@@ -680,10 +1179,39 @@ mod tests {
         cfg.validate().unwrap();
     }
 
+    /// Priorities no longer have to start at 0, and gaps are fine. A
+    /// "0 and 2" pair — the shape an operator reaches for when leaving room
+    /// to slot in a third uplink later — must validate, and the lower number
+    /// must win.
     #[test]
-    fn validate_requires_priority_zero() {
-        let cfg = base_cfg(vec![provider("p1", 1)]);
-        assert!(cfg.validate().is_err());
+    fn validate_allows_priority_gaps_and_nonzero_start() {
+        base_cfg(vec![provider("main", 0), provider("backup", 2)])
+            .validate()
+            .expect("0 and 2 with a gap must be valid");
+
+        base_cfg(vec![provider("a", 1), provider("b", 2)])
+            .validate()
+            .expect("priorities need not include 0");
+
+        base_cfg(vec![provider("solo", 7)])
+            .validate()
+            .expect("a single provider at any priority must be valid");
+    }
+
+    /// Routing tables, fwmarks and rule prefs are all derived from the
+    /// priority, so a gap must produce a gap in each of them rather than
+    /// collapsing two providers onto the same table.
+    #[test]
+    fn priority_gap_keeps_tables_and_marks_distinct() {
+        let providers = vec![provider("main", 0), provider("backup", 2)];
+        let cfg = base_cfg(providers.clone());
+        assert_eq!(cfg.table_for(&providers[0]), 200);
+        assert_eq!(cfg.table_for(&providers[1]), 202);
+        assert_ne!(cfg.mark_for(&providers[0]), cfg.mark_for(&providers[1]));
+        assert_ne!(
+            cfg.rule_pref_for(&providers[0]),
+            cfg.rule_pref_for(&providers[1])
+        );
     }
 
     #[test]
@@ -818,6 +1346,228 @@ mod tests {
         cfg.health.dns_check_enabled = true;
         cfg.health.dns_resolvers = vec!["127.0.0.1".parse().unwrap()];
         assert!(cfg.validate().is_err());
+    }
+
+    fn canary_cfg(targets: Vec<CanaryTargetConfig>, quorum: &str) -> Config {
+        let mut cfg = base_cfg(vec![provider("p", 0)]);
+        cfg.canary = CanaryConfig {
+            enabled: true,
+            quorum: quorum.into(),
+            targets,
+            ..CanaryConfig::default()
+        };
+        cfg
+    }
+
+    fn ct(url: &str) -> CanaryTargetConfig {
+        CanaryTargetConfig {
+            url: url.into(),
+            expect_status: 200,
+            expect_contains: None,
+            expect_exact: None,
+            expect_sha256: None,
+        }
+    }
+
+    /// The default canary config fetches `canary/canary.txt` from this
+    /// repository and looks for [`CANARY_MARKER`] in it. If the file and the
+    /// constant ever drift apart, every deployment running the defaults would
+    /// conclude its primary uplink had been hijacked and fail over — so the
+    /// two are pinned together here, at compile time.
+    #[test]
+    fn shipped_canary_file_contains_the_marker() {
+        let file = include_str!("../../canary/canary.txt");
+        assert!(
+            file.contains(CANARY_MARKER),
+            "canary/canary.txt no longer contains {CANARY_MARKER:?} — the default \
+             canary target would fail for every deployment"
+        );
+        // The marker must be on the first line: the file documents that
+        // nothing may be inserted above it.
+        assert_eq!(
+            file.lines().next().map(str::trim),
+            Some(CANARY_MARKER),
+            "the marker must remain the first line of canary/canary.txt"
+        );
+        // Guard the default target's URL against a typo'd path.
+        let url = &default_canary_targets()[2].url;
+        assert!(
+            url.ends_with("/canary/canary.txt"),
+            "default canary URL {url} does not point at the shipped file"
+        );
+    }
+
+    #[test]
+    fn canary_defaults_validate_and_parse() {
+        let mut cfg = base_cfg(vec![provider("p", 0)]);
+        cfg.canary = CanaryConfig::default();
+        cfg.validate()
+            .expect("shipped canary defaults must be valid");
+
+        let targets = cfg.canary.targets_parsed().unwrap();
+        assert_eq!(targets.len(), 3);
+        // Mixed schemes on purpose: plain HTTP catches the portal rewrite,
+        // HTTPS catches a MITM that proxies HTTP correctly.
+        assert!(
+            targets
+                .iter()
+                .any(|t| t.url.scheme == crate::http::Scheme::Http)
+        );
+        assert!(
+            targets
+                .iter()
+                .any(|t| t.url.scheme == crate::http::Scheme::Https)
+        );
+        // Majority of 3 is 2, so one endpoint being unreachable is tolerated.
+        assert_eq!(cfg.canary.quorum_parsed().unwrap().required(3), 2);
+    }
+
+    #[test]
+    fn canary_rejects_conflicting_expectations() {
+        let mut t = ct("http://example.com/x");
+        t.expect_contains = Some("a".into());
+        t.expect_sha256 = Some("0".repeat(64));
+        let err = canary_cfg(vec![t], "any")
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exactly one"), "{err}");
+    }
+
+    #[test]
+    fn canary_rejects_expecting_a_redirect() {
+        // Expecting a 3xx would make the probe blind to the exact thing it
+        // exists to catch.
+        let mut t = ct("http://example.com/x");
+        t.expect_status = 302;
+        let err = canary_cfg(vec![t], "any")
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("captive-portal signature"), "{err}");
+    }
+
+    #[test]
+    fn canary_rejects_bad_urls_and_digests() {
+        let err = canary_cfg(vec![ct("ftp://example.com/x")], "any")
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid url"), "{err}");
+
+        let mut t = ct("http://example.com/x");
+        t.expect_sha256 = Some("not-a-digest".into());
+        assert!(canary_cfg(vec![t], "any").validate().is_err());
+    }
+
+    #[test]
+    fn canary_rejects_empty_targets_when_enabled() {
+        let err = canary_cfg(vec![], "majority")
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("canary.targets is empty"), "{err}");
+    }
+
+    #[test]
+    fn canary_rejects_timeout_overrunning_interval() {
+        let mut cfg = canary_cfg(vec![ct("http://example.com/x")], "any");
+        cfg.canary.interval_secs = 2;
+        cfg.canary.timeout_ms = 5000;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("overruns"), "{err}");
+    }
+
+    #[test]
+    fn canary_rejects_unknown_quorum() {
+        assert!(
+            canary_cfg(vec![ct("http://example.com/x")], "sometimes")
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn failover_rejects_max_below_base() {
+        let mut cfg = base_cfg(vec![provider("p", 0)]);
+        cfg.failover.failback_stable_secs = 100;
+        cfg.failover.max_failback_stable_secs = 50;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn update_repo_shape_is_enforced() {
+        let mut cfg = base_cfg(vec![provider("p", 0)]);
+        for bad in ["", "no-slash", "a/b/c", "owner/na me"] {
+            cfg.update.repo = bad.into();
+            assert!(cfg.validate().is_err(), "{bad:?} should be rejected");
+        }
+        cfg.update.repo = "DenisHumen/vlb-Virtual-Load-Balancer".into();
+        cfg.validate().unwrap();
+    }
+
+    /// A typo in a key name used to be silently ignored, leaving the default
+    /// in place — e.g. `probe_target` (singular) would look accepted while
+    /// the daemon quietly probed the built-in list instead.
+    #[test]
+    fn unknown_keys_are_rejected_not_silently_ignored() {
+        let raw = r#"
+[health]
+probe_target = ["1.1.1.1"]
+
+[[providers]]
+name = "p"
+gateway = "10.0.0.2"
+interface = "eth0"
+priority = 0
+"#;
+        let err = toml::from_str::<Config>(raw).unwrap_err().to_string();
+        assert!(err.contains("probe_target"), "{err}");
+    }
+
+    #[test]
+    fn toml_parse_with_canary_and_failover_sections() {
+        let raw = r#"
+[health]
+probe_targets = ["1.1.1.1", "google.com"]
+
+[canary]
+enabled = true
+interval_secs = 10
+timeout_ms = 4000
+quorum = "majority"
+
+[[canary.targets]]
+url = "http://connectivitycheck.gstatic.com/generate_204"
+expect_status = 204
+
+[[canary.targets]]
+url = "https://raw.githubusercontent.com/o/r/main/canary/canary.txt"
+expect_contains = "vlb-canary-v1-do-not-edit"
+
+[failover]
+failback_stable_secs = 45
+
+[[providers]]
+name = "main"
+gateway = "10.0.0.2"
+interface = "eth0"
+priority = 0
+
+[[providers]]
+name = "backup"
+gateway = "10.0.0.1"
+interface = "eth0"
+priority = 2
+"#;
+        let parsed: Config = toml::from_str(raw).expect("parse");
+        parsed.validate().expect("validate");
+        assert_eq!(parsed.canary.targets.len(), 2);
+        assert_eq!(parsed.failover.failback_stable_secs, 45);
+        let targets = parsed.canary.targets_parsed().unwrap();
+        assert_eq!(targets[0].expect_status, 204);
+        assert_eq!(targets[0].expect, ContentExpectation::StatusOnly);
+        assert!(matches!(targets[1].expect, ContentExpectation::Contains(_)));
     }
 
     #[test]

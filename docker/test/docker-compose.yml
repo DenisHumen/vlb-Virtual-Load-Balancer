@@ -1,0 +1,122 @@
+# Hermetic failover test lab.
+#
+#   ┌────────────────── edge 10.77.0.0/24 ──────────────────┐
+#   │  vlb 10.77.0.100      isp1 10.77.0.2   isp2 10.77.0.3 │
+#   └───────────────────────────────────────────────────────┘
+#                              │                │
+#   ┌──────────────── transit 192.0.2.0/24 ─────────────────┐
+#   │  isp1 192.0.2.2       isp2 192.0.2.3   origin 192.0.2.10
+#   └───────────────────────────────────────────────────────┘
+#
+# Both providers hang off the *same* vlb interface with different next hops —
+# the single-armed topology this deployment actually uses. The origin plays
+# "the real internet": it is the only holder of the genuine canary content,
+# and it is reachable exclusively through one of the two ISPs, so a provider
+# that is broken or intercepting cannot be faked around.
+#
+# Drive it with ./run-tests.sh.
+
+services:
+  origin:
+    build:
+      context: ./netlab
+    image: vlb-netlab:test
+    container_name: vlb-test-origin
+    cap_add: [NET_ADMIN, NET_RAW]
+    environment:
+      ROLE: origin
+      ORIGIN_IP: 192.0.2.10
+    volumes:
+      # The genuine article, straight from the repo — the same bytes a real
+      # deployment fetches from raw.githubusercontent.com.
+      - ../../canary:/canary:ro
+    networks:
+      transit:
+        ipv4_address: 192.0.2.10
+
+  isp1:
+    build:
+      context: ./netlab
+    image: vlb-netlab:test
+    container_name: vlb-test-isp1
+    cap_add: [NET_ADMIN, NET_RAW]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv4.conf.all.forwarding: "1"
+      net.ipv4.conf.all.rp_filter: "0"
+    depends_on: [origin]
+    environment:
+      ROLE: isp
+      ISP_NAME: isp-main
+      EDGE_PREFIX: "10.77.0."
+      TRANSIT_PREFIX: "192.0.2."
+      PORTAL_IP: 203.0.113.2
+      INITIAL_MODE: good
+    networks:
+      edge:
+        ipv4_address: 10.77.0.2
+      transit:
+        ipv4_address: 192.0.2.2
+
+  isp2:
+    build:
+      context: ./netlab
+    image: vlb-netlab:test
+    container_name: vlb-test-isp2
+    cap_add: [NET_ADMIN, NET_RAW]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv4.conf.all.forwarding: "1"
+      net.ipv4.conf.all.rp_filter: "0"
+    depends_on: [origin]
+    environment:
+      ROLE: isp
+      ISP_NAME: isp-backup
+      EDGE_PREFIX: "10.77.0."
+      TRANSIT_PREFIX: "192.0.2."
+      PORTAL_IP: 203.0.113.3
+      INITIAL_MODE: good
+    networks:
+      edge:
+        ipv4_address: 10.77.0.3
+      transit:
+        ipv4_address: 192.0.2.3
+
+  vlb:
+    build:
+      context: ../..
+      dockerfile: docker/test/vlb/Dockerfile
+    image: vlb-under-test:test
+    container_name: vlb-test-vlb
+    cap_add: [NET_ADMIN, NET_RAW]
+    # /proc/sys is read-only in a normal container, so the runtime sets the
+    # forwarding knobs here and vlb finds them already correct. That path is
+    # itself worth exercising: it is the same one a hardened host takes when
+    # a security profile owns these knobs.
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv4.conf.all.forwarding: "1"
+      net.ipv4.conf.all.rp_filter: "2"
+      net.ipv4.conf.default.rp_filter: "2"
+    depends_on: [isp1, isp2]
+    environment:
+      RUST_LOG: ${VLB_LOG:-info}
+    volumes:
+      - ./vlb.test.toml:/etc/vlb/vlb.toml:ro
+    networks:
+      edge:
+        ipv4_address: 10.77.0.100
+
+networks:
+  edge:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.77.0.0/24
+  transit:
+    driver: bridge
+    # No external routing: the transit segment exists only inside the lab.
+    internal: true
+    ipam:
+      config:
+        - subnet: 192.0.2.0/24

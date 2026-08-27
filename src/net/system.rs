@@ -46,36 +46,169 @@ pub async fn prepare(cfg: &Config) -> Result<()> {
     }
 
     setup_policy_routing(cfg).await?;
+    ensure_bootstrap_default(cfg).await;
     Ok(())
 }
 
-async fn tune_sysctl() -> Result<()> {
-    // (key, value). rp_filter = 2 (loose) is the safe choice for a single-
-    // armed gateway where packets may arrive and leave on the same iface.
-    let knobs = [
-        ("net.ipv4.ip_forward", "1"),
-        ("net.ipv4.conf.all.forwarding", "1"),
-        ("net.ipv4.conf.all.send_redirects", "0"),
-        ("net.ipv4.conf.default.send_redirects", "0"),
-        ("net.ipv4.conf.all.accept_redirects", "0"),
-        ("net.ipv4.conf.all.rp_filter", "2"),
-        ("net.ipv4.conf.default.rp_filter", "2"),
-    ];
-
-    for (k, v) in knobs {
-        let arg = format!("{k}={v}");
-        let status = Command::new("sysctl")
-            .args(["-w", &arg])
-            .status()
-            .await
-            .with_context(|| format!("failed to run `sysctl -w {arg}`"))?;
-        if !status.success() {
-            bail!("`sysctl -w {arg}` failed");
+/// Make sure the main table has *a* default route before probing starts.
+///
+/// This closes a cold-start deadlock. Reverse-path filtering (`rp_filter`,
+/// which we set to loose) drops an incoming packet whose source address is
+/// not reachable by any route. Probe replies come back unmarked, so they are
+/// evaluated against the **main** table — and if main has no default route,
+/// every reply from the internet is dropped. No probe can then succeed, no
+/// provider is ever marked healthy, and so no default route is ever
+/// installed: the daemon waits for a condition it is itself preventing.
+///
+/// On a normal box this never shows up, because netplan or DHCP has already
+/// put a default route in main. It bites on a bare machine, in a container,
+/// or after someone flushes the table by hand.
+///
+/// The route installed here is provisional: it points at the
+/// highest-priority provider without any evidence that it works, and the
+/// first real reconcile replaces it. That is fine — the point is only to
+/// give the kernel something to validate reply paths against.
+async fn ensure_bootstrap_default(cfg: &Config) {
+    let out = Command::new("ip")
+        .args(["-4", "route", "show", "default"])
+        .kill_on_drop(true)
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty() => {
+            // Something already owns a default; leave it alone. The balancer
+            // replaces it at `metric 0 proto static` once a provider proves
+            // healthy.
+            return;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!(error = %e, "could not read the default route; skipping bootstrap");
+            return;
         }
     }
 
-    // Persist knobs across reboots.
-    let persisted: String = knobs.iter().map(|(k, v)| format!("{k} = {v}\n")).collect();
+    let Some(first) = cfg.providers.iter().min_by_key(|p| p.priority) else {
+        return;
+    };
+
+    // A high metric keeps it clearly subordinate to the metric-0 route the
+    // balancer installs, so the real choice always wins.
+    let gw = first.gateway.to_string();
+    let status = Command::new("ip")
+        .args([
+            "route",
+            "replace",
+            "default",
+            "via",
+            &gw,
+            "dev",
+            &first.interface,
+            "metric",
+            &crate::router::BOOTSTRAP_METRIC.to_string(),
+            "proto",
+            "static",
+        ])
+        .kill_on_drop(true)
+        .status()
+        .await;
+
+    match status {
+        Ok(s) if s.success() => warn!(
+            provider = %first.name,
+            gateway = %gw,
+            "no default route was present — installed a provisional one via the \
+             highest-priority provider at a high metric so probe replies are not \
+             dropped by reverse-path filtering. It will be replaced as soon as a \
+             provider passes its health checks."
+        ),
+        _ => warn!(
+            "no default route present and the provisional one could not be \
+             installed — probe replies may be dropped by rp_filter until some \
+             other tool installs a default route"
+        ),
+    }
+}
+
+/// Read a sysctl key, or `None` if it does not exist on this kernel.
+async fn read_sysctl(key: &str) -> Option<String> {
+    let path = format!("/proc/sys/{}", key.replace('.', "/"));
+    tokio::fs::read_to_string(path)
+        .await
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+async fn tune_sysctl() -> Result<()> {
+    // (key, value, required). rp_filter = 2 (loose) is the safe choice for a
+    // single-armed gateway where packets may arrive and leave on the same
+    // interface.
+    //
+    // Only `ip_forward` is *required*: without it the box cannot route client
+    // traffic at all, so continuing would be pretending to work. The rest are
+    // hardening — worth setting, not worth refusing to start over.
+    let knobs = [
+        ("net.ipv4.ip_forward", "1", true),
+        ("net.ipv4.conf.all.forwarding", "1", true),
+        ("net.ipv4.conf.all.send_redirects", "0", false),
+        ("net.ipv4.conf.default.send_redirects", "0", false),
+        ("net.ipv4.conf.all.accept_redirects", "0", false),
+        ("net.ipv4.conf.all.rp_filter", "2", false),
+        ("net.ipv4.conf.default.rp_filter", "2", false),
+    ];
+
+    for (k, v, required) in knobs {
+        let current = read_sysctl(k).await;
+
+        // Already correct? Then a read-only /proc/sys is irrelevant. This is
+        // the normal case inside a container whose sysctls were set by the
+        // runtime, and on hosts where a hardening profile owns these knobs —
+        // refusing to start there would be wrong, since the setting we need
+        // is already in force.
+        if current.as_deref() == Some(v) {
+            continue;
+        }
+
+        let arg = format!("{k}={v}");
+        let out = Command::new("sysctl")
+            .args(["-w", &arg])
+            .kill_on_drop(true)
+            .output()
+            .await
+            .with_context(|| format!("failed to run `sysctl -w {arg}`"))?;
+
+        if out.status.success() {
+            continue;
+        }
+
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        match current {
+            None => {
+                // The knob does not exist on this kernel at all.
+                warn!(key = k, "sysctl key not present on this kernel — skipping");
+            }
+            Some(found) if required => bail!(
+                "`sysctl -w {arg}` failed ({stderr}) and the current value is {found:?}. \
+                 IP forwarding is mandatory — without it this host cannot route client \
+                 traffic. Either grant write access to /proc/sys (run as root, or give \
+                 the container --privileged / an explicit `sysctls:` entry), or set \
+                 {k}={v} on the host beforehand."
+            ),
+            Some(found) => warn!(
+                key = k,
+                current = %found,
+                wanted = v,
+                error = %stderr,
+                "could not set sysctl (continuing — this knob is hardening, not required)"
+            ),
+        }
+    }
+
+    // Persist knobs across reboots. Best-effort: read-only /etc is fine.
+    let persisted: String = knobs
+        .iter()
+        .map(|(k, v, _)| format!("{k} = {v}\n"))
+        .collect();
     if let Err(e) = tokio::fs::write("/etc/sysctl.d/99-vlb.conf", persisted).await {
         warn!(error = %e, "failed to persist sysctl settings (non-fatal)");
     }

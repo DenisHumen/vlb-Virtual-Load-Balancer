@@ -47,19 +47,37 @@ fast, and gives you a real dashboard.
 * **Per-provider, fwmark-bound probes**, all independent of which provider
   currently owns the default route. Each provider gets its own routing
   table (`ip rule fwmark`) so we can verify any uplink any time.
-* **Three layers of health checks** per provider:
+* **Five layers of health checks** per provider:
   1. **Gateway**: ICMP to next-hop on the LAN.
   2. **Internet**: 3-packet ICMP burst (≥2 replies needed) to a list of
      external targets — IPs *and hostnames*. Hostnames are resolved
      through that provider's DNS, so the resolved IP is reachable via the
      same uplink.
   3. **DNS**: explicit UDP/53 round-trip to public resolvers, again
-     fwmarked. Catches "ICMP works but DNS is blocked" outages typical of
-     unpaid-account / captive-portal upstreams.
+     fwmarked. Catches "ICMP works but DNS is blocked" outages.
+  4. **DNS integrity**: a random name under `.invalid` — which RFC 6761
+     guarantees can never exist — must come back NXDOMAIN. A resolver that
+     invents an address for it is being intercepted.
+  5. **Content canary**: fetch a resource whose bytes we already know, over
+     that uplink, and compare. See below — this is the one that catches the
+     failure mode the others cannot.
 * **Selectively-prohibited detection**: if any hostname target is
   configured, at least one of them must succeed — so a happy `1.1.1.1`
   reply can't mask an uplink that returns
   `Destination Net Prohibited` for everything else.
+* **Interception detection (the content canary).** Reachability probes all
+  share one blind spot, and it is the failure mode that hurts most: an ISP
+  whose account has lapsed usually does *not* black-hole traffic — it
+  intercepts it. DNS answers get rewritten to a payment portal and HTTP
+  requests get answered with a billing page, while ICMP is left working. The
+  next hop pings, `1.1.1.1` pings, `google.com` resolves and pings (to the
+  portal, which answers), DNS returns a well-formed NOERROR. Every
+  reachability check passes and the uplink looks perfectly healthy while
+  nothing actually works. `vlb` closes that gap by fetching content it
+  already knows the answer to: an interceptor can fake reachability for
+  free, but it cannot produce bytes it does not have. Wrong content is
+  treated as *proof* rather than a symptom, so it bypasses the failure
+  threshold and switches on first observation.
 * **Deterministic priority-based selection** with separate fail / recover
   thresholds (anti-flap).
 * **Default route written as `metric 0 proto static`** so it cleanly
@@ -199,6 +217,28 @@ disable_host_firewall  = false   # leave UFW etc. alone
 [database]
 path = "/var/lib/vlb/stats.db"
 
+[canary]                         # content authenticity — see below
+enabled         = true
+interval_secs   = 10
+timeout_ms      = 4000
+quorum          = "majority"     # any | majority | all
+failure_threshold = 2
+
+[[canary.targets]]
+url = "http://connectivitycheck.gstatic.com/generate_204"
+expect_status = 204
+
+[[canary.targets]]
+url = "https://raw.githubusercontent.com/DenisHumen/vlb-Virtual-Load-Balancer/main/canary/canary.txt"
+expect_contains = "vlb-canary-v1-do-not-edit"
+
+[failover]
+failback_stable_secs     = 30    # primary must be clean this long before we return
+flap_threshold           = 3     # switches inside flap_window before backoff kicks in
+flap_window_secs         = 600
+max_failback_stable_secs = 900
+route_watchdog_secs      = 15    # re-assert our default route if something else took it
+
 [control]
 listen = "127.0.0.1:7650"        # control socket; loopback only
 
@@ -221,12 +261,87 @@ priority  = 0                    # lower wins
 role      = "primary"
 
 [[providers]]
-name      = "isp-backup-a"
+name      = "isp-backup"
 gateway   = "10.0.0.1"
 interface = "ens18"
-priority  = 1
+priority  = 2                    # gaps are fine — see below
 role      = "backup"
 ```
+
+### Priorities
+
+Lowest number wins. Priorities only have to be **unique** — they do not need
+to start at 0 and gaps are allowed. `0` and `2` with nothing at `1` is a
+perfectly good configuration, and leaving a gap is useful: you can slot in a
+third uplink later without renumbering, which would otherwise move an
+existing provider's routing table and fwmark (`table = table_base + priority`,
+`mark = fwmark_base + priority`).
+
+### Canary targets
+
+Each target names a URL, the status code you expect, and optionally what the
+body must look like. Set **exactly one** of:
+
+| Field             | Meaning                                                        |
+|-------------------|----------------------------------------------------------------|
+| `expect_contains` | Body must contain this marker. Robust to line-ending changes.   |
+| `expect_exact`    | Body must equal this string byte for byte.                      |
+| `expect_sha256`   | SHA-256 of the body, 64 hex chars. Strictest.                   |
+| *(none)*          | Only the status code is checked — for `generate_204`-style endpoints. |
+
+The shipped defaults deliberately mix schemes, so that no single failure can
+both cause a false failover and hide a real one:
+
+* the two **plain-HTTP** endpoints are the standard captive-portal probes
+  (what Android and Firefox use). Plain HTTP is precisely what an
+  intercepting ISP rewrites, so these trip first and loudest;
+* the **HTTPS** endpoint additionally proves the certificate chain — a
+  transparent proxy cannot present a valid certificate for
+  `raw.githubusercontent.com`, so it fails the handshake rather than serving
+  a portal page.
+
+`quorum = "majority"` (the default) means one endpoint being unavailable is
+tolerated, while an interceptor — which necessarily breaks all of them —
+still trips the check. Two failure kinds are distinguished:
+
+* **tampered** — proof that something is answering in place of the real
+  server. Overrides the quorum entirely: one tampered target takes the
+  provider down immediately, with no threshold.
+* **unreachable** — something failed, but benign explanations exist. Counts
+  as a single vote and must repeat `failure_threshold` times.
+
+Where the line falls matters, because `tampered` is powerful enough for one
+endpoint to fail every uplink over on its own. Only signals that cannot occur
+on a healthy link qualify:
+
+| Observation                                  | Verdict     |
+|----------------------------------------------|-------------|
+| 3xx redirect                                 | tampered    |
+| 511 Network Authentication Required          | tampered    |
+| 2xx, but not the expected one                | tampered    |
+| Expected status, wrong body                  | tampered    |
+| Public hostname resolving into RFC1918/CGNAT | tampered    |
+| **4xx / 5xx**                                | unreachable |
+| Timeout, refused, TLS handshake failure      | unreachable |
+
+The 4xx/5xx row is deliberate. Interceptors serve payment pages, not 404s, so
+a 4xx overwhelmingly means a wrong URL or a broken endpoint — and treating a
+typo'd canary URL as proof would fail over every provider at once on a
+perfectly healthy network.
+
+> Disabling the canary (`enabled = false`) removes the **only** check capable
+> of detecting a reachable-but-intercepted uplink. `vlb check` and the daemon
+> both warn when it is off.
+
+### Failback policy
+
+Leaving a broken uplink is immediate and unconditional — users are offline
+now, so any healthy provider beats the one we are on. Coming *back* is the
+opposite: nothing is broken, so `vlb` waits until the higher-priority
+provider has passed **every** layer continuously for `failback_stable_secs`.
+If a link proves unstable — more than `flap_threshold` switches inside
+`flap_window_secs` — that wait doubles for each extra switch, capped at
+`max_failback_stable_secs`, and decays on its own once the link settles.
 
 ### Probe target rules
 
@@ -253,7 +368,38 @@ vlb auto   [--config <path>]                # release pin
 vlb stats  [--config <path>] [--hours N] [--recent N]
 vlb system [--config <path>] [--recent N]
 vlb diag   [--config <path>]                # interfaces, DB, ports
+vlb probe  [--config <path>] [--provider <name>] [--repeat N]
+vlb update [--config <path>] [--check] [--pre] [--yes] [--force]
 ```
+
+### `vlb probe` — size your timeouts from measurements
+
+Runs every health layer once against each provider and prints what each one
+actually cost, without touching the routing table. Use it to pick
+`canary.timeout_ms` instead of guessing, and to see *why* a provider is
+considered unhealthy:
+
+```bash
+sudo vlb --config /etc/vlb/vlb.toml probe --repeat 5
+```
+
+It reports the slowest observed run per layer — the number a timeout has to
+accommodate — and suggests a `canary.timeout_ms`. Under an intercepted
+uplink it names the interception explicitly rather than reporting a vague
+timeout.
+
+### `vlb update` — install the newest release
+
+```bash
+sudo vlb --config /etc/vlb/vlb.toml update --check   # look, change nothing
+sudo vlb --config /etc/vlb/vlb.toml update           # install, with a prompt
+```
+
+Downloads the release asset for this host's architecture from GitHub,
+verifies it against the published SHA-256, proves the new binary runs
+(`--version`) *before* replacing the old one, keeps the previous binary as
+`vlb.bak`, and restarts the systemd unit. The same flow is on the TUI's `u`
+key.
 
 ---
 
@@ -267,6 +413,7 @@ vlb diag   [--config <path>]                # interfaces, DB, ports
 | `f`     | Force the selected provider               |
 | `a`     | Release force, return to auto             |
 | `r`     | Force redraw                              |
+| `u`     | Check for a new release and install it    |
 | `q`     | Quit                                      |
 
 ---
@@ -297,6 +444,97 @@ so live flows reset and reconnect.
 | Sysctl `ip_forward=0`                                 | startup check (when `firewall.manage = true`) |
 | Stale conntrack after switch                          | `conntrack -F` on every change |
 | Two coexisting default routes (DHCP + ours)           | `metric 0 proto static` replace |
+| **Account unpaid: DNS hijacked to a portal**          | **DNS integrity probe (`.invalid` must be NXDOMAIN)** |
+| **Account unpaid: HTTP answered by a billing page**   | **content canary (bytes compared, redirects rejected)** |
+| **Transparent TLS proxy**                             | **canary certificate validation fails the handshake** |
+| **Hostname resolves into RFC1918 / CGNAT space**      | **canary rejects the answer before even connecting** |
+| External tool replaces our default route (DHCP renew) | route watchdog re-installs it |
+| A provider that keeps bouncing up and down            | failback stability window + flap backoff |
+
+---
+
+## Testing
+
+```bash
+# everything that runs without root or docker: fmt, clippy, unit tests,
+# and a validation pass over the shipped example config
+./scripts/vlb.sh test
+
+# ...plus the full failover lab in docker (a few minutes)
+./scripts/vlb.sh test --lab
+```
+
+Run this before pushing — it is the same set CI enforces.
+
+### The failover lab
+
+`docker/test/` builds a hermetic two-ISP network and breaks it on purpose:
+
+```
+   ┌──────────────── edge 10.77.0.0/24 ────────────────┐
+   │  vlb 10.77.0.100    isp1 10.77.0.2   isp2 10.77.0.3│
+   └───────────────────────────────────────────────────┘
+                        │              │
+   ┌────────────── transit 192.0.2.0/24 ───────────────┐
+   │  isp1 192.0.2.2     isp2 192.0.2.3   origin 192.0.2.10
+   └───────────────────────────────────────────────────┘
+```
+
+Both providers hang off the *same* vlb interface with different next hops —
+the single-armed topology of the real deployment — with priorities 0 and 2 so
+the priority-gap case is exercised on every run. The `origin` container plays
+the real internet and is the only holder of the genuine canary content,
+reachable exclusively through one of the two ISPs. The lab's default route is
+deleted at startup, so vlb owns the only one: if it picks the wrong provider,
+nothing reaches the origin at all.
+
+Each ISP can be switched between failure modes at runtime:
+
+| Mode          | What it simulates                                                    |
+|---------------|----------------------------------------------------------------------|
+| `good`        | everything works                                                     |
+| `dead`        | the router is gone — even the next-hop ping fails                    |
+| `blackhole`   | answers pings, forwards nothing (defeats naive gateway checks)       |
+| `lossy`       | 60% packet loss                                                      |
+| `dns-blocked` | ICMP fine, UDP/53 dropped                                            |
+| `portal-http` | **transparent HTTP proxy with DNS left completely honest** — every layer except the content check passes, so only the canary can see it |
+| `expired`     | **unpaid account: DNS hijacked to a portal, HTTP answered by a billing page, ICMP left working** |
+| `mitm`        | as `expired`, plus TLS interception with a forged certificate        |
+
+`expired` and `portal-http` are the two that matter. `expired` is the full
+production symptom. `portal-http` is the stricter test: it leaves DNS entirely
+honest — the resolver still returns NXDOMAIN for `.invalid`, so the integrity
+probe is satisfied — meaning a failover there can *only* have come from
+comparing bytes. It exists so the canary cannot quietly stop working while the
+DNS check covers for it.
+
+In both modes the portal sits on a *public-looking* address (TEST-NET-3), and
+the simulated internet on another (TEST-NET-1), rather than on RFC1918 space.
+That is deliberate: vlb short-circuits a hijack that resolves into private
+address space, so a private portal would never reach the content comparison at
+all. Public-looking addresses force the real path — resolve, connect, fetch,
+compare bytes.
+
+```bash
+docker/test/run-tests.sh                 # all scenarios
+docker/test/run-tests.sh expired         # just the one
+docker/test/run-tests.sh --keep          # leave the lab up to poke at
+
+# manual poking
+docker compose -f docker/test/docker-compose.yml exec isp1 isp-mode expired
+docker compose -f docker/test/docker-compose.yml logs -f vlb
+```
+
+Scenarios assert on the **kernel's** default route and on whether real
+traffic reaches the origin, not just on what vlb believes — a daemon that
+reports a healthy failover while traffic still black-holes fails the test.
+
+> One gap worth naming: the lab exercises the canary over plain HTTP. Testing
+> a *successful* HTTPS canary hermetically would need a custom CA in the trust
+> store, and `vlb` deliberately trusts only the webpki roots. TLS failure
+> paths are covered (the `mitm` mode's forged certificate must be rejected),
+> and the TLS client config is unit-tested; a successful HTTPS fetch is
+> covered by the real-world default targets.
 
 ---
 
@@ -352,10 +590,36 @@ show default` that the live default is `proto static`, not `proto boot`
 or `proto dhcp`. The fix is already in `vlb` (we always write `proto
 static`); if you've manually pinned `proto boot` somewhere, remove that.
 
+**Everything looks healthy but nobody has internet — and the ISP bill is overdue.**  
+This is interception, not an outage. Confirm it with:
+
+```bash
+sudo vlb --config /etc/vlb/vlb.toml probe --provider isp-main
+```
+
+A tampered verdict names what came back instead of the expected content —
+usually a payment page. `vlb` should have failed over on its own within one
+canary interval; if it did not, check that `[canary] enabled = true` and that
+`vlb check` lists targets. Before the content canary existed this case passed
+every probe and no failover happened, which is precisely the bug it was added
+to fix.
+
 **Probes pass but the internet is dead.**  
 You're hitting selective prohibition. Add a hostname to
 `probe_targets` (e.g. `"google.com"`) — IP-only probes can be deceived
-by upstreams that allow popular DNS IPs but block everything else.
+by upstreams that allow popular DNS IPs but block everything else. If the
+uplink is intercepted rather than filtered, see the entry above.
+
+**The canary fails on a provider that is genuinely fine.**  
+Usually one endpoint being unreachable from your region. `quorum = "majority"`
+already tolerates one of three; find out which with `vlb probe`, then either
+replace that target or relax to `quorum = "any"`. If the failure is a timeout,
+raise `canary.timeout_ms` — `vlb probe --repeat 5` prints a suggested value.
+
+**Failback to the primary is slower than expected.**  
+By design: `failback_stable_secs` (30 s default) plus flap backoff. If the
+primary has been bouncing, the wait doubles for each extra switch inside
+`flap_window_secs`. `RUST_LOG=debug` logs the countdown on every tick.
 
 **`ping: invalid argument: '0x200'`.**  
 `iputils-ping`'s `-m` takes decimal. Inside the daemon we always pass
@@ -380,9 +644,12 @@ runs as root. If you're running by hand, prefix with `sudo`.
 ├── README.md
 ├── LICENSE
 ├── rustfmt.toml
+├── canary/
+│   └── canary.txt            # content fetched by the canary probe — do not edit
 ├── docker/
 │   ├── Dockerfile
-│   └── docker-compose.yml
+│   ├── docker-compose.yml
+│   └── test/                 # hermetic two-ISP failover lab (see Testing)
 ├── docs/
 │   └── assets/               # logo, screenshots used by README
 ├── examples/
@@ -395,10 +662,14 @@ runs as root. If you're running by hand, prefix with `sudo`.
 └── src/
     ├── main.rs               # CLI dispatch + module wiring
     ├── core/
-    │   ├── balancer.rs       # state machine, scheduling, control-plane glue
-    │   └── config.rs         # TOML schema + validator
+    │   ├── balancer.rs       # probe orchestration, control-plane glue
+    │   ├── config.rs         # TOML schema + validator
+    │   ├── selection.rs      # pure failover decision function (no I/O — heavily tested)
+    │   └── update.rs         # self-update from GitHub Releases
     ├── net/
+    │   ├── canary.rs         # content-authenticity probe
     │   ├── health.rs         # ICMP / DNS probes (fwmark-bound)
+    │   ├── http.rs           # minimal SO_MARK-bound HTTP/HTTPS client
     │   ├── router.rs         # writes to the kernel routing table
     │   ├── system.rs         # iptables / sysctl / ip rule / table bring-up
     │   └── traffic.rs        # /proc/net/dev sampling

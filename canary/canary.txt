@@ -1,0 +1,28 @@
+vlb-canary-v1-do-not-edit
+
+This file is fetched by vlb over each configured uplink to verify that the
+bytes coming back are genuinely ours.
+
+Why it exists
+-------------
+An ISP whose account has lapsed usually does not black-hole traffic. It
+intercepts it: DNS answers are rewritten to a portal address and HTTP
+requests are answered with a payment page. Every reachability check still
+passes -- the next hop pings, 1.1.1.1 pings, DNS "replies" -- so a probe that
+only asks "do packets come back?" reports the uplink as perfectly healthy
+while nothing actually works.
+
+Fetching a file whose contents are known in advance closes that gap. An
+interceptor can fake reachability for free; it cannot produce content it does
+not have. If the marker on the first line does not come back, the uplink is
+not carrying our traffic to the real internet, and vlb fails over.
+
+Contract
+--------
+The first line is the marker that vlb matches against. Do not edit, move or
+rename this file, and do not add anything above the marker: deployments in
+the field pin their canary check to it, and changing it makes every one of
+them believe their primary uplink has been hijacked.
+
+If you need different canary content, add a new file rather than editing
+this one.

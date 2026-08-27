@@ -1,4 +1,4 @@
-# vlb.ps1 — one-shot Windows launcher for the Virtual Load Balancer.
+﻿# vlb.ps1 — one-shot Windows launcher for the Virtual Load Balancer.
 #
 # Usage (from the repo root):
 #   .\scripts\vlb.ps1                 # build (if needed) + start daemon + status
@@ -6,6 +6,9 @@
 #   .\scripts\vlb.ps1 stop            # stop the background daemon
 #   .\scripts\vlb.ps1 status          # show daemon status
 #   .\scripts\vlb.ps1 build|check|run|logs|stats|system
+#   .\scripts\vlb.ps1 probe           # time every health layer, per provider
+#   .\scripts\vlb.ps1 test            # fmt + clippy + unit tests + example config
+#   .\scripts\vlb.ps1 lab             # docker failover lab (needs Docker Desktop)
 #
 # NOTE: the real forwarding / iptables / ip-rule work is Linux-only. On
 # Windows this launcher is primarily useful for `build`, `check`, `tui`,
@@ -110,6 +113,37 @@ function Cmd-Tui    { Ensure-Bin; Ensure-Cfg; & $VlbBin --config $VlbConfig tui 
 function Cmd-Stats  { Ensure-Bin; Ensure-Cfg; & $VlbBin --config $VlbConfig stats @Rest }
 function Cmd-System { Ensure-Bin; Ensure-Cfg; & $VlbBin --config $VlbConfig system @Rest }
 
+function Cmd-Probe  { Ensure-Bin; Ensure-Cfg; & $VlbBin --config $VlbConfig probe @Rest }
+
+function Cmd-Test {
+    # Everything that runs without root or Docker. The fwmark-bound probes
+    # are Linux-only, so this covers the pure logic: config validation, the
+    # selection state machine, HTTP/canary parsing, the updater.
+    Write-Info 'cargo fmt --check'
+    cargo fmt --all -- --check
+    if ($LASTEXITCODE -ne 0) { Die 'formatting differs; run: cargo fmt --all' }
+    Write-Info 'cargo clippy -D warnings'
+    cargo clippy --release --all-targets --locked -- -D warnings
+    if ($LASTEXITCODE -ne 0) { Die 'clippy found problems' }
+    Write-Info 'cargo test'
+    cargo test --release --locked
+    if ($LASTEXITCODE -ne 0) { Die 'unit tests failed' }
+    Write-Info 'validating examples/vlb.example.toml'
+    & $VlbBin --config (Join-Path $RepoDir 'examples/vlb.example.toml') check | Out-Null
+    if ($LASTEXITCODE -ne 0) { Die 'the shipped example config does not validate' }
+    Write-Ok 'all checks passed'
+    Write-Info 'the docker failover lab is not included here; run: .\scripts\vlb.ps1 lab'
+}
+
+function Cmd-Lab {
+    # The scenario suite is a bash script driving docker compose. Docker
+    # Desktop ships with Git Bash on most Windows dev boxes; if it is not on
+    # PATH, run it from WSL instead.
+    $bash = Get-Command bash -ErrorAction SilentlyContinue
+    if (-not $bash) { Die 'bash not found — run docker/test/run-tests.sh from Git Bash or WSL' }
+    & $bash.Source (Join-Path $RepoDir 'docker/test/run-tests.sh') @Rest
+}
+
 function Cmd-Logs {
     if (-not (Test-Path $VlbLog)) { Die "no log file at $VlbLog" }
     Get-Content $VlbLog -Tail 200 -Wait
@@ -137,6 +171,9 @@ switch ($Command) {
     'stats'    { Cmd-Stats }
     'system'   { Cmd-System }
     'logs'     { Cmd-Logs }
+    'probe'    { Cmd-Probe }
+    'test'     { Cmd-Test }
+    'lab'      { Cmd-Lab }
     'help'     { Get-Help $PSCommandPath -Detailed }
     default    { Die "unknown command: $Command (try: .\scripts\vlb.ps1 help)" }
 }

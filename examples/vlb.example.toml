@@ -1,28 +1,136 @@
-﻿[general]
+[general]
 lan_interface = "ens18"
 gateway_address = "10.0.0.100"
 
+# ─────────────────────────────────────────────────────────────────────────
+# Reachability probes — "do packets come back?"
+# ─────────────────────────────────────────────────────────────────────────
 [health]
 interval_secs = 3
 timeout_ms = 1000
 failure_threshold = 2
 success_threshold = 2
-# External targets to probe through each provider's fwmark. Mix IPs and
-# hostnames: hostnames (e.g. "google.com") are resolved through the
-# provider's own mark-bound DNS resolver and the resulting IP is then
-# pinged with the same mark — a true end-to-end test that catches
-# "selectively prohibited" upstreams which allow ICMP to popular DNS IPs
-# but return Destination Net Prohibited for general internet destinations.
-probe_targets = ["1.1.1.1", "8.8.8.8", "google.com"]
 status_print_secs = 30
-# Catch the "ICMP works but UDP/53 is blocked" failure mode (unpaid ISP
-# accounts, captive portals). Each provider's DNS is queried via its own
-# fwmark, independent of the active default route.
+
+# External targets probed through each provider's fwmark. Mix IPs and
+# hostnames: hostnames are resolved through that provider's own mark-bound
+# resolver and the resulting IP is then pinged with the same mark, which
+# catches "selectively prohibited" upstreams that allow ICMP to popular DNS
+# IPs but return Destination Net Prohibited for everything else.
+probe_targets = ["1.1.1.1", "8.8.8.8", "google.com"]
+
+# Catch "ICMP works but UDP/53 is blocked" (unpaid accounts, captive
+# portals). Each provider's DNS is queried via its own fwmark, independent of
+# the active default route.
 dns_check_enabled = true
 dns_resolvers = ["1.1.1.1", "8.8.8.8"]
 dns_check_name = "cloudflare.com"
 
+# Ask each resolver for a random name under `.invalid`, which RFC 6761
+# guarantees can never exist. An honest resolver answers NXDOMAIN; a
+# hijacking one invents an address. Cheap, and it catches the DNS half of an
+# unpaid-account intercept before the canary even runs.
+dns_integrity_check = true
+
+# Retention for the `health_checks` table. It is the fastest-growing table in
+# the database — several rows per provider on every tick. 0 disables pruning.
+retention_hours = 72
+
+# ─────────────────────────────────────────────────────────────────────────
+# Content canary — "are these bytes actually ours?"
+# ─────────────────────────────────────────────────────────────────────────
+#
+# This is the layer that detects an uplink which is reachable but
+# intercepted. When an ISP account lapses, the provider usually does not
+# black-hole traffic: it rewrites DNS to a portal address and answers every
+# HTTP request with a payment page. The next hop pings, 1.1.1.1 pings, DNS
+# "replies" — every reachability check above passes, and without this section
+# vlb would happily keep a dead uplink as the default route.
+#
+# Fetching content we already know closes that gap. An interceptor can fake
+# reachability for free; it cannot produce bytes it does not have.
+[canary]
+enabled = true
+
+# Slower than the ICMP tick on purpose: a TLS fetch costs far more than a
+# ping, and interception does not come and go between seconds.
+interval_secs = 10
+
+# Covers DNS + TCP + TLS + HTTP for one target. Measure yours with
+# `vlb probe --repeat 5`, which prints the slowest observed round and a
+# suggested value.
+timeout_ms = 4000
+
+# any | majority | all. `majority` tolerates one endpoint being down or
+# blocked in your region without failing over, while an interceptor — which
+# necessarily breaks all of them — still trips it.
+quorum = "majority"
+
+# Consecutive failing rounds before the provider is marked unhealthy. This
+# is ignored when content comes back *tampered*: wrong bytes are proof, not a
+# symptom, so that acts immediately.
+failure_threshold = 2
+
+user_agent = "vlb/0.0.1-alpha (uplink-canary)"
+
+# The two plain-HTTP endpoints are the industry-standard captive-portal
+# probes (what Android and Firefox use). Plain HTTP is exactly what an
+# intercepting ISP rewrites, so these trip first and loudest.
+[[canary.targets]]
+url = "http://connectivitycheck.gstatic.com/generate_204"
+expect_status = 204
+
+[[canary.targets]]
+url = "http://detectportal.firefox.com/success.txt"
+expect_exact = "success\n"
+
+# The HTTPS one additionally proves the certificate chain: a transparent
+# proxy cannot present a valid certificate for raw.githubusercontent.com, so
+# it fails the handshake instead of serving a portal page.
+#
+# `expect_contains` is used rather than `expect_sha256` so the check survives
+# harmless edits elsewhere in the file. For the strictest possible check, pin
+# the digest instead:
+#     expect_sha256 = "0d14d02e710d12902bcf1e6f62d87da014abf962f8a0c45aae603f5e7b223495"
+# (that is the sha256 of canary/canary.txt as shipped; re-compute it with
+#  `sha256sum canary/canary.txt` if you ever fork the file).
+[[canary.targets]]
+url = "https://raw.githubusercontent.com/DenisHumen/vlb-Virtual-Load-Balancer/main/canary/canary.txt"
+expect_contains = "vlb-canary-v1-do-not-edit"
+
+# ─────────────────────────────────────────────────────────────────────────
+# Switching policy
+# ─────────────────────────────────────────────────────────────────────────
+#
+# The two directions are deliberately asymmetric. Leaving a broken uplink is
+# urgent and unconditional — users are offline right now. Coming back to a
+# recovered one is not urgent at all, and doing it eagerly is how a gateway
+# ends up flapping and resetting every TCP connection each time an ISP
+# twitches.
+[failover]
+# A higher-priority provider must pass every layer continuously for this long
+# before we move back to it.
+failback_stable_secs = 30
+
+# After more than `flap_threshold` switches inside `flap_window_secs`, the
+# failback wait doubles for each extra switch, capped at
+# `max_failback_stable_secs`. The penalty decays on its own as old switches
+# age out of the window.
+flap_threshold = 3
+flap_window_secs = 600
+max_failback_stable_secs = 900
+
+# Re-read the kernel default route this often and put ours back if a DHCP
+# renew, `netplan apply` or NetworkManager replaced it. 0 disables.
+route_watchdog_secs = 15
+
+# ─────────────────────────────────────────────────────────────────────────
 [routing]
+# Per-provider table / mark / rule pref are derived from the priority:
+#   table = table_base + priority, mark = fwmark_base + priority
+# Gaps in priority are fine and are in fact useful: leaving room between
+# providers lets you slot a new one in later without renumbering (which would
+# move an existing provider's table and fwmark).
 table_base  = 200
 fwmark_base = 0x200
 rule_pref   = 32000
@@ -35,6 +143,7 @@ disable_host_firewall = false
 path = "/var/lib/vlb/stats.db"
 
 [control]
+# Unauthenticated; loopback only, and validation refuses anything else.
 listen = "127.0.0.1:7650"
 
 [traffic]
@@ -48,6 +157,20 @@ interval_secs = 2
 retention_hours = 72
 per_core = true
 
+# Used by `vlb update` and by the TUI's `u` key.
+[update]
+repo = "DenisHumen/vlb-Virtual-Load-Balancer"
+allow_prerelease = false
+restart_service = true
+service_name = "vlb"
+
+# ─────────────────────────────────────────────────────────────────────────
+# Providers — lowest priority number wins.
+#
+# Priorities need only be unique; they do not have to start at 0 and gaps are
+# allowed. The 0 / 2 pair below is deliberate: isp-main is primary, isp-backup
+# is next, and priority 1 is left free for a future uplink.
+# ─────────────────────────────────────────────────────────────────────────
 [[providers]]
 name = "isp-main"
 gateway = "10.0.0.2"
@@ -56,15 +179,8 @@ priority = 0
 role = "primary"
 
 [[providers]]
-name = "isp-backup-a"
+name = "isp-backup"
 gateway = "10.0.0.1"
-interface = "ens18"
-priority = 1
-role = "backup"
-
-[[providers]]
-name = "isp-backup-b"
-gateway = "10.0.1.1"
 interface = "ens18"
 priority = 2
 role = "backup"
