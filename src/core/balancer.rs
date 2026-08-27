@@ -582,11 +582,37 @@ impl Balancer {
             //    symptom and hide the cause — telling the operator to go
             //    looking at endpoints when the provider has capped them.
             if failure.is_none() {
-                let throughput_due = self.throughput_url.is_some()
-                    && last_throughput
-                        .map(|t: std::time::Instant| t.elapsed() >= throughput_interval)
+                let since_last = last_throughput.map(|t: std::time::Instant| t.elapsed());
+                let on_schedule = since_last
+                    .map(|elapsed| elapsed >= throughput_interval)
+                    .unwrap_or(true);
+
+                // Measure early when the canary has just failed while every
+                // reachability layer still passes. That combination has few
+                // explanations and a rate limit is the leading one: the
+                // throttle starves the canary, which is *why* it failed.
+                //
+                // Without this the answer waits for the next scheduled round
+                // — up to two minutes at the shipped interval — and for that
+                // whole window the provider is reported as having unreachable
+                // endpoints. The operator is sent to check third-party URLs
+                // when the actual finding is that their ISP has capped the
+                // link. The floor on spacing keeps a persistently broken
+                // provider from re-measuring on every tick.
+                let min_spacing = Duration::from_secs(15).min(throughput_interval);
+                let expedited = !canary_ok
+                    && since_last
+                        .map(|elapsed| elapsed >= min_spacing)
                         .unwrap_or(true);
-                if throughput_due {
+
+                if self.throughput_url.is_some() && (on_schedule || expedited) {
+                    if expedited && !on_schedule {
+                        debug!(
+                            provider = %name,
+                            "canary failed while reachability passed — measuring throughput \
+                             now rather than waiting for the next scheduled round"
+                        );
+                    }
                     last_throughput = Some(std::time::Instant::now());
                     self.run_throughput(&name, mark, throughput_timeout).await;
                 }
@@ -821,12 +847,18 @@ impl Balancer {
             if success {
                 entry.consecutive_failures = 0;
                 entry.consecutive_successes = entry.consecutive_successes.saturating_add(1);
-                entry.failure_layer = None;
-                entry.failure_detail = None;
                 if entry.state != State::Up && entry.consecutive_successes >= sthr {
                     entry.state = State::Up;
                     // The failback stability window is measured from here.
                     entry.up_since = Some(now);
+                    // Only now is the reason stale. Clearing it on the first
+                    // successful tick — before the provider has actually
+                    // recovered — leaves a window where the snapshot says
+                    // DOWN with no explanation, which is the one moment an
+                    // operator is most likely to be looking at it. A flapping
+                    // link spends most of its time in exactly that window.
+                    entry.failure_layer = None;
+                    entry.failure_detail = None;
                 }
             } else {
                 let conclusive = failure
@@ -1553,4 +1585,73 @@ impl Balancer {
 /// Effective throughput interval, floored at one second.
 fn cfg_throughput_interval(cfg: &Config) -> u64 {
     cfg.canary.throughput.interval_secs.max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Which layers are treated as *proof* rather than as symptoms.
+    ///
+    /// Only these two bypass the consecutive-failure threshold and take a
+    /// provider down on first observation, so the membership of this set is
+    /// the difference between "fails over in a second" and "fails over on a
+    /// twitch". A fabricated DNS answer and wrong content cannot occur on a
+    /// working link; everything else can.
+    #[test]
+    fn only_fabricated_answers_count_as_proof() {
+        assert!(FailureLayer::DnsHijack.is_conclusive());
+        assert!(FailureLayer::ContentTampered.is_conclusive());
+
+        for layer in [
+            FailureLayer::Gateway,
+            FailureLayer::Internet,
+            FailureLayer::Dns,
+            FailureLayer::ContentUnreachable,
+            FailureLayer::Throttled,
+        ] {
+            assert!(
+                !layer.is_conclusive(),
+                "{} can happen on a working link and must not bypass the threshold",
+                layer.as_str()
+            );
+        }
+    }
+
+    /// The labels end up in logs, in `vlb status` and in the TUI, and the
+    /// lab greps for them. A rename that slipped through would quietly break
+    /// every one of those at once.
+    #[test]
+    fn failure_layer_labels_are_stable_and_distinct() {
+        let all = [
+            (FailureLayer::Gateway, "gateway"),
+            (FailureLayer::Internet, "internet"),
+            (FailureLayer::Dns, "dns"),
+            (FailureLayer::DnsHijack, "dns-hijack"),
+            (FailureLayer::ContentTampered, "content-tampered"),
+            (FailureLayer::ContentUnreachable, "content-unreachable"),
+            (FailureLayer::Throttled, "throttled"),
+        ];
+        for (layer, expected) in all {
+            assert_eq!(layer.as_str(), expected);
+        }
+        let labels: std::collections::HashSet<&str> = all.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels.len(), all.len(), "labels must be distinct");
+    }
+
+    /// The wire form is what the TUI and `vlb status` parse. `snake_case`
+    /// serialisation is why the lab asserts on `content_tampered` rather
+    /// than the hyphenated display label — the two differ on purpose and
+    /// both are load-bearing.
+    #[test]
+    fn failure_layer_serialises_as_snake_case() {
+        let json = serde_json::to_string(&FailureLayer::ContentTampered).unwrap();
+        assert_eq!(json, "\"content_tampered\"");
+        assert_eq!(
+            serde_json::to_string(&FailureLayer::DnsHijack).unwrap(),
+            "\"dns_hijack\""
+        );
+        let back: FailureLayer = serde_json::from_str("\"throttled\"").unwrap();
+        assert_eq!(back, FailureLayer::Throttled);
+    }
 }

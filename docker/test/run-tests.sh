@@ -208,7 +208,7 @@ scenario_expired() {
         note "confirmed: the primary's next hop still answers ICMP"
     fi
 
-    local t; t=$(wait_for_active isp-backup 40)
+    local t; t=$(wait_until_stable isp-backup 60 3)
     if [ "$(active_provider)" = "isp-backup" ]; then
         ok "detected interception and failed over in ${t}s"
     else
@@ -245,7 +245,7 @@ scenario_canary_only() {
         note "next hop answers ICMP"
     fi
 
-    local t; t=$(wait_for_active isp-backup 40)
+    local t; t=$(wait_until_stable isp-backup 60 3)
     if [ "$(active_provider)" != "isp-backup" ]; then
         bad "portal-http: no failover after ${t}s — the canary is not carrying its weight"
         return
@@ -288,7 +288,7 @@ scenario_throttled() {
         -w "      256 KB transfer   : %{time_total}s at %{speed_download} B/s\n" \
         http://192.0.2.10/big.bin 2>/dev/null || true
 
-    local t; t=$(wait_for_active isp-backup 60)
+    local t; t=$(wait_until_stable isp-backup 90 3)
     if [ "$(active_provider)" != "isp-backup" ]; then
         bad "throttled: NO FAILOVER after ${t}s — a 64 kbit/s link is being treated as healthy"
         return
