@@ -396,8 +396,6 @@ scenario_restart() {
          nc -w 40 192.0.2.10 80 >/dev/null 2>&1 &' >/dev/null 2>&1 || true
 
     local before_gw; before_gw=$(kernel_default_gw)
-    local before_flows
-    before_flows=$(vlb_exec conntrack -C 2>/dev/null | tr -d '[:space:]' || echo 0)
 
     "${COMPOSE[@]}" restart vlb >/dev/null 2>&1
     local t; t=$(wait_for_active isp-main 45)
@@ -441,6 +439,204 @@ scenario_watchdog() {
         || bad "watchdog: route still $(kernel_default_gw) after ${waited}s"
 }
 
+# Ubuntu 24.04 runs netplan on top of systemd-networkd, and both write
+# default routes. `netplan apply` and a DHCP lease renewal each rewrite them
+# without asking, which is the single most likely way a live gateway loses
+# vlb's choice. The metric-0 / proto-static scheme exists precisely so our
+# route wins the kernel's lookup rather than merely coexisting with theirs.
+scenario_netplan_fight() {
+    info "netplan / networkd — competing default routes must not win"
+    reset_lab
+    local ours="10.77.0.2"
+
+    # The shapes netplan and dhclient actually produce, at the metrics they
+    # actually use. Each is installed alongside ours, not instead of it.
+    local -a competitors=(
+        "proto dhcp metric 100"
+        "proto static metric 100"
+        "proto ra metric 1024"
+        "proto kernel metric 0"
+        "proto dhcp metric 0"
+        "proto boot metric 0"
+        "proto ra metric 0"
+    )
+    local bad_gw="10.77.0.3"
+
+    for spec in "${competitors[@]}"; do
+        vlb_exec ip route add default via "$bad_gw" dev eth0 $spec >/dev/null 2>&1 \
+            || vlb_exec ip route replace default via "$bad_gw" dev eth0 $spec >/dev/null 2>&1
+
+        # The guarantee is "reclaimed within one watchdog period", not
+        # "instantly": a rival appearing between ticks is precisely what the
+        # watchdog exists to catch. The lab runs it every 5 s.
+        local waited=0
+        while [ "$waited" -lt 20 ]; do
+            [ "$(kernel_default_gw)" = "$ours" ] && break
+            sleep 1; waited=$((waited+1))
+        done
+        local winner; winner=$(kernel_default_gw)
+        if [ "$winner" = "$ours" ]; then
+            ok "beat '$spec' (reclaimed in ${waited}s)"
+        else
+            bad "netplan-fight: '$spec' held the route after ${waited}s (kernel picked $winner)"
+        fi
+        vlb_exec ip route del default via "$bad_gw" dev eth0 $spec >/dev/null 2>&1 || true
+    done
+
+    # Now the harder case: something replaces ours outright, exactly as
+    # `netplan apply` does. The watchdog has to notice and reclaim it.
+    vlb_exec ip route replace default via "$bad_gw" dev eth0 metric 0 proto static >/dev/null 2>&1
+    note "replaced our metric-0 route outright, as 'netplan apply' would"
+    local waited=0
+    while [ "$waited" -lt 25 ]; do
+        [ "$(kernel_default_gw)" = "$ours" ] && break
+        sleep 1; waited=$((waited+1))
+    done
+    [ "$(kernel_default_gw)" = "$ours" ] \
+        && ok "watchdog reclaimed the route in ${waited}s" \
+        || bad "netplan-fight: route still $(kernel_default_gw) after ${waited}s"
+
+    real_traffic_works && ok "client traffic unaffected throughout" \
+        || bad "netplan-fight: client traffic broken"
+}
+
+# 60% packet loss. The interesting property is that a single-packet probe is
+# a coin flip here, which is why the ICMP probe sends a burst and requires a
+# majority of replies. A link this lossy is unusable and must fail over.
+scenario_lossy() {
+    info "lossy — 60% packet loss on the primary"
+    reset_lab
+    isp_mode isp1 lossy
+    local t; t=$(wait_for_active isp-backup 60)
+    [ "$(active_provider)" = "isp-backup" ] \
+        && ok "failed over in ${t}s despite probes intermittently succeeding" \
+        || bad "lossy: no failover after ${t}s"
+    real_traffic_works && ok "real traffic restored via the backup" \
+        || bad "lossy: failed over but traffic still broken"
+}
+
+# conntrack is absent on a stock Ubuntu 24.04 server, and without it the
+# post-failover flush silently does nothing: failover "works" while every
+# established connection stays pinned to the dead provider until it times
+# out. Silent degradation on a gateway is worse than a loud failure, so vlb
+# has to say so at startup.
+scenario_missing_conntrack() {
+    info "missing conntrack — must be reported, not silently ignored"
+    reset_lab
+
+    "${COMPOSE[@]}" exec -T vlb sh -c 'mv /usr/sbin/conntrack /usr/sbin/conntrack.hidden 2>/dev/null \
+        || mv /usr/bin/conntrack /usr/bin/conntrack.hidden 2>/dev/null' >/dev/null 2>&1
+
+    local out
+    out=$(vlb_exec vlb --config /etc/vlb/vlb.toml check 2>&1)
+    case "$out" in
+        *conntrack*)
+            ok "vlb check names the missing tool and what it costs" ;;
+        *)
+            bad "missing-conntrack: 'vlb check' said nothing about it" ;;
+    esac
+    grep -qi "hang" <<<"$out" \
+        && ok "explains the consequence, not just the absence" \
+        || note "consequence text not found in check output"
+
+    "${COMPOSE[@]}" exec -T vlb sh -c 'mv /usr/sbin/conntrack.hidden /usr/sbin/conntrack 2>/dev/null \
+        || mv /usr/bin/conntrack.hidden /usr/bin/conntrack 2>/dev/null' >/dev/null 2>&1
+    ok "restored conntrack for the remaining scenarios"
+}
+
+# An operator pinning a provider at the exact moment the daemon is failing
+# over. Both write the routing table; the result must be coherent rather than
+# whichever raced last, and the daemon must survive it.
+scenario_concurrent_force() {
+    info "concurrent operator commands during a failover"
+    reset_lab
+    isp_mode isp1 dead
+
+    # Hammer force/auto while the health loop is switching underneath.
+    for _ in $(seq 1 6); do
+        vlb_exec vlb --config /etc/vlb/vlb.toml force isp-backup >/dev/null 2>&1 &
+        vlb_exec vlb --config /etc/vlb/vlb.toml auto >/dev/null 2>&1 &
+        vlb_exec vlb --config /etc/vlb/vlb.toml status >/dev/null 2>&1 &
+    done
+    wait 2>/dev/null || true
+    sleep 6
+
+    if vlb_exec vlb --config /etc/vlb/vlb.toml status >/dev/null 2>&1; then
+        ok "daemon survived concurrent force/auto during a switchover"
+    else
+        bad "concurrent-force: daemon stopped answering"
+        return
+    fi
+
+    # Exactly one default route, and it points at something real.
+    local n; n=$(vlb_exec ip -4 route show default | grep -c "^default" || true)
+    n=${n:-0}
+    [ "$n" = "1" ] \
+        && ok "exactly one default route installed (no duplicates from the race)" \
+        || bad "concurrent-force: $n default routes present"
+
+    vlb_exec vlb --config /etc/vlb/vlb.toml auto >/dev/null 2>&1
+    isp_mode isp1 good
+    local t; t=$(wait_for_active isp-main 60)
+    [ "$(active_provider)" = "isp-main" ] \
+        && ok "settled back onto the primary in ${t}s" \
+        || bad "concurrent-force: did not settle (${t}s)"
+    real_traffic_works && ok "client traffic works after the race" \
+        || bad "concurrent-force: traffic broken"
+}
+
+# Repeated failovers, then a look at what the daemon is holding. A gateway
+# runs for months untouched; a leak or an unbounded table is a slow outage.
+scenario_soak() {
+    info "soak — repeated failovers, then check the daemon is not growing"
+    reset_lab
+
+    local rss_before
+    rss_before=$(vlb_exec sh -c 'ps -o rss= -C vlb 2>/dev/null | head -1' | tr -d ' ')
+    [ -n "$rss_before" ] || rss_before=0
+    note "RSS before: ${rss_before} KiB"
+
+    local cycles=6
+    for _ in $(seq 1 "$cycles"); do
+        isp_mode isp1 dead
+        wait_for_active isp-backup 40 >/dev/null || true
+        isp_mode isp1 good
+        wait_for_active isp-main 60 >/dev/null || true
+    done
+    ok "survived ${cycles} full failover/failback cycles"
+
+    if ! vlb_exec vlb --config /etc/vlb/vlb.toml status >/dev/null 2>&1; then
+        bad "soak: daemon stopped answering after ${cycles} cycles"
+        return
+    fi
+    ok "still answering the control socket"
+
+    local rss_after
+    rss_after=$(vlb_exec sh -c 'ps -o rss= -C vlb 2>/dev/null | head -1' | tr -d ' ')
+    [ -n "$rss_after" ] || rss_after=0
+    note "RSS after : ${rss_after} KiB"
+
+    # Generous: allocator behaviour and the stats DB cache make an exact
+    # figure meaningless. The point is to catch a leak, not to police a few
+    # hundred kilobytes.
+    if [ "$rss_before" -gt 0 ] && [ "$rss_after" -gt 0 ]; then
+        local limit=$(( rss_before * 3 + 20000 ))
+        [ "$rss_after" -lt "$limit" ] \
+            && ok "memory stable across cycles (${rss_before} -> ${rss_after} KiB)" \
+            || bad "soak: RSS grew from ${rss_before} to ${rss_after} KiB"
+    fi
+
+    # Flap backoff should have kicked in and be visible, not silent.
+    if "${COMPOSE[@]}" logs --tail 400 vlb 2>&1 | grep -qi "failback pending"; then
+        ok "failback backoff engaged and logged during the flapping"
+    else
+        note "no failback-pending line (expected at RUST_LOG=debug)"
+    fi
+
+    real_traffic_works && ok "client traffic healthy at the end of the soak" \
+        || bad "soak: traffic broken after the cycles"
+}
+
 scenario_force() {
     info "force / auto — operator pin overrides priority, then releases"
     reset_lab
@@ -476,7 +672,7 @@ scenario_probe_cli() {
 
 # ─────────────────────────────────────────────────────────────────────────
 
-SCENARIOS=(baseline priority_gap dead blackhole dns_blocked expired canary_only throttled failback both_down restart watchdog force probe_cli)
+SCENARIOS=(baseline priority_gap dead blackhole lossy dns_blocked expired canary_only throttled failback both_down restart watchdog netplan_fight missing_conntrack concurrent_force soak force probe_cli)
 
 cleanup() {
     if [ "$KEEP" -eq 1 ]; then
@@ -537,4 +733,4 @@ else
     for f in "${FAILED_NAMES[@]}"; do printf '  %s- %s%s\n' "$RED" "$f" "$RST"; done
 fi
 say "────────────────────────────────────────────────────────"
-exit $([ "$FAIL" -eq 0 ] && echo 0 || echo 1)
+if [ "$FAIL" -eq 0 ]; then exit 0; else exit 1; fi

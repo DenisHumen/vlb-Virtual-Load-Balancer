@@ -20,7 +20,7 @@ installs the highest-priority healthy one as the kernel default route,
 flushes conntrack on switch, and ships a TUI / control protocol / SQLite
 stats so you can actually see what's happening.
 
-> **Status:** `0.2.0`. Runs in production, and the failover behaviour is
+> **Status:** `0.2.1`. Runs in production, and the failover behaviour is
 > covered by a docker lab that breaks the network eight different ways on
 > every CI run. Still pre-1.0: config keys can change between minor versions,
 > and `vlb check` will tell you when they do.
@@ -583,6 +583,13 @@ Each ISP can be switched between failure modes at runtime:
 | `blackhole`   | answers pings, forwards nothing (defeats naive gateway checks)       |
 | `lossy`       | 60% packet loss                                                      |
 | `throttled`   | **link up, everything reachable, capped at 64 kbit/s** — only the throughput floor can see it |
+
+Beyond the per-provider fault modes, the suite also covers the operational
+cases that break gateways in the field: competing default routes from
+netplan/networkd, a missing `conntrack`, operator `force`/`auto` racing a
+switchover, a daemon restart on a healthy gateway, and a soak that runs six
+full failover/failback cycles and then checks the daemon has not grown.
+62 assertions in 18 scenarios, all on Ubuntu 24.04.
 | `dns-blocked` | ICMP fine, UDP/53 dropped                                            |
 | `portal-http` | **transparent HTTP proxy with DNS left completely honest** — every layer except the content check passes, so only the canary can see it |
 | `expired`     | **unpaid account: DNS hijacked to a portal, HTTP answered by a billing page, ICMP left working** |
@@ -655,9 +662,38 @@ MSRV is **1.88**. The launcher script (`scripts/vlb.sh`) bootstraps
   <mark>` and fractional `-W`).
 * `iptables` NAT table — nftables hosts ship `iptables-nft`, which
   works.
-* `conntrack` — optional. Without it the per-failover flush is a
-  no-op and flows wait for TCP timeout.
+* `conntrack` — **install it.** Nominally optional, but without it the
+  per-failover flush silently does nothing: failover looks like it worked
+  while every established connection stays pinned to the dead provider and
+  hangs until it times out. **A stock Ubuntu 24.04 server does not have it**,
+  so this is the default state on a fresh box, not an edge case. The
+  installer puts it there; `vlb check` and the daemon both say so if it is
+  missing.
 * Root (`CAP_NET_ADMIN` plus write access to `/proc/sys`).
+
+---
+
+## Ubuntu 24.04
+
+The primary deployment target, and the platform the test lab runs on. Three
+things differ from older releases and all three are handled:
+
+* **`iptables` is the nf_tables backend** (`iptables-nft`). The rules vlb
+  writes — MASQUERADE, the `-C` idempotency check, the FORWARD policy — all
+  behave identically on it. Verified, not assumed.
+* **`conntrack` is not installed.** See above; the installer adds it, because
+  its absence degrades failover silently rather than loudly.
+* **netplan drives systemd-networkd**, and both write default routes. `ip
+  route replace` keys on (destination, metric, **proto**), so a rival default
+  at the same metric 0 with a different proto is a *separate* route to the
+  kernel: the two coexist at equal cost and the kernel picks between them by
+  insertion order. vlb removes such rivals when it installs its own route,
+  and the watchdog removes any that appear later — verified against `proto`
+  values of `dhcp`, `static`, `kernel`, `boot` and `ra` at both metric 0 and
+  higher.
+
+A `netplan apply` or a DHCP renewal that replaces our route outright is
+reclaimed within one `route_watchdog_secs` period.
 
 ---
 

@@ -1091,9 +1091,32 @@ impl Balancer {
                 r.gateway == expected.gateway && r.interface == expected.interface
             };
 
-            match self.router.current_default().await {
-                Ok(Some(installed)) if matches(&installed) => {}
-                Ok(other) => {
+            // Look at *every* default, not just the preferred one. A rival at
+            // the same metric 0 with a different proto sits alongside ours at
+            // equal cost, and the kernel breaks that tie by insertion order —
+            // so "the best route looks right" is not a safe check. The only
+            // reliable question is whether a rival exists at all.
+            let verdict = self.router.current_defaults().await.map(|routes| {
+                let ours_present = routes.iter().any(&matches);
+                let rival = routes
+                    .iter()
+                    .find(|r| r.metric.unwrap_or(0) == 0 && !matches(r))
+                    .cloned();
+                (ours_present, rival)
+            });
+
+            match verdict {
+                Ok((true, None)) => {}
+                Ok((ours_present, rival)) => {
+                    if let Some(r) = &rival {
+                        warn!(
+                            rival_gw = %r.gateway,
+                            rival_proto = r.proto.as_deref().unwrap_or("(none)"),
+                            ours_present,
+                            "a competing default route is installed at metric 0 —                              the kernel would choose between it and ours arbitrarily"
+                        );
+                    }
+                    let other = rival;
                     warn!(
                         provider = %expected.name,
                         expected_gw = %expected.gateway,

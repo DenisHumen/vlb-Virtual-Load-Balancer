@@ -119,6 +119,52 @@ esac
 
 log "host: $(uname -m) → ${TARGET}"
 
+# ── runtime dependencies ─────────────────────────────────────────────────
+#
+# vlb shells out to a handful of tools. Two of them are missing on a stock
+# Ubuntu 24.04 server, and one of those fails *silently*: without
+# `conntrack`, the flush after a switchover is a no-op, so failover looks
+# like it worked while every established connection keeps pointing at the
+# dead provider and hangs until it times out. Users experience a two-minute
+# outage that no log line explains.
+#
+# So install them rather than merely warning. They are tiny, and a gateway
+# that half-works is worse than one that tells you why.
+ensure_runtime_deps() {
+    local missing=()
+    command -v ip        >/dev/null || missing+=(iproute2)
+    command -v ping      >/dev/null || missing+=(iputils-ping)
+    command -v iptables  >/dev/null || missing+=(iptables)
+    command -v conntrack >/dev/null || missing+=(conntrack)
+
+    [[ ${#missing[@]} -eq 0 ]] && { log "runtime dependencies present"; return 0; }
+
+    log "installing missing runtime dependencies: ${missing[*]}"
+    if command -v apt-get >/dev/null; then
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+        if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing[@]}" >/dev/null 2>&1; then
+            ok "installed: ${missing[*]}"
+            return 0
+        fi
+    elif command -v dnf >/dev/null; then
+        dnf install -y -q "${missing[@]}" >/dev/null 2>&1 && { ok "installed: ${missing[*]}"; return 0; }
+    elif command -v yum >/dev/null; then
+        yum install -y -q "${missing[@]}" >/dev/null 2>&1 && { ok "installed: ${missing[*]}"; return 0; }
+    fi
+
+    warn "could not install: ${missing[*]}"
+    for m in "${missing[@]}"; do
+        case "$m" in
+            conntrack)
+                warn "  without conntrack, connections are NOT reset after a failover —" \
+                     "they hang until they time out. Install it by hand." ;;
+            iproute2|iputils-ping)
+                die "  ${m} is required; vlb cannot run without it" ;;
+        esac
+    done
+}
+ensure_runtime_deps
+
 if command -v systemctl >/dev/null; then
     adopt_existing_unit
 fi

@@ -21,7 +21,10 @@ COPY canary ./canary
 COPY rustfmt.toml ./
 RUN cargo build --release --locked
 
-FROM debian:bookworm-slim AS runtime
+# The production target. Notably this image does NOT preinstall conntrack:
+# a stock Ubuntu 24.04 server does not have it either, and the lab should
+# reproduce that rather than paper over it.
+FROM ubuntu:24.04 AS runtime
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         iproute2 \

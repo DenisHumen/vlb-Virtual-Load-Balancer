@@ -156,6 +156,10 @@ async fn main() -> Result<()> {
             let config = Config::load(&cli.config)?;
             config.validate()?;
             println!("{}", config.summary());
+            // Reading $PATH mutates nothing, and a missing `conntrack` is the
+            // sort of thing that only shows up as "failover worked but
+            // everyone was stuck for two minutes". Better said here.
+            report_dependencies(&config).await;
             println!("configuration OK");
             Ok(())
         }
@@ -288,6 +292,41 @@ async fn wait_for_shutdown() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Report which external commands are present, and what a missing one costs.
+///
+/// Deliberately not fatal: `vlb check` is for reading, and an operator may be
+/// validating a config on a machine that is not the gateway. It is printed
+/// rather than logged so it lands in the same output as the config summary.
+async fn report_dependencies(config: &Config) {
+    let mut problems = Vec::new();
+    for dep in system::DEPENDENCIES {
+        let present = tokio::process::Command::new("sh")
+            .args(["-c", &format!("command -v {} >/dev/null 2>&1", dep.bin)])
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if present {
+            continue;
+        }
+        if dep.bin == "iptables" && !config.firewall.manage {
+            continue;
+        }
+        problems.push(dep);
+    }
+
+    if problems.is_empty() {
+        return;
+    }
+
+    println!("external commands:");
+    for dep in problems {
+        let tag = if dep.required { "MISSING" } else { "missing" };
+        println!("  {tag} {} — {}", dep.bin, dep.consequence);
+        println!("          install:  apt-get install -y {}", dep.package);
     }
 }
 

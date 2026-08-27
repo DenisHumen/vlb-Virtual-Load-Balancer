@@ -23,6 +23,89 @@ pub fn check_root() -> Result<()> {
     Ok(())
 }
 
+/// One external command vlb depends on, and what breaks without it.
+pub struct Dependency {
+    pub bin: &'static str,
+    pub package: &'static str,
+    /// Whether vlb can do its job at all without this.
+    pub required: bool,
+    pub consequence: &'static str,
+}
+
+/// Everything vlb shells out to.
+///
+/// Listed explicitly rather than discovered on first use, because the
+/// failure modes are otherwise invisible: a missing `conntrack` makes the
+/// post-failover flush a silent no-op, so failover appears to work while
+/// every established connection hangs until it times out. On Ubuntu 24.04 —
+/// the platform this is deployed on — `conntrack` is **not** installed by
+/// default, so that is the expected state on a fresh box, not an edge case.
+pub const DEPENDENCIES: &[Dependency] = &[
+    Dependency {
+        bin: "ip",
+        package: "iproute2",
+        required: true,
+        consequence: "routing tables and ip rules cannot be managed at all",
+    },
+    Dependency {
+        bin: "ping",
+        package: "iputils-ping",
+        required: true,
+        consequence: "no health probing is possible",
+    },
+    Dependency {
+        bin: "iptables",
+        package: "iptables",
+        required: false,
+        consequence: "NAT and forwarding rules cannot be installed \
+                      (harmless if firewall.manage = false and you manage them yourself)",
+    },
+    Dependency {
+        bin: "conntrack",
+        package: "conntrack",
+        required: false,
+        consequence: "connection tracking cannot be flushed after a switchover, so every \
+                      established connection keeps pointing at the dead provider and hangs \
+                      until it times out — failover will look like it worked while users \
+                      stay stuck for minutes",
+    },
+];
+
+/// Check for the external commands vlb needs.
+///
+/// Returns the names of the missing optional ones so callers can report
+/// them; errors only when something genuinely essential is absent.
+pub async fn check_dependencies(firewall_managed: bool) -> Result<Vec<&'static str>> {
+    let mut missing_optional = Vec::new();
+    for dep in DEPENDENCIES {
+        if which(dep.bin).await {
+            continue;
+        }
+        // iptables only matters if we are the ones installing rules.
+        let matters = dep.required || dep.bin != "iptables" || firewall_managed;
+        if dep.required {
+            bail!(
+                "`{}` is not installed — {}. Install it with:  apt-get install -y {}",
+                dep.bin,
+                dep.consequence,
+                dep.package
+            );
+        }
+        if matters {
+            warn!(
+                missing = dep.bin,
+                package = dep.package,
+                "{} is not installed — {}. Install it with: apt-get install -y {}",
+                dep.bin,
+                dep.consequence,
+                dep.package
+            );
+            missing_optional.push(dep.bin);
+        }
+    }
+    Ok(missing_optional)
+}
+
 /// Bring the host into a state where it can NAT-forward client traffic:
 ///   - IP forwarding on
 ///   - sysctl knobs that trip up single-armed NAT gateways turned off
@@ -33,6 +116,7 @@ pub fn check_root() -> Result<()> {
 ///   - optionally stop ufw/firewalld (opt-in via config)
 pub async fn prepare(cfg: &Config) -> Result<bool> {
     info!("preparing host: sysctl, forwarding, NAT, policy routing");
+    check_dependencies(cfg.firewall.manage).await?;
     tune_sysctl().await?;
 
     if cfg.firewall.manage {

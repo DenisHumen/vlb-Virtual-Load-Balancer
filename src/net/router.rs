@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::process::Command;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Metric used for the provisional default route installed at startup when
 /// the main table has none. High enough to always lose to the metric-0 route
@@ -69,8 +69,84 @@ impl Router {
         }
         debug!(%gateway, interface, "default route installed at metric 0 proto static");
 
+        self.remove_competing_defaults(gateway, interface).await;
         self.drop_bootstrap_default().await;
         Ok(())
+    }
+
+    /// Delete any other default route that ties with ours for the kernel's
+    /// preference.
+    ///
+    /// `ip route replace` keys on (destination, **metric**, **proto**), so it
+    /// only displaces a route matching all three. A default installed by
+    /// something else at the same metric 0 but a different proto — which is
+    /// what netplan, systemd-networkd or a DHCP client can produce — is a
+    /// *different* route as far as the kernel is concerned. Both then sit in
+    /// the table at equal cost and the kernel picks between them by insertion
+    /// order, which is to say arbitrarily.
+    ///
+    /// Found by the lab: a competitor at `metric 0 proto kernel` won the
+    /// lookup outright while vlb believed its own route was installed and
+    /// active. Everything reported healthy; traffic left through the wrong
+    /// uplink.
+    ///
+    /// Routes at a *higher* metric are left alone: the kernel already
+    /// prefers ours, and if ours ever disappears one of those taking over is
+    /// better than no route at all — the watchdog notices and reclaims.
+    async fn remove_competing_defaults(&self, gateway: Ipv4Addr, interface: &str) {
+        let out = Command::new("ip")
+            .args(["-4", "route", "show", "default"])
+            .kill_on_drop(true)
+            .output()
+            .await;
+        let Ok(out) = out else { return };
+        if !out.status.success() {
+            return;
+        }
+
+        for route in parse_all_defaults(&String::from_utf8_lossy(&out.stdout)) {
+            // A missing metric means 0, which is what we install at.
+            if route.metric.unwrap_or(0) != 0 {
+                continue;
+            }
+            let is_ours = route.gateway == gateway
+                && route.interface == interface
+                && route.proto.as_deref() == Some("static");
+            if is_ours {
+                continue;
+            }
+
+            warn!(
+                found_gw = %route.gateway,
+                found_dev = %route.interface,
+                found_proto = route.proto.as_deref().unwrap_or("(none)"),
+                "another default route sits at metric 0 alongside ours — the kernel \
+                 would choose between them arbitrarily, so removing it"
+            );
+
+            let mut args = vec![
+                "route".to_string(),
+                "del".to_string(),
+                "default".to_string(),
+                "via".to_string(),
+                route.gateway.to_string(),
+                "dev".to_string(),
+                route.interface.clone(),
+                "metric".to_string(),
+                route.metric.unwrap_or(0).to_string(),
+            ];
+            if let Some(proto) = &route.proto {
+                args.push("proto".to_string());
+                args.push(proto.clone());
+            }
+            let _ = Command::new("ip")
+                .args(&args)
+                .kill_on_drop(true)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await;
+        }
     }
 
     /// Remove the provisional default route installed at startup, if it is
@@ -117,6 +193,20 @@ impl Router {
     /// Returns `None` when no default route exists at all. In dry-run we
     /// still read (reading mutates nothing), so `--dry-run` reports honestly.
     pub async fn current_default(&self) -> Result<Option<InstalledRoute>> {
+        Ok(parse_default_route_from(&self.read_defaults().await?))
+    }
+
+    /// Every default route currently in the main table.
+    ///
+    /// The watchdog needs all of them, not just the preferred one: a rival at
+    /// the same metric 0 does not change which route "wins" in a way we can
+    /// observe reliably — the kernel breaks that tie by insertion order — so
+    /// the only safe check is whether a rival exists at all.
+    pub async fn current_defaults(&self) -> Result<Vec<InstalledRoute>> {
+        self.read_defaults().await
+    }
+
+    async fn read_defaults(&self) -> Result<Vec<InstalledRoute>> {
         let out = Command::new("ip")
             .args(["-4", "route", "show", "default"])
             .kill_on_drop(true)
@@ -129,7 +219,7 @@ impl Router {
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
-        Ok(parse_default_route(&String::from_utf8_lossy(&out.stdout)))
+        Ok(parse_all_defaults(&String::from_utf8_lossy(&out.stdout)))
     }
 
     /// Drop conntrack state after a failover so existing flows reset
@@ -172,8 +262,14 @@ pub struct InstalledRoute {
 /// When several defaults coexist (the exact situation `metric 0 proto
 /// static` exists to avoid) the kernel prefers the lowest metric, so that is
 /// what we report — a missing metric counts as 0, matching kernel behaviour.
-fn parse_default_route(stdout: &str) -> Option<InstalledRoute> {
-    let mut best: Option<InstalledRoute> = None;
+/// The route the kernel prefers: lowest metric, a missing metric meaning 0.
+fn parse_default_route_from(routes: &[InstalledRoute]) -> Option<InstalledRoute> {
+    routes.iter().min_by_key(|r| r.metric.unwrap_or(0)).cloned()
+}
+
+/// Every default route in the output, in the order the kernel listed them.
+fn parse_all_defaults(stdout: &str) -> Vec<InstalledRoute> {
+    let mut found = Vec::new();
     for line in stdout.lines() {
         let line = line.trim();
         if !line.starts_with("default ") {
@@ -212,30 +308,28 @@ fn parse_default_route(stdout: &str) -> Option<InstalledRoute> {
         let (Some(gateway), Some(interface)) = (gateway, interface) else {
             continue;
         };
-        let candidate = InstalledRoute {
+        found.push(InstalledRoute {
             gateway,
             interface,
             metric,
             proto,
-        };
-        let better = match &best {
-            None => true,
-            Some(b) => candidate.metric.unwrap_or(0) < b.metric.unwrap_or(0),
-        };
-        if better {
-            best = Some(candidate);
-        }
+        });
     }
-    best
+    found
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Test shorthand: parse the output, then pick what the kernel would.
+    fn preferred_default(stdout: &str) -> Option<InstalledRoute> {
+        parse_default_route_from(&parse_all_defaults(stdout))
+    }
+
     #[test]
     fn parses_our_own_route() {
-        let r = parse_default_route("default via 10.0.0.2 dev ens18 proto static metric 0\n")
+        let r = preferred_default("default via 10.0.0.2 dev ens18 proto static metric 0\n")
             .expect("parsed");
         assert_eq!(r.gateway, Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(r.interface, "ens18");
@@ -245,7 +339,7 @@ mod tests {
 
     #[test]
     fn parses_a_dhcp_written_route_with_src() {
-        let r = parse_default_route(
+        let r = preferred_default(
             "default via 192.168.1.1 dev eth0 proto dhcp src 192.168.1.50 metric 100\n",
         )
         .expect("parsed");
@@ -262,16 +356,64 @@ mod tests {
     fn prefers_the_lowest_metric_when_several_defaults_coexist() {
         let out = "default via 10.0.0.9 dev ens18 proto dhcp metric 100\n\
                    default via 10.0.0.2 dev ens18 proto static metric 0\n";
-        let r = parse_default_route(out).expect("parsed");
+        let r = preferred_default(out).expect("parsed");
         assert_eq!(r.gateway, Ipv4Addr::new(10, 0, 0, 2));
 
         // Order in the output must not matter.
         let reversed = "default via 10.0.0.2 dev ens18 proto static metric 0\n\
                         default via 10.0.0.9 dev ens18 proto dhcp metric 100\n";
         assert_eq!(
-            parse_default_route(reversed).unwrap().gateway,
+            preferred_default(reversed).unwrap().gateway,
             Ipv4Addr::new(10, 0, 0, 2)
         );
+    }
+
+    /// A competitor at the *same* metric but a different proto is the case
+    /// `ip route replace` cannot handle: proto is part of the route key, so
+    /// the two coexist at equal cost and the kernel picks between them by
+    /// insertion order. Found by the lab, where a `proto kernel metric 0`
+    /// route took the traffic while vlb believed its own was active.
+    ///
+    /// Both have to be visible to the caller so the competitor can be
+    /// deleted rather than merely out-ranked.
+    #[test]
+    fn all_defaults_are_enumerated_including_same_metric_rivals() {
+        let out = "default via 10.77.0.3 dev eth0 proto kernel metric 0\n\
+                   default via 10.77.0.2 dev eth0 proto static metric 0\n\
+                   default via 10.77.0.9 dev eth0 proto dhcp metric 100\n";
+        let all = parse_all_defaults(out);
+        assert_eq!(all.len(), 3, "every default must be listed: {all:?}");
+
+        let rivals: Vec<_> = all
+            .iter()
+            .filter(|r| r.metric.unwrap_or(0) == 0 && r.proto.as_deref() != Some("static"))
+            .collect();
+        assert_eq!(rivals.len(), 1);
+        assert_eq!(rivals[0].gateway, Ipv4Addr::new(10, 77, 0, 3));
+        assert_eq!(rivals[0].proto.as_deref(), Some("kernel"));
+
+        // The higher-metric one is not a rival: the kernel already prefers
+        // ours, and leaving it is better than having no fallback at all.
+        assert!(
+            all.iter()
+                .any(|r| r.metric == Some(100) && r.gateway == Ipv4Addr::new(10, 77, 0, 9))
+        );
+    }
+
+    /// A DHCP client writing its default at metric 0 is the realistic shape
+    /// of this on Ubuntu, and the one most likely to be hit in production.
+    #[test]
+    fn a_dhcp_route_at_metric_zero_is_recognised_as_a_rival() {
+        let out = "default via 192.168.1.1 dev eth0 proto dhcp src 192.168.1.50 metric 0\n\
+                   default via 10.0.0.2 dev eth0 proto static metric 0\n";
+        let all = parse_all_defaults(out);
+        assert_eq!(all.len(), 2);
+        let rival = all
+            .iter()
+            .find(|r| r.proto.as_deref() == Some("dhcp"))
+            .expect("dhcp route parsed");
+        assert_eq!(rival.metric, Some(0));
+        assert_eq!(rival.gateway, Ipv4Addr::new(192, 168, 1, 1));
     }
 
     #[test]
@@ -279,24 +421,21 @@ mod tests {
         let out = "default via 10.0.0.5 dev eth0\n\
                    default via 10.0.0.6 dev eth0 metric 50\n";
         assert_eq!(
-            parse_default_route(out).unwrap().gateway,
+            preferred_default(out).unwrap().gateway,
             Ipv4Addr::new(10, 0, 0, 5)
         );
     }
 
     #[test]
     fn no_default_route_is_none() {
-        assert_eq!(parse_default_route(""), None);
-        assert_eq!(
-            parse_default_route("10.0.0.0/24 dev eth0 scope link\n"),
-            None
-        );
+        assert_eq!(preferred_default(""), None);
+        assert_eq!(preferred_default("10.0.0.0/24 dev eth0 scope link\n"), None);
     }
 
     #[test]
     fn directly_connected_default_is_not_a_candidate() {
         // No `via` means no comparable next-hop address.
-        assert_eq!(parse_default_route("default dev ppp0 scope link\n"), None);
+        assert_eq!(preferred_default("default dev ppp0 scope link\n"), None);
     }
 
     #[test]
@@ -308,7 +447,7 @@ mod tests {
             "default via 1.2.3.4 dev\n",
             "\n\n   \n",
         ] {
-            let _ = parse_default_route(junk);
+            let _ = preferred_default(junk);
         }
     }
 }
