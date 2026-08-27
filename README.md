@@ -20,8 +20,10 @@ installs the highest-priority healthy one as the kernel default route,
 flushes conntrack on switch, and ships a TUI / control protocol / SQLite
 stats so you can actually see what's happening.
 
-> **Status:** alpha (`0.0.1-alpha`). Tested in production-like environments,
-> but breaking changes can still happen between alpha tags.
+> **Status:** `0.1.0`. Runs in production, and the failover behaviour is
+> covered by a docker lab that breaks the network eight different ways on
+> every CI run. Still pre-1.0: config keys can change between minor versions,
+> and `vlb check` will tell you when they do.
 
 ---
 
@@ -98,6 +100,50 @@ fast, and gives you a real dashboard.
 * **Hardened config validator** — rejects reserved tables (253/254/255),
   overlong interface names, fwmark of 0, timeouts >= interval, control
   ports listening on non-loopback, and a few dozen more footguns.
+
+---
+
+## Install (or update) on a server
+
+One command. It downloads the release for your architecture, verifies it
+against the published SHA-256, checks the new build accepts your existing
+config *before* replacing anything, and restarts the service:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/DenisHumen/vlb-Virtual-Load-Balancer/main/scripts/install.sh | sudo bash
+```
+
+Safe to re-run: it is the update path as well as the install path. Your
+`/etc/vlb/vlb.toml` is never overwritten. If the new build rejects your config,
+or the service fails to come back, it rolls back to the previous binary and
+tells you why.
+
+On a machine with no existing config it installs the annotated example and
+stops short of starting the service, so it cannot bring up a gateway pointed
+at example addresses.
+
+Once installed, the box can update itself:
+
+```bash
+sudo vlb update
+```
+
+…or from the dashboard (`sudo vlb tui`), press `u`.
+
+<details>
+<summary>Options</summary>
+
+| Variable       | Effect                                          |
+|----------------|-------------------------------------------------|
+| `VLB_VERSION`  | Install a specific tag instead of the latest    |
+| `VLB_PRE=1`    | Consider pre-releases                            |
+| `VLB_NO_START=1` | Install the binary, leave the service alone    |
+| `VLB_REPO`     | Pull from a fork                                 |
+
+```bash
+curl -fsSL .../install.sh | sudo VLB_VERSION=v0.1.0 bash
+```
+</details>
 
 ---
 
