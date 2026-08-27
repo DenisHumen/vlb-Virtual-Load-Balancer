@@ -62,8 +62,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Invoked through `bash` rather than executed directly: a checkout on a
+      # filesystem that does not carry the exec bit would otherwise fail with
+      # a bare "exit code 126" and no hint as to why.
       - name: Run the failover scenarios
-        run: ./docker/test/run-tests.sh
+        run: bash ./docker/test/run-tests.sh
 
       - name: Daemon logs on failure
         if: failure()
