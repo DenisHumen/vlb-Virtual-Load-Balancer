@@ -199,9 +199,9 @@ pub struct ProviderSnapshot {
 }
 
 impl Balancer {
-    pub async fn new(cfg: Config, dry_run: bool) -> Result<Arc<Self>> {
+    pub async fn new(cfg: Config, dry_run: bool, installed_bootstrap: bool) -> Result<Arc<Self>> {
         let stats = Arc::new(Stats::open(&cfg.database.path, &cfg.providers)?);
-        let router = Router::new(dry_run);
+        let router = Router::new(dry_run, installed_bootstrap);
 
         let probe_targets: Vec<ProbeTarget> = cfg
             .health
@@ -595,9 +595,10 @@ impl Balancer {
         entry.last_canary_at = Some(now);
         entry.last_canary_summary = Some(summary.clone());
 
-        if let Some(detail) = report.tampered.clone() {
-            // Conclusive: no threshold, no grace. Wrong bytes on the wire
-            // cannot be a transient network condition.
+        if let Some(detail) = report.conclusive_tamper().map(str::to_string) {
+            // Proof: content came back wrong *and* too few targets verified.
+            // No threshold, no grace — an indiscriminate rewrite of every
+            // endpoint is not something a working link does.
             entry.canary_failures = entry.canary_failures.saturating_add(1);
             entry.canary_ok = false;
             entry.canary_tampered = Some(detail);
@@ -609,20 +610,33 @@ impl Balancer {
             entry.canary_ok = true;
             entry.canary_tampered = None;
         } else {
-            // Merely unreachable: this could be a transient blip at the
-            // endpoint rather than our uplink, so require repetition.
+            // Either the endpoints were unreachable, or one came back wrong
+            // while the rest verified. Both have benign explanations, so both
+            // require repetition before they cost the provider its health.
             entry.canary_failures = entry.canary_failures.saturating_add(1);
             let threshold = self.cfg.canary.failure_threshold;
             entry.canary_tampered = None;
             if entry.canary_failures >= threshold {
                 entry.canary_ok = false;
             }
-            debug!(
-                provider = %name,
-                failures = entry.canary_failures,
-                threshold,
-                "canary round failed: {summary}"
-            );
+            if report.tampered.is_some() {
+                // Worth a warning rather than a debug line: something really
+                // is rewriting content, even if it is not enough to convict
+                // the uplink on its own.
+                warn!(
+                    provider = %name,
+                    failures = entry.canary_failures,
+                    threshold,
+                    "{summary}"
+                );
+            } else {
+                debug!(
+                    provider = %name,
+                    failures = entry.canary_failures,
+                    threshold,
+                    "canary round failed: {summary}"
+                );
+            }
         }
     }
 
@@ -805,10 +819,36 @@ impl Balancer {
                     bail!("selection chose unknown provider '{to}'");
                 };
 
+                // Is this actually a change, or are we re-asserting a route
+                // the kernel already has? It matters because the flush below
+                // resets every live connection on the box.
+                //
+                // The common case is a daemon restart: state starts empty, so
+                // the first reconcile is a "switch" to whichever provider is
+                // healthy — usually the one already installed. Flushing there
+                // would drop every established connection for no reason, and
+                // an update is exactly when that would be noticed.
+                let route_unchanged = matches!(
+                    self.router.current_default().await,
+                    Ok(Some(ref r)) if r.gateway == target.gateway && r.interface == target.interface
+                );
+
                 self.router
                     .set_default_route(target.gateway, &target.interface)
                     .await?;
-                self.router.flush_conntrack().await;
+
+                if route_unchanged {
+                    debug!(
+                        provider = %to,
+                        "selected provider already owns the default route — \
+                         skipping the conntrack flush"
+                    );
+                } else {
+                    // A real path change: existing flows are bound to the old
+                    // uplink's NAT state and would black-hole until they time
+                    // out. Reset them so they reconnect immediately.
+                    self.router.flush_conntrack().await;
+                }
 
                 let _ = self.stats.record_failover(&FailoverRecord {
                     timestamp: now,
@@ -885,12 +925,21 @@ impl Balancer {
             };
             let Some(expected) = expected else { continue };
 
+            // Both the next hop *and* the egress interface have to match.
+            // A route with the right gateway on the wrong interface sends
+            // traffic somewhere we did not choose just as effectively as a
+            // wrong gateway does.
+            let matches = |r: &crate::router::InstalledRoute| {
+                r.gateway == expected.gateway && r.interface == expected.interface
+            };
+
             match self.router.current_default().await {
-                Ok(Some(installed)) if installed.gateway == expected.gateway => {}
+                Ok(Some(installed)) if matches(&installed) => {}
                 Ok(other) => {
                     warn!(
                         provider = %expected.name,
                         expected_gw = %expected.gateway,
+                        expected_dev = %expected.interface,
                         found = ?other,
                         "default route was changed by something else — re-installing ours"
                     );
@@ -901,6 +950,13 @@ impl Balancer {
                     {
                         error!(error = %e, "route watchdog failed to re-install the default route");
                     } else {
+                        // Traffic has been leaving through somebody else's
+                        // choice of uplink for up to one watchdog period, so
+                        // conntrack now holds entries bound to the wrong
+                        // path. Without a flush those flows stay broken until
+                        // they time out — the same reason a normal switchover
+                        // flushes.
+                        self.router.flush_conntrack().await;
                         let _ = self.stats.record_failover(&FailoverRecord {
                             timestamp: Utc::now(),
                             from_provider: Some(expected.name.clone()),

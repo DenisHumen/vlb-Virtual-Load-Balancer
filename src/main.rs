@@ -242,16 +242,20 @@ async fn run(cli: Cli) -> Result<()> {
         "configuration loaded"
     );
 
-    if !cli.dry_run {
+    // `prepare` reports whether it had to install a provisional default
+    // route, so the router knows whether the cleanup afterwards is removing
+    // something we created or something the operator did.
+    let installed_bootstrap = if !cli.dry_run {
         system::check_root()?;
-        system::prepare(&config).await?;
+        system::prepare(&config).await?
     } else {
         tracing::warn!("dry-run mode: system state will not be modified");
-    }
+        false
+    };
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let balancer = Balancer::new(config, cli.dry_run).await?;
+    let balancer = Balancer::new(config, cli.dry_run, installed_bootstrap).await?;
     balancer.spawn_tasks(shutdown_rx);
 
     wait_for_shutdown().await;

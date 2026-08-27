@@ -29,7 +29,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::canary::hex;
-use crate::http::{self, HttpRequest, Url};
+use crate::http::{self, HttpRequest, Scheme, Url};
 
 /// Generous: release tarballs are a few MiB and the runner may be far away.
 const NET_TIMEOUT: Duration = Duration::from_secs(60);
@@ -420,20 +420,38 @@ async fn get_following_redirects(url: &str, max_body: usize) -> Result<Vec<u8>> 
 }
 
 /// Resolve a `Location` value, which may be absolute or a site-relative path.
+///
+/// Refuses to downgrade an HTTPS request onto plain HTTP. This code path
+/// downloads a binary that is then executed as root, so the transport must
+/// stay authenticated for the whole redirect chain — otherwise anyone able
+/// to inject a `Location: http://…` (or sitting on the network for the
+/// following hop) gets to choose the bytes. The checksum is fetched over the
+/// same chain, so it would not save us here.
 fn resolve_location(base: &Url, location: &str) -> Result<Url> {
     let loc = location.trim();
-    if loc.starts_with("http://") || loc.starts_with("https://") {
-        return Url::parse(loc);
-    }
-    if loc.starts_with('/') {
-        return Url::parse(&format!(
+
+    let target = if loc.starts_with("http://") || loc.starts_with("https://") {
+        Url::parse(loc)?
+    } else if loc.starts_with('/') {
+        Url::parse(&format!(
             "{}://{}{}",
             base.scheme.as_str(),
             base.host_header(),
             loc
-        ));
+        ))?
+    } else {
+        bail!("cannot follow relative redirect target {loc:?} from {base}")
+    };
+
+    if base.scheme == Scheme::Https && target.scheme == Scheme::Http {
+        bail!(
+            "{base} redirected to {target}, downgrading HTTPS to plain HTTP. \
+             Refusing to follow — the binary this fetches runs as root, so the \
+             chain has to stay authenticated end to end."
+        );
     }
-    bail!("cannot follow relative redirect target {loc:?} from {base}")
+
+    Ok(target)
 }
 
 /// Resolve through the system resolver, taking the first IPv4 answer.
@@ -658,6 +676,32 @@ mod tests {
             "https://github.com/other/path"
         );
         assert!(resolve_location(&base, "../relative").is_err());
+    }
+
+    /// The updater fetches a binary that is then executed as root, so the
+    /// redirect chain must stay on HTTPS. A `Location: http://…` anywhere in
+    /// it would hand the choice of bytes to whoever is on the network for the
+    /// next hop — and the checksum travels the same chain, so it offers no
+    /// protection against that.
+    #[test]
+    fn redirects_may_not_downgrade_https_to_http() {
+        let secure = Url::parse("https://github.com/o/r/releases/download/v1/x.tar.gz").unwrap();
+
+        let err = resolve_location(&secure, "http://evil.example/x.tar.gz")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("downgrading"), "{err}");
+
+        // Site-relative redirects inherit the scheme, so they stay secure.
+        assert_eq!(
+            resolve_location(&secure, "/other").unwrap().scheme,
+            Scheme::Https
+        );
+
+        // https -> https is of course fine, as is http -> https.
+        assert!(resolve_location(&secure, "https://cdn.example/x").is_ok());
+        let insecure = Url::parse("http://example.com/a").unwrap();
+        assert!(resolve_location(&insecure, "https://example.com/a").is_ok());
     }
 
     /// The updater builds an asset name from [`host_target`], and the release

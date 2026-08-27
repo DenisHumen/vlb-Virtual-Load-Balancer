@@ -258,6 +258,24 @@ pub async fn check_internet_via(
                             };
                         }
                     };
+                    // A public name resolving into private / CGNAT /
+                    // link-local space is a rewritten answer, and pinging it
+                    // would "succeed" against the interceptor's own box —
+                    // which is exactly how a hijacked uplink used to pass
+                    // this layer. Fail the target instead of walking into it.
+                    if let Some(range) = crate::canary::non_routable_range(ip) {
+                        tracing::warn!(
+                            host = %name,
+                            resolved = %ip,
+                            range,
+                            "DNS answer points into non-routable space — the resolver \
+                             on this uplink is rewriting answers"
+                        );
+                        return TargetResult {
+                            is_hostname: true,
+                            outcome: ProbeOutcome::Failed,
+                        };
+                    }
                     let outcome = ping_burst(ip, timeout, 3, 2, Some(mark)).await;
                     TargetResult {
                         is_hostname: true,

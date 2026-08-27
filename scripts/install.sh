@@ -24,6 +24,7 @@
 #   VLB_PRE       set to 1 to consider pre-releases
 #   VLB_REPO      owner/name (default: DenisHumen/vlb-Virtual-Load-Balancer)
 #   VLB_NO_START  set to 1 to install without starting/restarting the service
+#   VLB_SKIP_PROBE set to 1 to skip the pre-restart canary reachability check
 
 set -Eeuo pipefail
 
@@ -74,13 +75,24 @@ adopt_existing_unit() {
 C_RED=$'\033[0;31m'; C_GRN=$'\033[0;32m'; C_YLW=$'\033[0;33m'; C_CYN=$'\033[0;36m'; C_RST=$'\033[0m'
 [[ -t 1 ]] || { C_RED=; C_GRN=; C_YLW=; C_CYN=; C_RST=; }
 
+# Every fetch this script makes ends up as root-owned bytes on the box, so
+# the transport is pinned to HTTPS for the whole chain. `--proto-redir` is the
+# half people forget: without it a redirect to plain http:// is followed
+# happily, and the checksum travels the same chain so it would not save us.
+CURL=(curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 --retry-delay 2 --max-time 300)
+
 log()  { printf '%s[vlb]%s %s\n' "$C_CYN" "$C_RST" "$*"; }
 ok()   { printf '%s[ ok]%s %s\n' "$C_GRN" "$C_RST" "$*"; }
 warn() { printf '%s[!! ]%s %s\n' "$C_YLW" "$C_RST" "$*"; }
 die()  { printf '%s[err]%s %s\n' "$C_RED" "$C_RST" "$*" >&2; exit 1; }
 
 WORKDIR=""
-cleanup() { [[ -n "$WORKDIR" && -d "$WORKDIR" ]] && rm -rf "$WORKDIR"; }
+cleanup() {
+    if [[ -n "$WORKDIR" && -d "$WORKDIR" ]]; then
+        rm -rf "$WORKDIR"
+    fi
+    return 0
+}
 trap cleanup EXIT
 
 # ── preflight ────────────────────────────────────────────────────────────
@@ -107,11 +119,13 @@ esac
 
 log "host: $(uname -m) → ${TARGET}"
 
-command -v systemctl >/dev/null && adopt_existing_unit
+if command -v systemctl >/dev/null; then
+    adopt_existing_unit
+fi
 
 # ── locate the release ───────────────────────────────────────────────────
 
-api() { curl -fsSL -H 'Accept: application/vnd.github+json' "$@"; }
+api() { "${CURL[@]}" -H 'Accept: application/vnd.github+json' "$@"; }
 
 if [[ -n "${VLB_VERSION:-}" ]]; then
     TAG="$VLB_VERSION"
@@ -126,6 +140,9 @@ else
     # Pick the newest non-draft release, honouring VLB_PRE for pre-releases.
     # Parsed with grep/sed rather than jq, which is not installed by default
     # on a minimal server and would be an unnecessary prerequisite.
+    # shellcheck disable=SC2020  # character sets, not words: both ',' and
+    # '{' are deliberately mapped to a newline so each JSON key lands on its
+    # own line for awk. Verified against a real 270 KB API response.
     TAG=$(printf '%s' "$RELEASES_JSON" \
         | tr ',{' '\n\n' \
         | awk -v want_pre="${VLB_PRE:-0}" '
@@ -164,12 +181,12 @@ fi
 
 WORKDIR=$(mktemp -d)
 log "downloading ${ASSET}"
-curl -fsSL --retry 3 --retry-delay 2 -o "${WORKDIR}/${ASSET}" "${BASE}/${ASSET}" \
+"${CURL[@]}" -o "${WORKDIR}/${ASSET}" "${BASE}/${ASSET}" \
     || die "download failed: ${BASE}/${ASSET}
 Check that release ${TAG} publishes an asset for ${TARGET}."
 
 log "verifying checksum"
-curl -fsSL --retry 3 -o "${WORKDIR}/${ASSET}.sha256" "${BASE}/${ASSET}.sha256" \
+"${CURL[@]}" -o "${WORKDIR}/${ASSET}.sha256" "${BASE}/${ASSET}.sha256" \
     || die "the release publishes no .sha256 for ${ASSET} — refusing to install an unverified binary"
 
 EXPECTED=$(awk '{print $1; exit}' "${WORKDIR}/${ASSET}.sha256")
@@ -209,11 +226,60 @@ Nothing was changed — ${BIN_PATH} is still ${CURRENT_VERSION:-the previous bui
 Fix ${CONFIG_PATH}, then re-run this installer."
     fi
     ok "existing config validates against ${NEW_VERSION}"
+
+    # The canary is enabled by default, and it is the one new check that can
+    # fail for reasons unrelated to your uplinks: a restrictive egress
+    # firewall, or a region where one of the default endpoints is blocked. If
+    # it cannot verify anything through *any* provider, restarting would mark
+    # every provider unhealthy. Traffic would keep flowing on the installed
+    # route -- nothing black-holes -- but automatic failover would quietly
+    # stop working, which is precisely the thing you are installing this for.
+    #
+    # So find out before the restart, while the old binary is still serving.
+    # Ask the *binary* whether the canary is on, rather than looking for a
+    # [canary] section in the file. An existing config predates that section
+    # entirely and will not contain it, while the canary still defaults to
+    # enabled — so a grep over the config would skip this check on precisely
+    # the deployments that most need it. `vlb check` prints the resolved
+    # configuration, defaults included.
+    CANARY_ON=1
+    if grep -q 'DISABLED' "${WORKDIR}/check.out" 2>/dev/null; then
+        CANARY_ON=0
+        log "canary is disabled in this config — skipping the pre-flight"
+    fi
+
+    if [[ "${VLB_SKIP_PROBE:-0}" != "1" && $CANARY_ON -eq 1 ]]; then
+        log "checking the content canary can reach its targets (pre-flight)"
+        PROBE_OUT="${WORKDIR}/probe.out"
+        if "${WORKDIR}/vlb" --config "$CONFIG_PATH" probe >"$PROBE_OUT" 2>&1; then
+            if grep -q 'canary verdict: [1-9][0-9]*/' "$PROBE_OUT"; then
+                VERIFIED=$(grep -o 'canary verdict: [0-9]*/[0-9]* canary targets verified' "$PROBE_OUT" | head -1)
+                ok "canary pre-flight passed (${VERIFIED:-verified})"
+            else
+                echo
+                grep -E 'canary|TAMPERED|unreach' "$PROBE_OUT" | sed 's/^/    /' >&2 || true
+                echo
+                die "the content canary could not verify a single target through any provider
+(output above). Restarting now would mark every provider unhealthy and switch
+automatic failover off, while the old binary is still working fine.
+
+Nothing was changed. Either:
+  * fix egress so the canary targets are reachable, or
+  * point [[canary.targets]] in ${CONFIG_PATH} at endpoints you can reach, or
+  * re-run with VLB_SKIP_PROBE=1 if you know this is a false alarm."
+            fi
+        else
+            # `probe` needs the fwmark ip rules the running daemon installed.
+            # If it could not run at all, that is not evidence about the
+            # canary either way -- say so and carry on rather than blocking.
+            warn "could not run the canary pre-flight (probe exited non-zero); continuing"
+        fi
+    fi
 else
     FRESH_CONFIG=1
     log "no config at ${CONFIG_PATH} — installing the annotated example"
     install -d -m 0755 "$CONFIG_DIR"
-    curl -fsSL -o "${WORKDIR}/vlb.example.toml" \
+    "${CURL[@]}" -o "${WORKDIR}/vlb.example.toml" \
         "https://raw.githubusercontent.com/${REPO}/${TAG}/examples/vlb.example.toml" \
         || die "could not fetch the example config"
     install -m 0644 "${WORKDIR}/vlb.example.toml" "$CONFIG_PATH"
@@ -239,7 +305,7 @@ ok "installed ${NEW_VERSION} to ${BIN_PATH}"
 if command -v systemctl >/dev/null; then
     if [[ ! -f "$UNIT_PATH" ]]; then
         log "installing the systemd unit"
-        curl -fsSL -o "${WORKDIR}/vlb.service" \
+        "${CURL[@]}" -o "${WORKDIR}/vlb.service" \
             "https://raw.githubusercontent.com/${REPO}/${TAG}/systemd/vlb.service" \
             || die "could not fetch the systemd unit"
         install -m 0644 "${WORKDIR}/vlb.service" "$UNIT_PATH"

@@ -100,7 +100,9 @@ services:
       net.ipv4.conf.default.rp_filter: "2"
     depends_on: [isp1, isp2]
     environment:
-      RUST_LOG: ${VLB_LOG:-info}
+      # debug so the lab can assert on decisions the daemon logs at that
+      # level (failback countdown, conntrack-flush skip).
+      RUST_LOG: ${VLB_LOG:-info,vlb=debug}
     volumes:
       - ./vlb.test.toml:/etc/vlb/vlb.toml:ro
     networks:

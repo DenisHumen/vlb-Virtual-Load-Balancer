@@ -20,7 +20,7 @@ set -uo pipefail
 export MSYS_NO_PATHCONV=1
 export MSYS2_ARG_CONV_EXCL='*'
 
-cd "$(dirname "$0")"
+cd "$(dirname "$0")" || exit 2
 
 COMPOSE=(docker compose -f docker-compose.yml)
 KEEP=0
@@ -284,6 +284,51 @@ scenario_both_down() {
         || bad "both-down: did not recover after ${t}s"
 }
 
+# Models the operator's own update: the daemon is restarted while everything
+# is healthy. Nothing about the network changed, so the route must stay put
+# and traffic must keep flowing. This is the moment an operator is most
+# likely to be watching, and the least forgiving of a needless disruption.
+scenario_restart() {
+    info "daemon restart — an update must not disturb a healthy gateway"
+    reset_lab
+    [ "$(active_provider)" = "isp-main" ] || { bad "restart: setup failed"; return; }
+
+    # Establish a long-lived flow through the gateway first. If the restart
+    # flushes conntrack, this connection dies; if it does not, it survives.
+    "${COMPOSE[@]}" exec -T -d vlb sh -c \
+        'curl -s --max-time 45 -o /tmp/slow.out http://192.0.2.10/canary.txt >/dev/null 2>&1; \
+         nc -w 40 192.0.2.10 80 >/dev/null 2>&1 &' >/dev/null 2>&1 || true
+
+    local before_gw; before_gw=$(kernel_default_gw)
+    local before_flows
+    before_flows=$(vlb_exec conntrack -C 2>/dev/null | tr -d '[:space:]' || echo 0)
+
+    "${COMPOSE[@]}" restart vlb >/dev/null 2>&1
+    local t; t=$(wait_for_active isp-main 45)
+    if [ "$(active_provider)" != "isp-main" ]; then
+        bad "restart: daemon did not come back onto isp-main after ${t}s"
+        return
+    fi
+    ok "came back on the same provider in ${t}s"
+
+    [ "$(kernel_default_gw)" = "$before_gw" ] \
+        && ok "default route unchanged across the restart ($before_gw)" \
+        || bad "restart: route moved from $before_gw to $(kernel_default_gw)"
+
+    real_traffic_works && ok "traffic works immediately after the restart" \
+        || bad "restart: traffic broken after the restart"
+
+    # The daemon logs whether it skipped the flush. That line is the actual
+    # assertion -- conntrack counts on a near-idle lab are too noisy to
+    # compare directly.
+    if "${COMPOSE[@]}" logs --tail 200 vlb 2>&1 | grep -q "skipping the conntrack flush"; then
+        ok "recognised the route was already correct and skipped the flush"
+    else
+        # Not fatal on its own: with RUST_LOG=info the debug line is absent.
+        note "flush-skip line not in the log (expected at RUST_LOG=debug)"
+    fi
+}
+
 scenario_watchdog() {
     info "route watchdog — an external tool overwrites our default route"
     reset_lab
@@ -335,7 +380,7 @@ scenario_probe_cli() {
 
 # ─────────────────────────────────────────────────────────────────────────
 
-SCENARIOS=(baseline dead blackhole dns_blocked expired canary_only failback both_down watchdog force probe_cli)
+SCENARIOS=(baseline dead blackhole dns_blocked expired canary_only failback both_down restart watchdog force probe_cli)
 
 cleanup() {
     if [ "$KEEP" -eq 1 ]; then

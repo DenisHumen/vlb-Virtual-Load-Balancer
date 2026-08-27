@@ -31,7 +31,7 @@ pub fn check_root() -> Result<()> {
 ///   - per-provider routing tables and fwmark-based ip rules, used by
 ///     health probes to verify each provider's internet path independently
 ///   - optionally stop ufw/firewalld (opt-in via config)
-pub async fn prepare(cfg: &Config) -> Result<()> {
+pub async fn prepare(cfg: &Config) -> Result<bool> {
     info!("preparing host: sysctl, forwarding, NAT, policy routing");
     tune_sysctl().await?;
 
@@ -46,8 +46,10 @@ pub async fn prepare(cfg: &Config) -> Result<()> {
     }
 
     setup_policy_routing(cfg).await?;
-    ensure_bootstrap_default(cfg).await;
-    Ok(())
+    // Reported back so the router only removes a provisional route that this
+    // process actually created.
+    let installed_bootstrap = ensure_bootstrap_default(cfg).await;
+    Ok(installed_bootstrap)
 }
 
 /// Make sure the main table has *a* default route before probing starts.
@@ -68,7 +70,7 @@ pub async fn prepare(cfg: &Config) -> Result<()> {
 /// highest-priority provider without any evidence that it works, and the
 /// first real reconcile replaces it. That is fine — the point is only to
 /// give the kernel something to validate reply paths against.
-async fn ensure_bootstrap_default(cfg: &Config) {
+async fn ensure_bootstrap_default(cfg: &Config) -> bool {
     let out = Command::new("ip")
         .args(["-4", "route", "show", "default"])
         .kill_on_drop(true)
@@ -79,17 +81,17 @@ async fn ensure_bootstrap_default(cfg: &Config) {
             // Something already owns a default; leave it alone. The balancer
             // replaces it at `metric 0 proto static` once a provider proves
             // healthy.
-            return;
+            return false;
         }
         Ok(_) => {}
         Err(e) => {
             warn!(error = %e, "could not read the default route; skipping bootstrap");
-            return;
+            return false;
         }
     }
 
     let Some(first) = cfg.providers.iter().min_by_key(|p| p.priority) else {
-        return;
+        return false;
     };
 
     // A high metric keeps it clearly subordinate to the metric-0 route the
@@ -114,19 +116,25 @@ async fn ensure_bootstrap_default(cfg: &Config) {
         .await;
 
     match status {
-        Ok(s) if s.success() => warn!(
+        Ok(s) if s.success() => {
+            warn!(
             provider = %first.name,
             gateway = %gw,
             "no default route was present — installed a provisional one via the \
              highest-priority provider at a high metric so probe replies are not \
              dropped by reverse-path filtering. It will be replaced as soon as a \
              provider passes its health checks."
-        ),
-        _ => warn!(
-            "no default route present and the provisional one could not be \
+            );
+            true
+        }
+        _ => {
+            warn!(
+                "no default route present and the provisional one could not be \
              installed — probe replies may be dropped by rp_filter until some \
              other tool installs a default route"
-        ),
+            );
+            false
+        }
     }
 }
 

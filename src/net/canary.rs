@@ -192,10 +192,46 @@ impl CanaryReport {
         self.tampered.is_none() && self.passed >= self.required
     }
 
+    /// Tampering that amounts to *proof*, as opposed to an oddity.
+    ///
+    /// This distinction matters more than it looks. A conclusive verdict
+    /// bypasses the failure threshold and takes the provider down on the
+    /// first observation — which is exactly right for an intercepted uplink,
+    /// and exactly wrong for a single flaky endpoint.
+    ///
+    /// A real intercept is indiscriminate: a portal in the path rewrites
+    /// *everything*, so every target fails and the quorum collapses with it.
+    /// One target coming back wrong while the others verify correctly is a
+    /// different animal — a transparent cache on one CDN, a hotel proxy, an
+    /// endpoint that quietly changed its own content. Treating that as proof
+    /// would let one misbehaving third-party URL mark every provider DOWN at
+    /// once, leaving the gateway with no failover capability at all, on a
+    /// network where nothing is actually wrong.
+    ///
+    /// So proof requires both signals: content came back wrong **and** not
+    /// enough targets verified. A lone tampered target still fails the round
+    /// and will take the provider down if it persists — the signal is kept,
+    /// the cliff is not.
+    pub fn conclusive_tamper(&self) -> Option<&str> {
+        match &self.tampered {
+            Some(detail) if self.passed < self.required => Some(detail),
+            _ => None,
+        }
+    }
+
     /// One-line human summary for logs and the TUI.
     pub fn summary(&self) -> String {
-        if let Some(t) = &self.tampered {
+        if let Some(t) = self.conclusive_tamper() {
             return format!("CONTENT TAMPERED — {t}");
+        }
+        if let Some(t) = &self.tampered {
+            // Suspicious but not proof: say so plainly, so nobody reading the
+            // journal concludes the uplink was hijacked on this evidence.
+            return format!(
+                "content mismatch on one target while {}/{} others still verified \
+                 (counted as a failed round, not proof) — {t}",
+                self.passed, self.total
+            );
         }
         if self.is_ok() {
             return format!("{}/{} canary targets verified", self.passed, self.total);
@@ -806,6 +842,48 @@ mod tests {
         assert_eq!(crate::http::parse_response(raw, 4096).unwrap().status, 511);
     }
 
+    /// Tampering only counts as proof when the quorum fails with it.
+    ///
+    /// This is the difference between "an ISP is intercepting this uplink"
+    /// and "one third-party URL is behaving oddly today". Getting it wrong in
+    /// the permissive direction misses real intercepts; getting it wrong in
+    /// the strict direction is worse — one misbehaving endpoint would mark
+    /// *every* provider DOWN at once, on a network where nothing is broken,
+    /// leaving the gateway with no failover capability.
+    #[test]
+    fn tampering_is_proof_only_when_the_quorum_fails_with_it() {
+        let mk = |passed, total, required, tampered: Option<&str>| CanaryReport {
+            passed,
+            total,
+            required,
+            tampered: tampered.map(String::from),
+            latency: None,
+            per_target: Vec::new(),
+        };
+
+        // Real intercept: a portal rewrites everything, so nothing verifies.
+        let intercepted = mk(0, 3, 2, Some("portal page"));
+        assert_eq!(intercepted.conclusive_tamper(), Some("portal page"));
+        assert!(!intercepted.is_ok());
+        assert!(intercepted.summary().contains("CONTENT TAMPERED"));
+
+        // Partial intercept — HTTP rewritten, HTTPS still honest. One target
+        // passes, which is below a majority of three, so still proof.
+        let partial = mk(1, 3, 2, Some("portal page"));
+        assert_eq!(partial.conclusive_tamper(), Some("portal page"));
+
+        // One odd endpoint while the others verify: suspicious, not proof.
+        let odd = mk(2, 3, 2, Some("cache rewrote it"));
+        assert_eq!(odd.conclusive_tamper(), None);
+        assert!(!odd.is_ok(), "the round should still count as failed");
+        let s = odd.summary();
+        assert!(!s.contains("CONTENT TAMPERED"), "must not claim proof: {s}");
+        assert!(s.contains("not proof"), "{s}");
+
+        // No tampering at all is never conclusive, however few passed.
+        assert_eq!(mk(0, 3, 2, None).conclusive_tamper(), None);
+    }
+
     #[test]
     fn report_is_ok_respects_quorum_and_tamper_override() {
         let mk = |passed, total, required, tampered: Option<&str>| CanaryReport {
@@ -818,10 +896,22 @@ mod tests {
         };
         assert!(mk(2, 3, 2, None).is_ok());
         assert!(!mk(1, 3, 2, None).is_ok());
-        // A single tampered target overrides an otherwise-passing quorum:
-        // authenticated content that came back wrong is never acceptable.
-        assert!(!mk(3, 3, 2, Some("portal")).is_ok());
-        assert!(mk(3, 3, 2, Some("portal")).summary().contains("TAMPERED"));
+
+        // Any tampering fails the round, even when the quorum is otherwise
+        // satisfied — content that came back wrong is never acceptable. What
+        // it does *not* do on its own is bypass the failure threshold; see
+        // `tampering_is_proof_only_when_the_quorum_fails_with_it`.
+        //
+        // 2 of 3 passing with the third tampered is the realistic shape: a
+        // tampered target is never counted among `passed`.
+        let odd = mk(2, 3, 2, Some("portal"));
+        assert!(!odd.is_ok());
+        assert_eq!(odd.conclusive_tamper(), None);
+
+        // Quorum failing alongside the tampering is what makes it proof.
+        let intercepted = mk(0, 3, 2, Some("portal"));
+        assert!(!intercepted.is_ok());
+        assert!(intercepted.summary().contains("TAMPERED"));
     }
 
     #[test]

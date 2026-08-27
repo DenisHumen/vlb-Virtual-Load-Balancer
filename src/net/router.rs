@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::process::Command;
 use tracing::{debug, info};
 
@@ -13,11 +14,22 @@ pub const BOOTSTRAP_METRIC: u32 = 4096;
 /// the kernel; this just picks which next-hop becomes the default.
 pub struct Router {
     dry_run: bool,
+    /// Whether startup installed a provisional default route that we are
+    /// responsible for removing once a real one is chosen.
+    ///
+    /// Tracked rather than inferred, so cleanup only ever removes a route
+    /// this process created. Deleting by shape alone would mean that an
+    /// operator's own `default … metric 4096 proto static` — unusual, but
+    /// theirs — would silently disappear the first time a provider came up.
+    owns_bootstrap: AtomicBool,
 }
 
 impl Router {
-    pub fn new(dry_run: bool) -> Self {
-        Self { dry_run }
+    pub fn new(dry_run: bool, installed_bootstrap: bool) -> Self {
+        Self {
+            dry_run,
+            owns_bootstrap: AtomicBool::new(installed_bootstrap),
+        }
     }
 
     /// Put our default route at metric 0 in the main table.
@@ -73,6 +85,11 @@ impl Router {
     /// avoid, and something that makes `ip route show default` misleading to
     /// whoever is debugging at the time.
     async fn drop_bootstrap_default(&self) {
+        // `swap` so the deletion is attempted exactly once even if several
+        // reconciles land at the same moment.
+        if !self.owns_bootstrap.swap(false, Ordering::SeqCst) {
+            return;
+        }
         let _ = Command::new("ip")
             .args([
                 "route",
