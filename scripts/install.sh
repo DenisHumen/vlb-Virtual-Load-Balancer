@@ -259,13 +259,15 @@ Fix ${CONFIG_PATH}, then re-run this installer."
                 echo
                 grep -E 'canary|TAMPERED|unreach' "$PROBE_OUT" | sed 's/^/    /' >&2 || true
                 echo
-                die "the content canary could not verify a single target through any provider
+                die "the content canary did not meet its quorum through any provider
 (output above). Restarting now would mark every provider unhealthy and switch
-automatic failover off, while the old binary is still working fine.
+automatic failover off, while the currently installed binary keeps working.
 
-Nothing was changed. Either:
-  * fix egress so the canary targets are reachable, or
-  * point [[canary.targets]] in ${CONFIG_PATH} at endpoints you can reach, or
+Nothing was changed. Pick one:
+  * open egress so the canary targets are reachable from this box; or
+  * point [[canary.targets]] in ${CONFIG_PATH} at endpoints you can reach
+    (any URL with stable content works — one on your own server is fine); or
+  * lower the bar with  quorum = \"any\"  in the [canary] section; or
   * re-run with VLB_SKIP_PROBE=1 if you know this is a false alarm."
             fi
         else
