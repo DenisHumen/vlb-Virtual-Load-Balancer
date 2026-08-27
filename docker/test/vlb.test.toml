@@ -1,0 +1,97 @@
+# vlb configuration for the failover test lab.
+#
+# Two providers on ONE interface with different next hops — the single-armed
+# shape of the real deployment. Priorities are 0 and 2 with a deliberate gap,
+# to keep the "no provider at priority 1" case exercised on every run.
+#
+# Timings are compressed relative to production so a scenario resolves in
+# seconds rather than a minute; the *logic* under test is identical.
+
+[general]
+lan_interface = "eth0"
+gateway_address = "10.77.0.100"
+
+[health]
+interval_secs = 2
+timeout_ms = 800
+failure_threshold = 2
+success_threshold = 2
+status_print_secs = 5
+probe_targets = ["192.0.2.10", "probe.test"]
+dns_check_enabled = true
+dns_resolvers = ["192.0.2.10"]
+dns_check_name = "canary.test"
+dns_integrity_check = true
+retention_hours = 1
+
+[canary]
+enabled = true
+interval_secs = 3
+timeout_ms = 2000
+quorum = "majority"
+failure_threshold = 1
+user_agent = "vlb-test-canary"
+
+# Resolved through the provider's own DNS. Under `expired` the hijacking
+# resolver answers with the ISP's portal address instead of the origin.
+[[canary.targets]]
+url = "http://canary.test/canary.txt"
+expect_contains = "vlb-canary-v1-do-not-edit"
+
+[[canary.targets]]
+url = "http://canary.test/generate_204"
+expect_status = 204
+
+# An IP literal, so DNS is bypassed entirely. This one still fails under
+# `expired` because the ISP redirects TCP/80 wholesale — which is what proves
+# the detection does not depend on the DNS layer alone.
+[[canary.targets]]
+url = "http://192.0.2.10/canary.txt"
+expect_contains = "vlb-canary-v1-do-not-edit"
+
+[failover]
+failback_stable_secs = 6
+flap_threshold = 3
+flap_window_secs = 60
+max_failback_stable_secs = 60
+route_watchdog_secs = 5
+
+[routing]
+table_base = 200
+fwmark_base = 0x200
+rule_pref = 32000
+
+[firewall]
+manage = true
+disable_host_firewall = false
+
+[database]
+path = "/var/lib/vlb/stats.db"
+
+[control]
+listen = "127.0.0.1:7650"
+
+[traffic]
+enabled = true
+interval_secs = 2
+retention_hours = 1
+
+[system]
+enabled = false
+interval_secs = 5
+retention_hours = 1
+per_core = false
+
+[[providers]]
+name = "isp-main"
+gateway = "10.77.0.2"
+interface = "eth0"
+priority = 0
+role = "primary"
+
+[[providers]]
+name = "isp-backup"
+gateway = "10.77.0.3"
+interface = "eth0"
+priority = 2
+role = "backup"

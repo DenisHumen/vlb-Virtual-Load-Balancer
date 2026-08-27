@@ -6,7 +6,7 @@ services:
       # or `(cd docker && docker compose up -d --build)`.
       context: ..
       dockerfile: docker/Dockerfile
-    image: vlb:0.0.1-alpha
+    image: vlb:0.1.0
     container_name: vlb
     restart: unless-stopped
     # vlb writes ip rules, ip routes, iptables and uses SO_MARK for probes.

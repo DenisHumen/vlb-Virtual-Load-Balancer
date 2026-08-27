@@ -1,0 +1,32 @@
+# Line endings.
+#
+# Default everything to LF in the repository and in the working tree. This
+# project is built and run on Linux, and several files break outright with
+# CRLF: a shell script copied into a container gets `#!/bin/bash\r`, which
+# the kernel reports as "bad interpreter" with an invisible cause. Cloning on
+# a Windows box with core.autocrlf=true would otherwise produce exactly that.
+* text=auto eol=lf
+
+*.sh            text eol=lf
+*.rs            text eol=lf
+*.toml          text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+Dockerfile      text eol=lf
+*/Dockerfile    text eol=lf
+
+# The canary file's bytes are part of a runtime contract: deployments compare
+# what they fetch from raw.githubusercontent.com against a known marker (and
+# optionally a sha256). Any end-of-line conversion would change those bytes
+# and make every deployment believe its primary uplink had been hijacked.
+# Excluded from all conversion, not merely pinned to LF.
+canary/canary.txt -text
+
+# The one deliberate exception. Windows PowerShell 5.1 reads a BOM-less file
+# as ANSI, so the em-dashes in this script decoded to CP1252 curly quotes and
+# terminated string literals — the launcher would not parse at all. It is
+# stored with CRLF and a UTF-8 BOM.
+scripts/vlb.ps1 text eol=crlf
+
+# Binary assets: never touch.
+*.png binary

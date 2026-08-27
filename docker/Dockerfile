@@ -1,19 +1,20 @@
 # syntax=docker/dockerfile:1.7
 
 # ---------- builder ----------
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.90-bookworm AS builder
 
 WORKDIR /src
 
 # Cache deps separately from source. We do a stub-build trick so cargo
 # fetches and compiles the dependency graph once.
-COPY Cargo.toml Cargo.lock* ./
+COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src && \
     echo "fn main() { println!(\"stub\"); }" > src/main.rs && \
     cargo build --release --locked && \
     rm -rf src target/release/vlb target/release/deps/vlb-* target/release/.fingerprint/vlb-*
 
 COPY src ./src
+COPY canary ./canary
 COPY rustfmt.toml ./
 RUN cargo build --release --locked && \
     strip target/release/vlb

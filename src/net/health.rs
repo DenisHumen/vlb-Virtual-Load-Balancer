@@ -1,7 +1,44 @@
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tokio::time::timeout as tokio_timeout;
+
+/// Small non-cryptographic PRNG for DNS transaction IDs and probe nonces.
+///
+/// This exists because the obvious `Instant::now().elapsed().subsec_nanos()`
+/// is *not* a source of entropy — the elapsed time between those two calls
+/// is a couple of hundred nanoseconds every time, so it yields a tiny,
+/// highly repetitive range. Concurrent probes then share transaction IDs and
+/// can accept each other's replies. A xorshift seeded once from the wall
+/// clock and advanced per call gives us the variation we actually need.
+fn rand_u64() -> u64 {
+    static STATE: AtomicU64 = AtomicU64::new(0);
+
+    let mut x = STATE.load(Ordering::Relaxed);
+    if x == 0 {
+        // Seed lazily. Mixing the wall clock with the pid keeps two daemons
+        // started in the same nanosecond from marching in lock-step.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E37_79B9_7F4A_7C15);
+        x = nanos ^ ((std::process::id() as u64) << 32) ^ 0x2545_F491_4F6C_DD1D;
+        if x == 0 {
+            x = 0x9E37_79B9_7F4A_7C15;
+        }
+    }
+    // xorshift64*: cheap, no dependency, good enough for collision avoidance.
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    STATE.store(x, Ordering::Relaxed);
+    x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+}
+
+fn rand_txid() -> u16 {
+    (rand_u64() >> 16) as u16
+}
 
 /// Probe destination as configured in `health.probe_targets`.
 ///
@@ -362,7 +399,7 @@ async fn dns_query_once(
         Err(_) => return ProbeOutcome::Failed,
     };
 
-    let txid: u16 = (Instant::now().elapsed().subsec_nanos() & 0xFFFF) as u16;
+    let txid: u16 = rand_txid();
     let pkt = build_dns_query(name, txid);
     let dst = std::net::SocketAddr::from((resolver, 53u16));
 
@@ -411,11 +448,150 @@ pub async fn check_dns_via(
     ProbeOutcome::Failed
 }
 
+/// Result of the NXDOMAIN-hijack probe.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DnsIntegrity {
+    /// The resolver behaved honestly (NXDOMAIN, REFUSED, or an empty
+    /// answer) for a name that cannot exist.
+    Clean,
+    /// The resolver invented an address for a guaranteed-nonexistent name.
+    /// Only an intercepting middlebox does this.
+    Hijacked { detail: String },
+    /// No usable reply from any resolver. Ambiguous — could be a timeout,
+    /// a blocked port, or a genuinely dead link. Never treated as proof.
+    NoAnswer,
+}
+
+impl DnsIntegrity {
+    pub fn is_hijacked(&self) -> bool {
+        matches!(self, DnsIntegrity::Hijacked { .. })
+    }
+}
+
+/// Detect DNS interception by asking for a name that cannot possibly exist.
+///
+/// `.invalid` is reserved by RFC 6761 precisely so that it never resolves;
+/// prefixing a random label makes a cached positive answer impossible too.
+/// An honest resolver returns NXDOMAIN. A transparent DNS interceptor —
+/// which is what an ISP installs when an account lapses, so every lookup
+/// lands on the payment portal — answers with an address instead.
+///
+/// The test is deliberately asymmetric: **only a positive answer proves
+/// interception.** Timeouts, REFUSED and SERVFAIL are all reported as
+/// something other than `Hijacked`, because a blocked or slow resolver is
+/// already covered by the ordinary DNS probe and must not be double-counted
+/// as evidence of tampering.
+#[cfg(target_os = "linux")]
+pub async fn check_dns_integrity_via(
+    resolvers: &[Ipv4Addr],
+    timeout: Duration,
+    mark: u32,
+) -> DnsIntegrity {
+    // A fresh random label every probe: no resolver, hostile or otherwise,
+    // can have a cached answer for it.
+    let name = format!("{:016x}.vlb-probe.invalid", rand_u64());
+
+    let mut saw_reply = false;
+    for &r in resolvers {
+        match dns_resolve_a_once(r, &name, timeout, Some(mark)).await {
+            Some(ip) => {
+                return DnsIntegrity::Hijacked {
+                    detail: format!(
+                        "resolver {r} answered {ip} for {name}, a name reserved by \
+                         RFC 6761 to never exist — DNS is being intercepted"
+                    ),
+                };
+            }
+            None => {
+                // `dns_resolve_a_once` returns None both for "correct
+                // NXDOMAIN" and for "no reply at all". Distinguish them so a
+                // dead resolver isn't recorded as a clean bill of health.
+                if dns_responded(r, &name, timeout, Some(mark)).await {
+                    saw_reply = true;
+                }
+            }
+        }
+    }
+
+    if saw_reply {
+        DnsIntegrity::Clean
+    } else {
+        DnsIntegrity::NoAnswer
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn check_dns_integrity_via(
+    _resolvers: &[Ipv4Addr],
+    _timeout: Duration,
+    _mark: u32,
+) -> DnsIntegrity {
+    DnsIntegrity::NoAnswer
+}
+
+/// Did the resolver send *any* well-formed reply carrying our transaction
+/// id? Used to tell "honest NXDOMAIN" apart from "silence".
+#[cfg(target_os = "linux")]
+async fn dns_responded(
+    resolver: Ipv4Addr,
+    name: &str,
+    timeout: Duration,
+    mark: Option<u32>,
+) -> bool {
+    use std::os::fd::AsRawFd;
+
+    let Ok(std_sock) = std::net::UdpSocket::bind("0.0.0.0:0") else {
+        return false;
+    };
+    if std_sock.set_nonblocking(true).is_err() {
+        return false;
+    }
+    if let Some(m) = mark {
+        let val: libc::c_int = m as libc::c_int;
+        let rc = unsafe {
+            libc::setsockopt(
+                std_sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_MARK,
+                &val as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            return false;
+        }
+    }
+    let Ok(sock) = tokio::net::UdpSocket::from_std(std_sock) else {
+        return false;
+    };
+
+    let txid = rand_txid();
+    let pkt = build_dns_query(name, txid);
+    let dst = std::net::SocketAddr::from((resolver, 53u16));
+    if tokio_timeout(timeout, sock.send_to(&pkt, dst))
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    let mut buf = [0u8; 1500];
+    match tokio_timeout(timeout, sock.recv_from(&mut buf)).await {
+        // Any reply with a matching id and the QR bit set counts — we do not
+        // care about the RCODE here, only that somebody answered us.
+        Ok(Ok((n, _))) if n >= 12 => {
+            let rid = u16::from_be_bytes([buf[0], buf[1]]);
+            let flags = u16::from_be_bytes([buf[2], buf[3]]);
+            rid == txid && (flags & 0x8000) != 0
+        }
+        _ => false,
+    }
+}
+
 /// Resolve `name` to IPv4 through the provider's mark. Used by
 /// `check_internet_via` so hostname probes don't depend on the system
 /// resolver (which always uses whichever provider owns the default).
 #[cfg(target_os = "linux")]
-async fn resolve_a_via(
+pub(crate) async fn resolve_a_via(
     resolvers: &[Ipv4Addr],
     name: &str,
     timeout: Duration,
@@ -430,7 +606,7 @@ async fn resolve_a_via(
 }
 
 #[cfg(not(target_os = "linux"))]
-async fn resolve_a_via(
+pub(crate) async fn resolve_a_via(
     _resolvers: &[Ipv4Addr],
     _name: &str,
     _timeout: Duration,
@@ -470,7 +646,7 @@ async fn dns_resolve_a_once(
     }
 
     let sock = tokio::net::UdpSocket::from_std(std_sock).ok()?;
-    let txid: u16 = (Instant::now().elapsed().subsec_nanos() & 0xFFFF) as u16;
+    let txid: u16 = rand_txid();
     let pkt = build_dns_query(name, txid);
     // Question section size in the wire format we just built: qname
     // (length-prefixed labels + terminating 0) + qtype(2) + qclass(2).
@@ -777,6 +953,53 @@ mod tests {
         // No rtt line (100% loss).
         let s3 = "3 packets transmitted, 0 received, 100% packet loss, time 2003ms\n";
         assert_eq!(parse_rtt_avg_ms(s3), None);
+    }
+
+    /// Regression guard for the transaction-id bug this replaced.
+    ///
+    /// The previous implementation was
+    /// `Instant::now().elapsed().subsec_nanos() & 0xFFFF`, which measures the
+    /// gap between two adjacent instructions — a few hundred nanoseconds,
+    /// every single time. It produced a handful of distinct ids clustered at
+    /// the bottom of the range, so concurrent probes regularly collided and
+    /// could accept one another's replies. Assert real spread instead.
+    #[test]
+    fn txids_are_well_distributed() {
+        const N: usize = 2000;
+        let ids: Vec<u16> = (0..N).map(|_| rand_txid()).collect();
+
+        let unique: std::collections::HashSet<u16> = ids.iter().copied().collect();
+        assert!(
+            unique.len() > N * 9 / 10,
+            "only {} unique ids out of {N} — txids are not varying",
+            unique.len()
+        );
+
+        // The old bug also kept every value tiny. Require the full 16-bit
+        // range to be exercised, not just the low byte.
+        assert!(
+            ids.iter().any(|&i| i > 0xF000),
+            "no high transaction ids generated — the range is truncated"
+        );
+        assert!(ids.iter().any(|&i| i < 0x0FFF));
+    }
+
+    #[test]
+    fn rand_u64_does_not_get_stuck() {
+        let a = rand_u64();
+        let b = rand_u64();
+        let c = rand_u64();
+        assert!(a != b || b != c, "PRNG returned a constant");
+        assert_ne!(a, 0);
+    }
+
+    #[test]
+    fn dns_integrity_only_hijacked_is_proof() {
+        assert!(DnsIntegrity::Hijacked { detail: "x".into() }.is_hijacked());
+        // Silence and honest answers must never be read as tampering — a
+        // dead resolver is a different failure, already covered elsewhere.
+        assert!(!DnsIntegrity::Clean.is_hijacked());
+        assert!(!DnsIntegrity::NoAnswer.is_hijacked());
     }
 
     #[test]

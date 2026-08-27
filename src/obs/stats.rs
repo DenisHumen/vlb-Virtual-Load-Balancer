@@ -18,7 +18,7 @@ pub struct HealthRecord {
     pub timestamp: DateTime<Utc>,
     pub success: bool,
     pub latency_ms: Option<f64>,
-    pub kind: &'static str, // "gateway" | "internet"
+    pub kind: &'static str, // gateway | internet | dns | dns_integrity | canary
 }
 
 #[derive(Debug, Clone)]
@@ -173,6 +173,25 @@ impl Stats {
             ],
         )?;
         Ok(())
+    }
+
+    /// Delete `health_checks` rows older than `retention_hours`.
+    ///
+    /// This table is by far the fastest-growing one: every provider writes a
+    /// row per probe kind on every tick. At the default 3 s interval with
+    /// five kinds and three providers that is roughly 43 M rows a year, on a
+    /// box that is expected to run untouched for years. `0` keeps everything.
+    pub fn prune_health(&self, retention_hours: u32) -> Result<usize> {
+        if retention_hours == 0 {
+            return Ok(0);
+        }
+        let cutoff = Utc::now() - chrono::Duration::hours(retention_hours as i64);
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM health_checks WHERE ts < ?1",
+            params![cutoff.to_rfc3339()],
+        )?;
+        Ok(n)
     }
 
     /// Remove traffic samples older than `retention_hours`. Cheap — the
@@ -663,6 +682,65 @@ mod tests {
             priority: 0,
             role: ProviderRole::Primary,
         }]
+    }
+
+    /// `health_checks` is the fastest-growing table by a wide margin — every
+    /// provider writes a row per probe kind on every tick, which is tens of
+    /// millions of rows a year on a gateway that is never restarted. It had
+    /// no retention at all until this was added, so the pruning is worth
+    /// pinning down: old rows go, recent rows stay, and `0` means "keep
+    /// everything" rather than "delete everything".
+    #[test]
+    fn health_rows_are_pruned_by_retention() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vlb-prune-{}-{}.db",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let stats = Stats::open(&tmp, &mk_providers()).unwrap();
+
+        let now = Utc::now();
+        for (age_hours, kind) in [
+            (100i64, "gateway"),
+            (80, "canary"),
+            (1, "dns"),
+            (0, "canary"),
+        ] {
+            stats
+                .record_health(&HealthRecord {
+                    provider: "p0".into(),
+                    timestamp: now - chrono::Duration::hours(age_hours),
+                    success: true,
+                    latency_ms: None,
+                    kind,
+                })
+                .unwrap();
+        }
+
+        let count = || -> i64 {
+            stats
+                .conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM health_checks", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count(), 4);
+
+        // 0 must be a no-op, not a wipe.
+        assert_eq!(stats.prune_health(0).unwrap(), 0);
+        assert_eq!(count(), 4);
+
+        // 72 h retention drops the 100 h and 80 h rows only.
+        assert_eq!(stats.prune_health(72).unwrap(), 2);
+        assert_eq!(count(), 2);
+
+        // Running it again is idempotent.
+        assert_eq!(stats.prune_health(72).unwrap(), 0);
+        assert_eq!(count(), 2);
+
+        drop(stats);
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
