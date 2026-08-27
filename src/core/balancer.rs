@@ -77,6 +77,8 @@ pub enum FailureLayer {
     ContentTampered,
     /// Canary endpoints could not be reached often enough.
     ContentUnreachable,
+    /// Reachable, authentic, and far too slow to carry traffic.
+    Throttled,
 }
 
 impl FailureLayer {
@@ -88,6 +90,7 @@ impl FailureLayer {
             FailureLayer::DnsHijack => "dns-hijack",
             FailureLayer::ContentTampered => "content-tampered",
             FailureLayer::ContentUnreachable => "content-unreachable",
+            FailureLayer::Throttled => "throttled",
         }
     }
 
@@ -135,6 +138,13 @@ struct ProviderState {
     /// endpoint. The canary owns this field exclusively, so its verdict
     /// survives until the canary itself clears it.
     canary_tampered: Option<String>,
+    /// Consecutive failing throughput measurements, and the latest reading.
+    /// Kept apart from the canary counters because this check runs on its own
+    /// much slower cadence and is the noisiest of the three.
+    throughput_failures: u32,
+    throughput_ok: bool,
+    last_throughput_at: Option<DateTime<Utc>>,
+    last_throughput_summary: Option<String>,
 }
 
 pub struct Balancer {
@@ -146,6 +156,8 @@ pub struct Balancer {
     /// Pre-parsed canary endpoints and the quorum rule over them.
     canary_targets: Vec<CanaryTarget>,
     canary_quorum: Quorum,
+    /// Pre-parsed throughput payload URL; `None` when the check is off.
+    throughput_url: Option<crate::http::Url>,
     router: Router,
     stats: Arc<Stats>,
     providers: RwLock<HashMap<String, ProviderState>>,
@@ -196,6 +208,12 @@ pub struct ProviderSnapshot {
     pub last_canary_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub last_canary_summary: Option<String>,
+    #[serde(default)]
+    pub throughput_ok: bool,
+    #[serde(default)]
+    pub last_throughput_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_throughput_summary: Option<String>,
 }
 
 impl Balancer {
@@ -225,6 +243,13 @@ impl Balancer {
             (Vec::new(), Quorum::Any)
         };
 
+        // Parsed once. `validate()` already proved it well-formed.
+        let throughput_url = if cfg.canary.enabled && cfg.canary.throughput.enabled {
+            Some(crate::http::Url::parse(&cfg.canary.throughput.url)?)
+        } else {
+            None
+        };
+
         let mut providers = HashMap::with_capacity(cfg.providers.len());
         for p in &cfg.providers {
             providers.insert(
@@ -243,6 +268,13 @@ impl Balancer {
                     last_canary_at: None,
                     last_canary_summary: None,
                     canary_tampered: None,
+                    throughput_failures: 0,
+                    // Optimistic until measured, so a provider is not held
+                    // down for a whole interval just because we have not
+                    // looked yet.
+                    throughput_ok: true,
+                    last_throughput_at: None,
+                    last_throughput_summary: None,
                     // Optimistic until the first round completes, so a
                     // provider is not held DOWN for the first canary
                     // interval purely because we have not looked yet.
@@ -264,6 +296,7 @@ impl Balancer {
             probe_targets,
             canary_targets,
             canary_quorum,
+            throughput_url,
             router,
             stats,
             providers: RwLock::new(providers),
@@ -345,6 +378,14 @@ impl Balancer {
         let canary_interval = Duration::from_secs(self.cfg.canary.interval_secs.max(1));
         let canary_timeout = Duration::from_millis(self.cfg.canary.timeout_ms.max(200));
         let mut last_canary: Option<std::time::Instant> = None;
+
+        // The throughput probe moves real bytes, so it runs far less often
+        // than everything else — a couple of times a minute rather than a
+        // couple of times a second.
+        let throughput_interval = Duration::from_secs(cfg_throughput_interval(&self.cfg));
+        let throughput_timeout =
+            Duration::from_millis(self.cfg.canary.throughput.timeout_ms.max(1000));
+        let mut last_throughput: Option<std::time::Instant> = None;
 
         loop {
             tokio::select! {
@@ -514,11 +555,62 @@ impl Balancer {
                 failure = Some((FailureLayer::DnsHijack, detail));
             } else if let Some(detail) = canary_tamper {
                 failure = Some((FailureLayer::ContentTampered, detail));
-            } else if !canary_ok {
-                failure = Some((
-                    FailureLayer::ContentUnreachable,
-                    canary_summary.unwrap_or_else(|| "canary quorum not met".to_string()),
-                ));
+            }
+
+            // 6. Throughput.
+            //
+            //    When to *run* it and how to *label* its result are separate
+            //    questions, and conflating them gets one of the two wrong.
+            //
+            //    Running: only when the *reachability* layers pass — gateway,
+            //    internet, DNS, and no proof of interception. Those failing
+            //    means the link is dead, and firing a 64 KiB transfer at a
+            //    dead link teaches us nothing while stretching the health loop
+            //    by the whole timeout, delaying the failover they just called
+            //    for. Measured in the lab: the blackhole scenario went from
+            //    8 s to 26 s when this ran unconditionally.
+            //
+            //    Note what is deliberately *not* in that gate: the canary. A
+            //    throttled link starves the canary, so gating on it would let
+            //    the condition being detected switch off its own detector —
+            //    the probe would never run precisely when it was needed, and
+            //    the throttle would be misreported as unreachable endpoints.
+            //
+            //    Labelling: a known-bad throughput reading outranks a canary
+            //    timeout. On a rate-limited link the canary times out *because
+            //    of* the throttle, so reporting the timeout would name the
+            //    symptom and hide the cause — telling the operator to go
+            //    looking at endpoints when the provider has capped them.
+            if failure.is_none() {
+                let throughput_due = self.throughput_url.is_some()
+                    && last_throughput
+                        .map(|t: std::time::Instant| t.elapsed() >= throughput_interval)
+                        .unwrap_or(true);
+                if throughput_due {
+                    last_throughput = Some(std::time::Instant::now());
+                    self.run_throughput(&name, mark, throughput_timeout).await;
+                }
+            }
+
+            if failure.is_none() {
+                let (tp_ok, tp_summary) = {
+                    let ps = self.providers.read().await;
+                    match ps.get(&name) {
+                        Some(e) => (e.throughput_ok, e.last_throughput_summary.clone()),
+                        None => (true, None),
+                    }
+                };
+                if !tp_ok {
+                    failure = Some((
+                        FailureLayer::Throttled,
+                        tp_summary.unwrap_or_else(|| "throughput below the floor".into()),
+                    ));
+                } else if !canary_ok {
+                    failure = Some((
+                        FailureLayer::ContentUnreachable,
+                        canary_summary.unwrap_or_else(|| "canary quorum not met".to_string()),
+                    ));
+                }
             }
 
             let overall_ok = failure.is_none();
@@ -553,6 +645,72 @@ impl Balancer {
             if let Err(e) = self.reconcile_active().await {
                 error!(error = %e, "failed to reconcile active provider");
             }
+        }
+    }
+
+    /// One throughput measurement for a provider.
+    ///
+    /// Deliberately separate from the content canary: that one asks "are
+    /// these bytes ours", this one asks "can this link actually move bytes".
+    /// A throttled provider passes the first and fails the second.
+    async fn run_throughput(self: &Arc<Self>, name: &str, mark: u32, timeout: Duration) {
+        let Some(url) = self.throughput_url.clone() else {
+            return;
+        };
+        let floor = self.cfg.canary.throughput.min_kbps;
+        let resolvers = self.cfg.health.dns_resolvers.clone();
+        let resolve_timeout = Duration::from_millis(self.cfg.health.timeout_ms);
+        let resolver = move |host: String| {
+            let resolvers = resolvers.clone();
+            async move { crate::health::resolve_a_via(&resolvers, &host, resolve_timeout, mark).await }
+        };
+
+        let verdict = crate::canary::check_throughput_via(
+            &url,
+            floor,
+            timeout,
+            Some(mark),
+            &self.cfg.canary.user_agent,
+            resolver,
+        )
+        .await;
+
+        let now = Utc::now();
+        let _ = self.stats.record_health(&HealthRecord {
+            provider: name.to_string(),
+            timestamp: now,
+            success: verdict.is_ok(),
+            latency_ms: None,
+            kind: "throughput",
+        });
+
+        let summary = verdict.describe();
+        let threshold = self.cfg.canary.throughput.failure_threshold;
+
+        let mut ps = self.providers.write().await;
+        let Some(entry) = ps.get_mut(name) else {
+            return;
+        };
+        entry.last_throughput_at = Some(now);
+        entry.last_throughput_summary = Some(summary.clone());
+
+        if verdict.is_ok() {
+            if entry.throughput_failures > 0 {
+                info!(provider = %name, "throughput recovered: {summary}");
+            }
+            entry.throughput_failures = 0;
+            entry.throughput_ok = true;
+        } else {
+            entry.throughput_failures = entry.throughput_failures.saturating_add(1);
+            if entry.throughput_failures >= threshold {
+                entry.throughput_ok = false;
+            }
+            warn!(
+                provider = %name,
+                failures = entry.throughput_failures,
+                threshold,
+                "throughput check failed: {summary}"
+            );
         }
     }
 
@@ -1122,6 +1280,9 @@ impl Balancer {
                 canary_ok: p.canary_ok,
                 last_canary_at: p.last_canary_at,
                 last_canary_summary: p.last_canary_summary.clone(),
+                throughput_ok: p.throughput_ok,
+                last_throughput_at: p.last_throughput_at,
+                last_throughput_summary: p.last_throughput_summary.clone(),
             })
             .collect();
         providers.sort_by_key(|p| p.priority);
@@ -1364,4 +1525,9 @@ impl Balancer {
             }
         }
     }
+}
+
+/// Effective throughput interval, floored at one second.
+fn cfg_throughput_interval(cfg: &Config) -> u64 {
+    cfg.canary.throughput.interval_secs.max(1)
 }

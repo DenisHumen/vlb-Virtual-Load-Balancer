@@ -72,7 +72,11 @@ try: d = json.load(sys.stdin)
 except Exception: sys.exit(0)
 for p in d.get('snapshot', {}).get('providers', []):
     if p['name'] == '$1':
-        print(p.get('$2') or '')
+        v = p.get('$2')
+        # `or ''` would swallow legitimate falsy values -- priority 0 is the
+        # primary provider, and printing it as empty made the priority-gap
+        # assertion fail against correct behaviour.
+        print('' if v is None else v)
 "
 }
 
@@ -97,11 +101,16 @@ wait_for_active() {
     return 1
 }
 
-# Can a client actually reach the genuine origin content right now? This is
-# the end-to-end assertion: it does not consult vlb's opinion at all, it just
-# asks whether real traffic works.
+# Can a LAN client actually reach the genuine origin content right now?
+#
+# Run from the `client` container rather than from vlb, and deliberately so:
+# this is the only assertion that speaks for the people behind the gateway.
+# It consults nothing vlb believes, and it exercises forwarding, NAT and the
+# conntrack state a failover disturbs — none of which the gateway's own
+# traffic touches.
 real_traffic_works() {
-    vlb_exec curl -s --max-time 4 http://192.0.2.10/canary.txt 2>/dev/null \
+    "${COMPOSE[@]}" exec -T client \
+        curl -s --max-time 6 http://192.0.2.10/canary.txt 2>/dev/null \
         | grep -q 'vlb-canary-v1-do-not-edit'
 }
 
@@ -231,6 +240,93 @@ scenario_canary_only() {
 
     real_traffic_works && ok "real traffic restored via the backup" \
         || bad "portal-http: failed over but traffic still broken"
+}
+
+# The mode no reachability check can see.
+#
+# The provider applies a rate limit instead of redirecting or dropping. Every
+# other layer passes: the next hop answers ICMP, DNS resolves honestly, and
+# the content canary fetches the right bytes -- because a rate limiter is a
+# token bucket and a 1.2 KB file fits inside the burst allowance, arriving at
+# full line speed. Only moving enough bytes to drain the bucket reveals it.
+scenario_throttled() {
+    info "throttled — link up, everything reachable, 64 kbit/s"
+    reset_lab
+    isp_mode isp1 throttled
+
+    # Show the deception is real before asserting on the fix.
+    note "small probes still sail through the rate limiter's burst:"
+    vlb_exec curl -s --max-time 10 -o /dev/null \
+        -w "      1.2 KB canary file: %{time_total}s\n" \
+        http://192.0.2.10/canary.txt 2>/dev/null || true
+    vlb_exec curl -s --max-time 30 -o /dev/null \
+        -w "      256 KB transfer   : %{time_total}s at %{speed_download} B/s\n" \
+        http://192.0.2.10/big.bin 2>/dev/null || true
+
+    local t; t=$(wait_for_active isp-backup 60)
+    if [ "$(active_provider)" != "isp-backup" ]; then
+        bad "throttled: NO FAILOVER after ${t}s — a 64 kbit/s link is being treated as healthy"
+        return
+    fi
+    ok "detected the throttle and failed over in ${t}s"
+
+    local layer; layer=$(provider_field isp-main failure_layer)
+    [ "$layer" = "throttled" ] \
+        && ok "attributed to 'throttled', not a vague timeout" \
+        || bad "throttled: layer was '$layer', expected throttled"
+
+    local summary; summary=$(provider_field isp-main last_throughput_summary)
+    case "$summary" in
+        *"kbit/s"*) ok "reported the measured rate: ${summary%% (*}" ;;
+        *) bad "throttled: no throughput figure reported (got: $summary)" ;;
+    esac
+
+    real_traffic_works && ok "real traffic restored via the backup" \
+        || bad "throttled: failed over but traffic still broken"
+}
+
+# The operator asked for this one explicitly: priorities 0 and 2, nothing at
+# 1. The gap must not confuse ordering in either direction.
+scenario_priority_gap() {
+    info "priority gap — 0 and 2 with no 1 in between"
+    reset_lab
+
+    local p0 p2
+    p0=$(provider_field isp-main priority)
+    p2=$(provider_field isp-backup priority)
+    [ "$p0" = "0" ] && [ "$p2" = "2" ] \
+        && ok "configured as priority 0 and 2, with 1 deliberately absent" \
+        || bad "priority-gap: expected 0 and 2, got '$p0' and '$p2'"
+
+    [ "$(active_provider)" = "isp-main" ] \
+        && ok "lowest number wins while both are healthy" \
+        || bad "priority-gap: expected isp-main, got $(active_provider)"
+
+    # Down the priority-0 provider: the only candidate left is at priority 2.
+    # Nothing occupies 1, so a naive "next priority" walk would find nothing.
+    isp_mode isp1 dead
+    local t; t=$(wait_for_active isp-backup 40)
+    [ "$(active_provider)" = "isp-backup" ] \
+        && ok "skipped the empty priority 1 and took priority 2 in ${t}s" \
+        || bad "priority-gap: did not fall through to priority 2 after ${t}s"
+    real_traffic_works && ok "traffic flows through the priority-2 provider" \
+        || bad "priority-gap: traffic broken on the backup"
+
+    # And back up again, to prove the gap does not break the return path.
+    isp_mode isp1 good
+    t=$(wait_for_active isp-main 60)
+    [ "$(active_provider)" = "isp-main" ] \
+        && ok "returned to priority 0 in ${t}s once it recovered" \
+        || bad "priority-gap: never returned to priority 0 (${t}s)"
+
+    # Kernel routing tables are derived from the priority, so the gap has to
+    # show up there too rather than collapsing onto one table.
+    if vlb_exec ip route show table 200 | grep -q default \
+       && vlb_exec ip route show table 202 | grep -q default; then
+        ok "tables 200 and 202 both populated (201 unused, as intended)"
+    else
+        bad "priority-gap: expected routing tables 200 and 202 to exist"
+    fi
 }
 
 scenario_failback() {
@@ -380,7 +476,7 @@ scenario_probe_cli() {
 
 # ─────────────────────────────────────────────────────────────────────────
 
-SCENARIOS=(baseline dead blackhole dns_blocked expired canary_only failback both_down restart watchdog force probe_cli)
+SCENARIOS=(baseline priority_gap dead blackhole dns_blocked expired canary_only throttled failback both_down restart watchdog force probe_cli)
 
 cleanup() {
     if [ "$KEEP" -eq 1 ]; then
@@ -396,6 +492,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# A payload large enough to outlast any rate limiter's burst, used by the
+# throttled scenario to show what real traffic experiences.
+seed_origin_payload() {
+    "${COMPOSE[@]}" exec -T origin sh -c \
+        'test -f /var/www/origin/big.bin || head -c 262144 /dev/urandom > /var/www/origin/big.bin' \
+        >/dev/null 2>&1 || true
+}
+
 info "building the lab"
 if ! "${COMPOSE[@]}" build >/tmp/vlb-lab-build.log 2>&1; then
     say "${RED}build failed${RST} — last 40 lines:"
@@ -406,6 +510,7 @@ fi
 info "starting the lab"
 "${COMPOSE[@]}" up -d >/dev/null 2>&1
 
+seed_origin_payload
 info "waiting for vlb to select a provider"
 if ! wait_for_active isp-main 60 >/dev/null; then
     say "${RED}vlb never came up.${RST} Logs:"

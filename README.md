@@ -20,7 +20,7 @@ installs the highest-priority healthy one as the kernel default route,
 flushes conntrack on switch, and ships a TUI / control protocol / SQLite
 stats so you can actually see what's happening.
 
-> **Status:** `0.1.2`. Runs in production, and the failover behaviour is
+> **Status:** `0.2.0`. Runs in production, and the failover behaviour is
 > covered by a docker lab that breaks the network eight different ways on
 > every CI run. Still pre-1.0: config keys can change between minor versions,
 > and `vlb check` will tell you when they do.
@@ -63,6 +63,8 @@ fast, and gives you a real dashboard.
   5. **Content canary**: fetch a resource whose bytes we already know, over
      that uplink, and compare. See below — this is the one that catches the
      failure mode the others cannot.
+  6. **Throughput floor**: move 64 KiB and check the link is not merely
+     reachable but actually fast enough to be worth anything.
 * **Selectively-prohibited detection**: if any hostname target is
   configured, at least one of them must succeed — so a happy `1.1.1.1`
   reply can't mask an uplink that returns
@@ -386,6 +388,36 @@ perfectly healthy network.
 > of detecting a reachable-but-intercepted uplink. `vlb check` and the daemon
 > both warn when it is off.
 
+### Throughput floor — the case content checking cannot see
+
+Verifying content proves the bytes are genuine. It says nothing about how
+*fast* they arrived, and a provider suspending an account may simply cap the
+rate rather than redirect or drop.
+
+It is worse than "small transfers are fast enough". A rate limiter is a token
+bucket, so a small transfer drains the burst allowance and completes at **full
+line speed**. Measured against a 64 kbit/s policer in the test lab:
+
+| Transfer over the same throttled link | Time    | Effective rate |
+|---------------------------------------|---------|----------------|
+| the 1.2 KB canary file                | 0.6 ms  | ~16 Mbit/s (!) |
+| a 256 KB transfer                     | 12.3 s  | 60 kbit/s      |
+
+So no latency budget on the small probe could ever fire. `vlb` moves 64 KiB
+twice a minute instead — under a kilobyte per second on average — and fails
+the provider if the measured rate is below `min_kbps`.
+
+The default floor of 128 kbit/s is deliberately low: a suspension throttle is
+64–128 kbit/s, while any working link clears it comfortably. Round-trip time
+alone caps the *measured* figure (64 KiB over a 100 ms RTT reads as roughly
+5 Mbit/s however fast the pipe is), so a high floor would fail healthy
+providers over — validation refuses anything above 5000. Run `vlb probe` to
+see what your links actually report before changing it.
+
+The probe runs only when the reachability layers pass; there is nothing to
+learn about the speed of a link that is already down, and firing a 64 KiB
+transfer at one would just delay the failover.
+
 ### Failback policy
 
 Leaving a broken uplink is immediate and unconditional — users are offline
@@ -500,6 +532,7 @@ so live flows reset and reconnect.
 | **Account unpaid: DNS hijacked to a portal**          | **DNS integrity probe (`.invalid` must be NXDOMAIN)** |
 | **Account unpaid: HTTP answered by a billing page**   | **content canary (bytes compared, redirects rejected)** |
 | **Transparent TLS proxy**                             | **canary certificate validation fails the handshake** |
+| **Account unpaid: rate-limited to a trickle**         | **throughput floor (64 KiB probe; small probes fit inside the limiter's burst and are useless)** |
 | **Hostname resolves into RFC1918 / CGNAT space**      | **canary rejects the answer before even connecting** |
 | External tool replaces our default route (DHCP renew) | route watchdog re-installs it |
 | A provider that keeps bouncing up and down            | failback stability window + flap backoff |
@@ -549,6 +582,7 @@ Each ISP can be switched between failure modes at runtime:
 | `dead`        | the router is gone — even the next-hop ping fails                    |
 | `blackhole`   | answers pings, forwards nothing (defeats naive gateway checks)       |
 | `lossy`       | 60% packet loss                                                      |
+| `throttled`   | **link up, everything reachable, capped at 64 kbit/s** — only the throughput floor can see it |
 | `dns-blocked` | ICMP fine, UDP/53 dropped                                            |
 | `portal-http` | **transparent HTTP proxy with DNS left completely honest** — every layer except the content check passes, so only the canary can see it |
 | `expired`     | **unpaid account: DNS hijacked to a portal, HTTP answered by a billing page, ICMP left working** |
@@ -578,8 +612,12 @@ docker compose -f docker/test/docker-compose.yml exec isp1 isp-mode expired
 docker compose -f docker/test/docker-compose.yml logs -f vlb
 ```
 
-Scenarios assert on the **kernel's** default route and on whether real
-traffic reaches the origin, not just on what vlb believes — a daemon that
+Scenarios assert on the **kernel's** default route and on whether traffic
+from a separate `client` container — a plain LAN host whose only route out is
+the vlb box — reaches the origin. That is deliberately not the gateway's own
+traffic: it also exercises forwarding, NAT and the conntrack state a failover
+disturbs, and it is what the people behind the gateway actually experience.
+Assertions never rest on what vlb believes — a daemon that
 reports a healthy failover while traffic still black-holes fails the test.
 
 > One gap worth naming: the lab exercises the canary over plain HTTP. Testing

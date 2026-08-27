@@ -446,6 +446,34 @@ async fn probe_report(config: &Config, only: Option<&str>, repeat: u32) -> Resul
                 }
                 println!("    canary verdict: {}", report.summary());
             }
+
+            // Throughput last: it is the slowest check and the one that
+            // answers "is this link fast enough to be worth anything", which
+            // no amount of reachability testing can tell you.
+            if config.canary.enabled && config.canary.throughput.enabled {
+                let url = crate::http::Url::parse(&config.canary.throughput.url)?;
+                let resolvers = config.health.dns_resolvers.clone();
+                let resolver = move |host: String| {
+                    let resolvers = resolvers.clone();
+                    async move { health::resolve_a_via(&resolvers, &host, timeout, mark).await }
+                };
+                let t = Instant::now();
+                let verdict = canary::check_throughput_via(
+                    &url,
+                    config.canary.throughput.min_kbps,
+                    std::time::Duration::from_millis(config.canary.throughput.timeout_ms),
+                    Some(mark),
+                    &config.canary.user_agent,
+                    resolver,
+                )
+                .await;
+                record(
+                    "throughput".into(),
+                    t.elapsed().as_millis(),
+                    verdict.is_ok(),
+                );
+                println!("    throughput: {}", verdict.describe());
+            }
         }
 
         println!("  slowest observed per layer:");

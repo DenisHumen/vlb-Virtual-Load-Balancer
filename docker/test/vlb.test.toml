@@ -49,6 +49,21 @@ expect_status = 204
 url = "http://192.0.2.10/canary.txt"
 expect_contains = "vlb-canary-v1-do-not-edit"
 
+# Throughput floor. Compressed cadence versus production (which measures
+# every two minutes) so a scenario resolves in seconds. The floor is well
+# under the lab's real speed and well over the 64 kbit/s the `throttled`
+# mode applies, so it separates the two cleanly.
+[canary.throughput]
+enabled = true
+url = "http://192.0.2.10/throughput-64k.bin"
+min_kbps = 400
+# 64 KiB at the 64 kbit/s the `throttled` mode applies takes ~8 s, so the
+# budget has to exceed that or the probe times out before it can report a
+# figure — and a timeout says "did not finish", not "here is the speed".
+interval_secs = 15
+timeout_ms = 12000
+failure_threshold = 1
+
 [failover]
 failback_stable_secs = 6
 flap_threshold = 3

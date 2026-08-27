@@ -71,7 +71,7 @@ quorum = "majority"
 # symptom, so that acts immediately.
 failure_threshold = 2
 
-user_agent = "vlb/0.1.2 (uplink-canary)"
+user_agent = "vlb/0.2.0 (uplink-canary)"
 
 # The two plain-HTTP endpoints are the industry-standard captive-portal
 # probes (what Android and Firefox use). Plain HTTP is exactly what an
@@ -97,6 +97,46 @@ expect_exact = "success\n"
 [[canary.targets]]
 url = "https://raw.githubusercontent.com/DenisHumen/vlb-Virtual-Load-Balancer/main/canary/canary.txt"
 expect_contains = "vlb-canary-v1-do-not-edit"
+
+# ── Throughput floor ─────────────────────────────────────────────────────
+#
+# The one thing content checking cannot see.
+#
+# A provider suspending an account does not always redirect or black-hole. A
+# common alternative is to leave everything reachable and simply cap the rate
+# — 64 kbit/s is typical. Under that, every check above passes: pings are
+# tiny, DNS answers are tiny, and the canary file is barely a kilobyte.
+#
+# It is worse than "small transfers are fast enough". A rate limiter is a
+# token bucket, so a small transfer drains the burst allowance and completes
+# at *full line speed*. Measured against a 64 kbit/s policer in the test lab:
+# the 1.2 KB canary file arrived in 0.6 ms, while a 256 KB transfer over the
+# same link took 12.3 seconds. No latency budget on the small probe could
+# ever fire.
+#
+# So this moves enough bytes to outlast the bucket — 64 KiB, twice a minute,
+# well under a kilobyte per second on average.
+[canary.throughput]
+enabled = true
+url = "https://raw.githubusercontent.com/DenisHumen/vlb-Virtual-Load-Balancer/main/canary/throughput-64k.bin"
+
+# Below this, the provider counts as unusable.
+#
+# The default sits deliberately low. A suspension throttle is 64-128 kbit/s;
+# any working link, a poor mobile one included, clears 128 comfortably. Note
+# that round-trip time alone caps the *measured* figure — 64 KiB over a 100 ms
+# RTT reads as roughly 5 Mbit/s however fast the pipe really is — so a high
+# floor would fail healthy providers over. Run `vlb probe` to see what your
+# links actually report before raising it; validation refuses anything above
+# 5000 for this reason.
+min_kbps = 128
+
+interval_secs = 120
+timeout_ms = 15000
+
+# Throughput is the noisiest signal here: a burst of local traffic can depress
+# a single sample. Hence a threshold rather than acting on one reading.
+failure_threshold = 2
 
 # ─────────────────────────────────────────────────────────────────────────
 # Switching policy

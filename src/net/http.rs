@@ -217,7 +217,42 @@ pub async fn fetch(req: &HttpRequest) -> Result<HttpResponse> {
     let max_body = req.max_body.min(ABSOLUTE_MAX_BODY);
     tokio::time::timeout(req.timeout, fetch_inner(req, max_body))
         .await
-        .map_err(|_| anyhow!("request to {} timed out after {:?}", req.url, req.timeout))?
+        .map_err(|_| {
+            anyhow::Error::new(Timeout {
+                url: req.url.to_string(),
+                budget: req.timeout,
+            })
+        })?
+}
+
+/// The request ran out of time.
+///
+/// A distinct type rather than a message, because callers need to act on it
+/// differently: for the throughput probe, "did not finish inside a budget
+/// sized for a working link" is itself a statement about speed, while any
+/// other failure is not. Matching on error text to make that distinction
+/// would break the moment the wording changed.
+#[derive(Debug, Clone)]
+pub struct Timeout {
+    pub url: String,
+    pub budget: Duration,
+}
+
+impl std::fmt::Display for Timeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "request to {} timed out after {:?}",
+            self.url, self.budget
+        )
+    }
+}
+
+impl std::error::Error for Timeout {}
+
+/// Did this error come from the request exceeding its budget?
+pub fn is_timeout(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<Timeout>().is_some()
 }
 
 async fn fetch_inner(req: &HttpRequest, max_body: usize) -> Result<HttpResponse> {

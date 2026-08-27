@@ -82,6 +82,26 @@ services:
       transit:
         ipv4_address: 192.0.2.3
 
+  # A LAN client whose only way out is the vlb box. Assertions run from here
+  # rather than from inside vlb, because "the gateway can reach the origin"
+  # and "a client behind the gateway can reach the origin" are different
+  # claims: the second also exercises forwarding, NAT and the conntrack
+  # handling that a failover disturbs.
+  client:
+    build:
+      context: ./netlab
+    image: vlb-netlab:test
+    container_name: vlb-test-client
+    cap_add: [NET_ADMIN, NET_RAW]
+    depends_on: [vlb]
+    environment:
+      ROLE: client
+      GATEWAY_IP: 10.77.0.100
+      EDGE_PREFIX: "10.77.0."
+    networks:
+      edge:
+        ipv4_address: 10.77.0.50
+
   vlb:
     build:
       context: ../..

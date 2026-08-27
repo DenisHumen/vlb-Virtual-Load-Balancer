@@ -75,6 +75,81 @@ pub struct CanaryConfig {
     pub user_agent: String,
     #[serde(default = "default_canary_targets")]
     pub targets: Vec<CanaryTargetConfig>,
+    #[serde(default)]
+    pub throughput: ThroughputConfig,
+}
+
+/// Throughput floor — the check for "reachable but throttled to a trickle".
+///
+/// A provider suspending an account does not always redirect or black-hole;
+/// it may simply apply a rate limit. Every reachability check passes under
+/// that, and so does the content canary, because a rate limiter is a token
+/// bucket: a small transfer drains the burst allowance and completes at full
+/// line speed. Measured against a 64 kbit/s policer, the 1.2 KB canary file
+/// arrived in 0.6 ms while a 256 KB transfer over the same link took 12.3
+/// seconds.
+///
+/// Detecting it therefore requires moving enough bytes to outlast the burst,
+/// which is what this does — a couple of times a minute, at a cost of well
+/// under a kilobyte per second.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ThroughputConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// A payload at least 16 KiB in size. The default is a deterministic,
+    /// incompressible 64 KiB file in this repository.
+    #[serde(default = "default_throughput_url")]
+    pub url: String,
+    /// Below this, the provider is considered unusable.
+    ///
+    /// The default sits deliberately low. A suspension throttle is typically
+    /// 64–128 kbit/s; any working link — including a poor mobile one — clears
+    /// 128 kbit/s comfortably, and round-trip time alone caps the *measured*
+    /// figure on a fast link well above it. Raise it only after looking at
+    /// what `vlb probe` actually reports for your links.
+    #[serde(default = "default_min_kbps")]
+    pub min_kbps: u64,
+    /// Far slower than the content canary: this one moves real bytes.
+    #[serde(default = "default_throughput_interval")]
+    pub interval_secs: u64,
+    #[serde(default = "default_throughput_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Consecutive failing measurements before the provider is marked
+    /// unhealthy. Throughput is the noisiest signal here — a burst of local
+    /// traffic can depress one sample — so it defaults higher than the
+    /// content canary's threshold.
+    #[serde(default = "default_throughput_failure_threshold")]
+    pub failure_threshold: u32,
+}
+
+impl Default for ThroughputConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            url: default_throughput_url(),
+            min_kbps: default_min_kbps(),
+            interval_secs: default_throughput_interval(),
+            timeout_ms: default_throughput_timeout_ms(),
+            failure_threshold: default_throughput_failure_threshold(),
+        }
+    }
+}
+
+fn default_throughput_url() -> String {
+    "https://raw.githubusercontent.com/DenisHumen/vlb-Virtual-Load-Balancer/main/canary/throughput-64k.bin".to_string()
+}
+fn default_min_kbps() -> u64 {
+    128
+}
+fn default_throughput_interval() -> u64 {
+    120
+}
+fn default_throughput_timeout_ms() -> u64 {
+    15_000
+}
+fn default_throughput_failure_threshold() -> u32 {
+    2
 }
 
 impl Default for CanaryConfig {
@@ -87,6 +162,7 @@ impl Default for CanaryConfig {
             failure_threshold: default_canary_failure_threshold(),
             user_agent: default_user_agent(),
             targets: default_canary_targets(),
+            throughput: ThroughputConfig::default(),
         }
     }
 }
@@ -943,6 +1019,49 @@ impl Config {
             if self.canary.user_agent.trim().is_empty() {
                 bail!("canary.user_agent must not be empty");
             }
+
+            let t = &self.canary.throughput;
+            if t.enabled {
+                Url::parse(&t.url)
+                    .with_context(|| format!("canary.throughput.url {:?} is invalid", t.url))?;
+                if t.interval_secs == 0 {
+                    bail!("canary.throughput.interval_secs must be >= 1");
+                }
+                if t.failure_threshold == 0 {
+                    bail!("canary.throughput.failure_threshold must be >= 1");
+                }
+                if t.min_kbps == 0 {
+                    bail!(
+                        "canary.throughput.min_kbps must be >= 1 — set \
+                         canary.throughput.enabled = false to turn the check off instead"
+                    );
+                }
+                // Round-trip time alone caps the measured figure: 64 KiB over
+                // a 100 ms RTT reads as ~5 Mbit/s no matter how fast the link
+                // really is. A floor anywhere near that guarantees false
+                // failovers on healthy links.
+                if t.min_kbps > 5_000 {
+                    bail!(
+                        "canary.throughput.min_kbps = {} is too high to be safe. The measured \
+                         figure is capped by round-trip time — a 64 KiB payload over a 100 ms \
+                         RTT reads as roughly 5000 kbit/s however fast the link is — so this \
+                         would fail healthy providers over. Run `vlb probe` to see what your \
+                         links actually measure, and keep the floor well below that.",
+                        t.min_kbps
+                    );
+                }
+                if t.timeout_ms < 1000 {
+                    bail!("canary.throughput.timeout_ms must be >= 1000");
+                }
+                if t.timeout_ms >= t.interval_secs.saturating_mul(1000) {
+                    bail!(
+                        "canary.throughput.timeout_ms ({}) must be < \
+                         canary.throughput.interval_secs*1000 ({}ms)",
+                        t.timeout_ms,
+                        t.interval_secs * 1000
+                    );
+                }
+            }
         }
 
         // ── failover ────────────────────────────────────────────────────
@@ -1046,6 +1165,23 @@ impl Config {
                 Err(e) => {
                     let _ = writeln!(s, "  <invalid: {e}>");
                 }
+            }
+            if self.canary.throughput.enabled {
+                let _ = writeln!(
+                    s,
+                    "  throughput floor: >= {} kbit/s every {}s (timeout {}ms, fail_after={})",
+                    self.canary.throughput.min_kbps,
+                    self.canary.throughput.interval_secs,
+                    self.canary.throughput.timeout_ms,
+                    self.canary.throughput.failure_threshold
+                );
+                let _ = writeln!(s, "    payload: {}", self.canary.throughput.url);
+            } else {
+                let _ = writeln!(
+                    s,
+                    "  throughput floor: DISABLED — a provider that is reachable but \
+                     rate-limited to a trickle will NOT be detected"
+                );
             }
         }
         let _ = writeln!(s, "failover:");

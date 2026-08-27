@@ -54,6 +54,23 @@
 //! | Public hostname resolving into RFC1918/CGNAT  | Tampered    | No public name legitimately resolves there. |
 //! | **4xx / 5xx**                                 | Unreachable | Almost always a wrong URL or a broken endpoint. Interceptors serve payment pages, not 404s — and treating a typo'd canary URL as proof would fail over every provider at once on a perfectly healthy network. |
 //! | Timeout, refused, TLS handshake failure       | Unreachable | Ordinary transient conditions. |
+//!
+//! # The blind spot content checking still has
+//!
+//! Verifying content proves the bytes are genuine. It says nothing about how
+//! *fast* they arrived — and a provider suspending an account may simply
+//! apply a rate limit rather than redirect or drop. Every check above passes
+//! under that.
+//!
+//! It is worse than "small transfers are fast enough": a rate limiter is a
+//! token bucket, so a small transfer drains the burst allowance and completes
+//! at **full line speed**. Measured against a 64 kbit/s policer in the test
+//! lab, the 1.2 KB canary file arrived in 0.6 ms while a 256 KB transfer over
+//! the same link took 12.3 seconds. No latency budget on the small probe
+//! could ever fire.
+//!
+//! [`check_throughput_via`] closes that by moving enough bytes to outlast the
+//! bucket.
 
 use sha2::{Digest, Sha256};
 use std::net::Ipv4Addr;
@@ -547,6 +564,223 @@ fn describe_body(body: &[u8]) -> String {
     format!("{} bytes starting {first:?}", body.len())
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Throughput
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Result of one throughput measurement.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ThroughputVerdict {
+    Ok {
+        kbps: u64,
+        bytes: usize,
+        elapsed: Duration,
+    },
+    /// The link is up and reachable and cannot carry enough traffic to be
+    /// usable.
+    ///
+    /// `kbps` is `None` when the transfer never finished. We then know the
+    /// rate was under the floor without knowing what it was — and that is
+    /// still a statement about speed, which is why it belongs here rather
+    /// than in `Unmeasurable`. The payload is sized so any link meeting the
+    /// floor delivers it comfortably inside the budget, so failing to
+    /// deliver it *is* the finding.
+    TooSlow {
+        kbps: Option<u64>,
+        floor_kbps: u64,
+        bytes: usize,
+        elapsed: Duration,
+    },
+    /// Could not measure at all.
+    Unmeasurable { detail: String },
+}
+
+impl ThroughputVerdict {
+    pub fn is_ok(&self) -> bool {
+        matches!(self, ThroughputVerdict::Ok { .. })
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            ThroughputVerdict::Ok {
+                kbps,
+                bytes,
+                elapsed,
+            } => format!(
+                "{kbps} kbit/s ({bytes} bytes in {} ms)",
+                elapsed.as_millis()
+            ),
+            ThroughputVerdict::TooSlow {
+                kbps: Some(kbps),
+                floor_kbps,
+                bytes,
+                elapsed,
+            } => format!(
+                "{kbps} kbit/s is below the {floor_kbps} kbit/s floor \
+                 ({bytes} bytes took {} ms) — the link is reachable but too \
+                 slow to carry real traffic",
+                elapsed.as_millis()
+            ),
+            ThroughputVerdict::TooSlow {
+                kbps: None,
+                floor_kbps,
+                elapsed,
+                ..
+            } => format!(
+                "the payload did not finish transferring within {} ms, so the link \
+                 is below the {floor_kbps} kbit/s floor — reachable, but too slow \
+                 to carry real traffic",
+                elapsed.as_millis()
+            ),
+            ThroughputVerdict::Unmeasurable { detail } => detail.clone(),
+        }
+    }
+}
+
+/// Measure how fast a provider can actually move bytes.
+///
+/// # Why reachability probes cannot answer this
+///
+/// A provider suspending an account does not always redirect or drop; a
+/// common alternative is to leave everything reachable and apply a rate
+/// limit — 64 kbit/s is typical. Every other check in this crate passes
+/// happily under that: ICMP echoes are tiny, DNS answers are tiny, and the
+/// content canary fetches barely a kilobyte.
+///
+/// Worse, it is not merely that small transfers are "fast enough" — a rate
+/// limiter is a token bucket with a burst allowance, so a small transfer
+/// completes at **full line speed** by draining the bucket. Measured in the
+/// test lab against a 64 kbit/s policer: the 1.2 KB canary file arrived in
+/// 0.6 ms, while a 256 KB transfer over the same link took 12.3 seconds.
+/// A latency budget on the small probe would therefore never fire.
+///
+/// So the payload has to be large enough to exhaust the bucket. 64 KiB is
+/// past any plausible burst while still costing almost nothing when fetched
+/// a couple of times a minute.
+///
+/// RTT dilutes the figure on fast links — 64 KiB over a 100 ms RTT reads as
+/// roughly 5 Mbit/s however fast the pipe really is — which is precisely why
+/// the floor belongs far below any real link and just above a suspension
+/// throttle.
+pub async fn check_throughput_via<R, F>(
+    url: &Url,
+    floor_kbps: u64,
+    timeout: Duration,
+    mark: Option<u32>,
+    user_agent: &str,
+    resolve: R,
+) -> ThroughputVerdict
+where
+    R: Fn(String) -> F,
+    F: std::future::Future<Output = Option<Ipv4Addr>>,
+{
+    let ip = match url.host_as_ip() {
+        Some(ip) => ip,
+        None => match resolve(url.host.clone()).await {
+            Some(ip) => ip,
+            None => {
+                return ThroughputVerdict::Unmeasurable {
+                    detail: format!("DNS resolution of {} failed", url.host),
+                };
+            }
+        },
+    };
+
+    let req = HttpRequest {
+        url: url.clone(),
+        connect_ip: ip,
+        mark,
+        timeout,
+        // Room for the payload plus slack; anything larger is not ours.
+        max_body: 4 * 1024 * 1024,
+        user_agent: user_agent.to_string(),
+    };
+
+    let started = Instant::now();
+    let resp = match http::fetch(&req).await {
+        Ok(r) => r,
+        Err(e) => {
+            // A timeout is evidence about speed. The payload is sized so that
+            // any link meeting the floor delivers it comfortably inside the
+            // budget, so not finishing means the rate was below the floor —
+            // we simply do not learn what it was, hence `kbps: None` rather
+            // than a fabricated figure.
+            //
+            // Every other failure (DNS, refused, TLS) says nothing about
+            // throughput and stays unmeasurable, so a broken endpoint is
+            // never reported to the operator as "your provider is throttled".
+            if http::is_timeout(&e) {
+                return ThroughputVerdict::TooSlow {
+                    kbps: None,
+                    floor_kbps,
+                    bytes: 0,
+                    elapsed: started.elapsed(),
+                };
+            }
+            return ThroughputVerdict::Unmeasurable {
+                detail: format!("{e:#}"),
+            };
+        }
+    };
+    let elapsed = started.elapsed();
+
+    if !(200..300).contains(&resp.status) {
+        return ThroughputVerdict::Unmeasurable {
+            detail: format!("HTTP {} fetching the throughput payload", resp.status),
+        };
+    }
+
+    classify_throughput(resp.body.len(), elapsed, floor_kbps)
+}
+
+/// Minimum payload that can say anything about a link's speed.
+///
+/// Below this the figure is dominated by round-trip time, and — the reason
+/// that matters here — a rate limiter is a token bucket, so a small transfer
+/// drains the burst allowance and completes at full line speed even on a
+/// throttled link. 16 KiB outlasts any plausible burst.
+const MIN_MEASURABLE_BYTES: usize = 16 * 1024;
+
+/// Turn a completed transfer into a verdict.
+///
+/// Split out from the I/O so the arithmetic and its edge cases are testable
+/// without a server: a payload too small to mean anything, a transfer that
+/// registered no elapsed time, and the boundary at the floor itself.
+fn classify_throughput(bytes: usize, elapsed: Duration, floor_kbps: u64) -> ThroughputVerdict {
+    if bytes < MIN_MEASURABLE_BYTES {
+        return ThroughputVerdict::Unmeasurable {
+            detail: format!(
+                "throughput payload was only {bytes} bytes — too small to measure \
+                 against (needs at least {} KiB to outlast a rate limiter's burst)",
+                MIN_MEASURABLE_BYTES / 1024
+            ),
+        };
+    }
+
+    let secs = elapsed.as_secs_f64();
+    if secs <= 0.0 {
+        return ThroughputVerdict::Unmeasurable {
+            detail: "transfer completed in no measurable time".to_string(),
+        };
+    }
+    let kbps = ((bytes as f64 * 8.0) / secs / 1000.0).round() as u64;
+
+    if kbps < floor_kbps {
+        ThroughputVerdict::TooSlow {
+            kbps: Some(kbps),
+            floor_kbps,
+            bytes,
+            elapsed,
+        }
+    } else {
+        ThroughputVerdict::Ok {
+            kbps,
+            bytes,
+            elapsed,
+        }
+    }
+}
+
 /// Classify an address that a *public* hostname must never resolve to.
 /// Returns the range name when the address is non-routable.
 pub fn non_routable_range(ip: Ipv4Addr) -> Option<&'static str> {
@@ -1005,6 +1239,117 @@ mod tests {
             "the shipped default canary targets do not pass on a healthy link: {}",
             report.summary()
         );
+    }
+
+    /// The throughput verdict has to distinguish "slow" from "did not work",
+    /// because only the first is a statement about the link's speed. A
+    /// timeout tells us the transfer did not finish, not how fast it was.
+    #[test]
+    fn throughput_verdicts_read_correctly() {
+        let ok = ThroughputVerdict::Ok {
+            kbps: 8000,
+            bytes: 65536,
+            elapsed: Duration::from_millis(65),
+        };
+        assert!(ok.is_ok());
+        assert!(ok.describe().contains("8000 kbit/s"));
+
+        let slow = ThroughputVerdict::TooSlow {
+            kbps: Some(60),
+            floor_kbps: 128,
+            bytes: 65536,
+            elapsed: Duration::from_secs(8),
+        };
+        assert!(!slow.is_ok());
+        let d = slow.describe();
+        assert!(d.contains("60 kbit/s"), "{d}");
+        assert!(d.contains("128"), "{d}");
+        assert!(d.contains("too slow"), "{d}");
+
+        let bad = ThroughputVerdict::Unmeasurable {
+            detail: "DNS resolution failed".into(),
+        };
+        assert!(!bad.is_ok());
+        assert_eq!(bad.describe(), "DNS resolution failed");
+
+        // A transfer that never finished still says "too slow". Classifying
+        // it as unmeasurable instead would let a throttled provider be
+        // reported as merely unreachable, pointing the operator at the wrong
+        // problem — which is exactly what the lab caught.
+        let never_finished = ThroughputVerdict::TooSlow {
+            kbps: None,
+            floor_kbps: 128,
+            bytes: 0,
+            elapsed: Duration::from_secs(15),
+        };
+        assert!(!never_finished.is_ok());
+        let d = never_finished.describe();
+        assert!(d.contains("did not finish"), "{d}");
+        assert!(d.contains("128"), "{d}");
+    }
+
+    /// A payload smaller than a rate limiter's burst allowance measures
+    /// nothing useful — it completes at full line speed even on a throttled
+    /// link, which is exactly why a latency check on the 1.2 KB canary file
+    /// cannot detect throttling. Refuse to report a figure from one rather
+    /// than reporting a flattering lie.
+    #[test]
+    fn a_too_small_payload_is_unmeasurable_not_fast() {
+        // 1.2 KB in 0.6 ms is the real measurement taken through the lab's
+        // 64 kbit/s policer. Naively that reads as 16 Mbit/s.
+        let v = classify_throughput(1243, Duration::from_micros(600), 128);
+        assert!(
+            !v.is_ok(),
+            "a burst-sized transfer must not read as healthy"
+        );
+        assert!(matches!(v, ThroughputVerdict::Unmeasurable { .. }));
+        assert!(
+            v.describe().contains("too small to measure"),
+            "{}",
+            v.describe()
+        );
+    }
+
+    #[test]
+    fn throughput_classification_boundaries() {
+        // 64 KiB in 8 s ≈ 66 kbit/s: a throttled link, below the floor.
+        let slow = classify_throughput(65_536, Duration::from_secs(8), 128);
+        assert!(matches!(
+            slow,
+            ThroughputVerdict::TooSlow { kbps: Some(66), .. }
+        ));
+
+        // 64 KiB in 120 ms ≈ 4.4 Mbit/s: a healthy link.
+        let fast = classify_throughput(65_536, Duration::from_millis(120), 128);
+        assert!(fast.is_ok(), "{}", fast.describe());
+
+        // Exactly at the floor passes — the floor is a minimum, not a
+        // threshold to exceed.
+        let at_floor = classify_throughput(65_536, Duration::from_millis(4096), 128);
+        assert!(at_floor.is_ok(), "{}", at_floor.describe());
+
+        // A zero-duration transfer would divide by zero; report it rather
+        // than inventing an infinite rate.
+        let instant = classify_throughput(65_536, Duration::ZERO, 128);
+        assert!(matches!(instant, ThroughputVerdict::Unmeasurable { .. }));
+    }
+
+    /// The arithmetic, pinned against the figures actually measured in the
+    /// test lab: a 64 kbit/s policer moved 256 KiB in 12.3 s.
+    #[test]
+    fn throughput_arithmetic_matches_a_real_measurement() {
+        let kbps = |bytes: usize, secs: f64| ((bytes as f64 * 8.0) / secs / 1000.0).round() as u64;
+
+        // The lab's throttled link.
+        assert_eq!(kbps(262_144, 12.318), 170);
+
+        // The shipped 64 KiB payload over the same 64 kbit/s link: 8 s.
+        assert_eq!(kbps(65_536, 8.0), 66);
+        assert!(kbps(65_536, 8.0) < 128, "must fall below the default floor");
+
+        // A healthy link, where round-trip time dominates: 64 KiB in 120 ms
+        // still reads as several Mbit/s, comfortably clear of the floor.
+        assert!(kbps(65_536, 0.12) > 4_000);
     }
 
     #[test]

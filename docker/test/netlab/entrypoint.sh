@@ -55,6 +55,7 @@ EOF
     # ── the genuine canary content ─────────────────────────────────────
     mkdir -p /var/www/origin
     cp /canary/canary.txt /var/www/origin/canary.txt
+    cp /canary/throughput-64k.bin /var/www/origin/throughput-64k.bin
     cat >/etc/nginx/sites-available/default <<'EOF'
 server {
     listen 80 default_server;
@@ -143,6 +144,16 @@ EOF
 
     isp-mode "${INITIAL_MODE:-good}"
     log "ready in mode ${INITIAL_MODE:-good}"
+    ;;
+
+client)
+    # An ordinary LAN host: no policy routing, no marks, no special
+    # knowledge. Its only route out is the vlb box, so every assertion made
+    # from here is a statement about what a real user behind the gateway
+    # experiences.
+    drop_docker_default
+    ip route add default via "${GATEWAY_IP:?GATEWAY_IP must be set}"
+    log "default route via ${GATEWAY_IP} (the vlb gateway)"
     ;;
 
 *)

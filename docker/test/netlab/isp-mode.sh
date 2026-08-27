@@ -8,6 +8,11 @@
 #   dead        the router itself is gone (cable pulled, power cut)
 #   blackhole   the router answers pings but forwards nothing
 #   lossy       heavy packet loss, the classic "is it down or not" case
+#   throttled   the link stays up and everything is reachable -- it is just
+#               crawling. This is what a provider does when it applies a rate
+#               limit instead of a redirect: ICMP still answers, DNS still
+#               resolves, and a small file still arrives. Detecting it needs
+#               a judgement about speed, not about reachability.
 #   dns-blocked ICMP fine, UDP/53 dropped
 #   portal-http a transparent HTTP proxy, with DNS left completely honest.
 #               Every earlier layer -- including the DNS-integrity probe --
@@ -40,8 +45,9 @@ reset_rules() {
     # so it is re-created rather than flushed away.
     iptables -t nat -F POSTROUTING
     iptables -t nat -A POSTROUTING -o "$TRANSIT_IF" -j MASQUERADE
-    # Drop any tc qdisc left over from `lossy`.
+    # Drop any tc qdisc left over from `lossy` / `throttled`.
     tc qdisc del dev "$TRANSIT_IF" root 2>/dev/null || true
+    tc qdisc del dev "$EDGE_IF" root 2>/dev/null || true
     pkill -x dnsmasq 2>/dev/null || true
 }
 
@@ -74,6 +80,14 @@ blackhole)
     # Answers ICMP addressed to itself, forwards nothing. This is the mode
     # that defeats a naive "ping the gateway" health check.
     iptables -P FORWARD DROP
+    ;;
+
+throttled)
+    # 64 kbit/s with a shallow queue, in both directions. A policer this tight
+    # is what "service suspended, speed reduced" looks like in practice: small
+    # probes sail through while anything real is unusable.
+    tc qdisc add dev "$TRANSIT_IF" root tbf rate 64kbit burst 4kb latency 50ms 2>/dev/null || true
+    tc qdisc add dev "$EDGE_IF" root tbf rate 64kbit burst 4kb latency 50ms 2>/dev/null || true
     ;;
 
 lossy)
