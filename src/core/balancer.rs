@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::{RwLock, watch};
@@ -15,11 +16,16 @@ use crate::control;
 use crate::health::{
     ProbeTarget, check_dns_integrity_via, check_dns_via, check_gateway, check_internet_via,
 };
+use crate::notify;
 use crate::router::Router;
 use crate::selection::{Decision, FlapTracker, ProviderView, SelectionInput, decide};
-use crate::stats::{FailoverRecord, HealthRecord, Stats, SystemPoint, TrafficPoint};
+use crate::stats::{FailoverEvent, FailoverRecord, HealthRecord, Stats, SystemPoint, TrafficPoint};
 use crate::sysmon::SysMonitor;
+use crate::system::Prepared;
 use crate::traffic;
+
+/// Key under which the operator pin is persisted in the stats database.
+const KV_FORCED_PROVIDER: &str = "forced_provider";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -171,6 +177,28 @@ pub struct Balancer {
     /// link keeps bouncing.
     flap: StdMutex<FlapTracker>,
     handles: StdMutex<Vec<JoinHandle<()>>>,
+    dry_run: bool,
+    /// Providers whose routing table could not be set up at startup. The
+    /// health loop retries them until they work.
+    policy_pending: Vec<String>,
+    /// True while `active` names a provider adopted from the kernel routing
+    /// table at startup that this process has not yet verified itself.
+    active_adopted: AtomicBool,
+    started_at: DateTime<Utc>,
+    /// The failback countdown, if one is running — surfaced to the TUI.
+    failback_pending: StdMutex<Option<FailbackPending>>,
+    /// Last line handed to systemd, so an unchanged status is not re-sent on
+    /// every tick.
+    last_status_line: StdMutex<String>,
+}
+
+/// A better provider is healthy and the daemon is waiting for it to prove
+/// stable before failing back to it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FailbackPending {
+    pub candidate: String,
+    pub stable_for_secs: u64,
+    pub required_secs: u64,
 }
 
 /// Read-only snapshot of the balancer state, serialized over the control
@@ -180,6 +208,22 @@ pub struct ControlSnapshot {
     pub active: Option<String>,
     pub forced: Option<String>,
     pub providers: Vec<ProviderSnapshot>,
+    /// Fields below were added later; `#[serde(default)]` keeps a newer TUI
+    /// talking to an older daemon (and the reverse) during an update.
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub started_at: Option<DateTime<Utc>>,
+    /// `active` was taken over from the routing table at startup and has not
+    /// been confirmed healthy by this process yet.
+    #[serde(default)]
+    pub active_adopted: bool,
+    /// The default route as the kernel actually has it — the ground truth,
+    /// independent of what the daemon believes.
+    #[serde(default)]
+    pub kernel_route: Option<String>,
+    #[serde(default)]
+    pub failback_pending: Option<FailbackPending>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,9 +261,104 @@ pub struct ProviderSnapshot {
 }
 
 impl Balancer {
-    pub async fn new(cfg: Config, dry_run: bool, installed_bootstrap: bool) -> Result<Arc<Self>> {
+    pub async fn new(cfg: Config, dry_run: bool, prepared: Prepared) -> Result<Arc<Self>> {
         let stats = Arc::new(Stats::open(&cfg.database.path, &cfg.providers)?);
-        let router = Router::new(dry_run, installed_bootstrap);
+        let router = Router::new(dry_run, prepared.installed_bootstrap);
+        let now = Utc::now();
+
+        // ── continuity across a restart ─────────────────────────────────
+        //
+        // Nothing is torn down on shutdown, so after an update the kernel
+        // still routes through whichever provider the previous instance
+        // chose. Rather than start from "nothing selected" — where the first
+        // provider to pass its checks wins, which on links of unequal speed
+        // is often the *backup*, complete with a conntrack flush and a
+        // thirty-second detour before failing back — take the installed
+        // route as the incumbent. It keeps carrying traffic, untouched, until
+        // this process has probed its provider to a verdict of its own.
+        //
+        // Only a route at metric 0 qualifies: that is what this daemon
+        // installs. The provisional bootstrap route and a netplan default at
+        // metric 100 are not choices anyone made.
+        let (active, adopted) = match router.current_default().await {
+            Ok(Some(route)) if route.metric.unwrap_or(0) == 0 => {
+                match cfg
+                    .providers
+                    .iter()
+                    .find(|p| p.gateway == route.gateway && p.interface == route.interface)
+                {
+                    Some(p) => {
+                        info!(
+                            provider = %p.name,
+                            route = %route,
+                            "adopted the installed default route as the incumbent — traffic \
+                             keeps flowing through it while the health checks confirm it"
+                        );
+                        (Some(p.name.clone()), true)
+                    }
+                    None => {
+                        info!(
+                            route = %route,
+                            "the installed default route matches no configured provider; \
+                             the first provider to pass its checks will replace it"
+                        );
+                        (None, false)
+                    }
+                }
+            }
+            Ok(_) => (None, false),
+            Err(e) => {
+                debug!(error = %e, "could not read the default route at startup");
+                (None, false)
+            }
+        };
+
+        // The operator's pin outlives the process: an update must not
+        // silently undo a `vlb force` from an hour ago.
+        let forced = match stats.get_kv(KV_FORCED_PROVIDER) {
+            Ok(Some(name)) if cfg.providers.iter().any(|p| p.name == name) => {
+                info!(
+                    provider = %name,
+                    "operator pin restored from the previous run (release it with `vlb auto`)"
+                );
+                Some(name)
+            }
+            Ok(Some(name)) => {
+                warn!(
+                    provider = %name,
+                    "a persisted operator pin names a provider that is no longer configured — \
+                     discarding it"
+                );
+                let _ = stats.del_kv(KV_FORCED_PROVIDER);
+                None
+            }
+            Ok(None) => None,
+            Err(e) => {
+                warn!(error = %e, "could not read the persisted operator pin");
+                None
+            }
+        };
+
+        // Flap history survives too, so a bouncing uplink cannot reset its
+        // own backoff by having the daemon restarted.
+        let flap = {
+            let window = chrono::Duration::seconds(cfg.failover.flap_window_secs as i64);
+            match stats.failover_times_since(now - window, 256) {
+                Ok(times) if !times.is_empty() => {
+                    info!(
+                        switches = times.len(),
+                        window_secs = cfg.failover.flap_window_secs,
+                        "flap history restored from the previous run"
+                    );
+                    FlapTracker::with_history(times)
+                }
+                Ok(_) => FlapTracker::new(),
+                Err(e) => {
+                    warn!(error = %e, "could not restore flap history");
+                    FlapTracker::new()
+                }
+            }
+        };
 
         let probe_targets: Vec<ProbeTarget> = cfg
             .health
@@ -288,10 +427,11 @@ impl Balancer {
             canary_targets = canary_targets.len(),
             canary_quorum = canary_quorum.as_str(),
             db = %cfg.database.path.display(),
+            incumbent = active.as_deref().unwrap_or("(none)"),
             "balancer initialized"
         );
 
-        Ok(Arc::new(Self {
+        let me = Arc::new(Self {
             cfg,
             probe_targets,
             canary_targets,
@@ -300,11 +440,71 @@ impl Balancer {
             router,
             stats,
             providers: RwLock::new(providers),
-            active: RwLock::new(None),
-            force_override: RwLock::new(None),
-            flap: StdMutex::new(FlapTracker::new()),
+            active: RwLock::new(active),
+            force_override: RwLock::new(forced),
+            flap: StdMutex::new(flap),
             handles: StdMutex::new(Vec::new()),
-        }))
+            dry_run,
+            policy_pending: prepared.policy_pending,
+            active_adopted: AtomicBool::new(adopted),
+            started_at: now,
+            failback_pending: StdMutex::new(None),
+            last_status_line: StdMutex::new(String::new()),
+        });
+        me.publish_status().await;
+        Ok(me)
+    }
+
+    /// Hand systemd a one-line summary for `systemctl status vlb`.
+    ///
+    /// Sent only when the line changes, which is rarely: the interesting
+    /// transitions are a provider changing state or the route moving.
+    async fn publish_status(&self) {
+        let line = {
+            let ps = self.providers.read().await;
+            let active = self.active.read().await.clone();
+            let forced = self.force_override.read().await.clone();
+            let mut rows: Vec<&ProviderState> = ps.values().collect();
+            rows.sort_by_key(|p| p.cfg.priority);
+            let mut parts = Vec::with_capacity(rows.len() + 2);
+            parts.push(match &active {
+                Some(a) if self.active_adopted.load(Ordering::Relaxed) => {
+                    format!("active: {a} (adopted, verifying)")
+                }
+                Some(a) => format!("active: {a}"),
+                None => "active: none yet".to_string(),
+            });
+            for p in rows {
+                let mut s = format!("{} {}", p.cfg.name, p.state.as_str().to_uppercase());
+                if let Some(l) = p.failure_layer
+                    && p.state != State::Up
+                {
+                    s.push_str(&format!(" [{}]", l.as_str()));
+                }
+                if let Some(ms) = p.last_latency_ms
+                    && p.state == State::Up
+                {
+                    s.push_str(&format!(" {ms:.0}ms"));
+                }
+                parts.push(s);
+            }
+            if let Some(f) = forced {
+                parts.push(format!("pinned: {f}"));
+            }
+            parts.join(" · ")
+        };
+        let changed = {
+            let mut last = self.last_status_line.lock().unwrap();
+            if *last == line {
+                false
+            } else {
+                *last = line.clone();
+                true
+            }
+        };
+        if changed {
+            notify::status(&line);
+        }
     }
 
     pub fn spawn_tasks(self: &Arc<Self>, shutdown: watch::Receiver<bool>) {
@@ -387,6 +587,13 @@ impl Balancer {
             Duration::from_millis(self.cfg.canary.throughput.timeout_ms.max(1000));
         let mut last_throughput: Option<std::time::Instant> = None;
 
+        // Startup could not install this provider's routing table (its
+        // interface was not up yet, typically). Keep trying from here: the
+        // probes below cannot pass without it, so until it succeeds this
+        // provider is simply — and truthfully — down.
+        let mut policy_ready = self.dry_run || !self.policy_pending.contains(&name);
+        let mut policy_attempts: u32 = 0;
+
         loop {
             tokio::select! {
                 _ = ticker.tick() => {}
@@ -394,6 +601,31 @@ impl Balancer {
                     if *shutdown.borrow() {
                         tracing::debug!(provider = %name, "health loop stopping");
                         return;
+                    }
+                }
+            }
+
+            if !policy_ready {
+                policy_attempts = policy_attempts.saturating_add(1);
+                match crate::system::setup_provider_policy_route(&self.cfg, &provider_cfg).await {
+                    Ok(()) => {
+                        policy_ready = true;
+                        info!(
+                            provider = %name,
+                            attempts = policy_attempts,
+                            "routing table set up — the interface is usable now"
+                        );
+                    }
+                    Err(e) => {
+                        // Loud the first time and every so often after that,
+                        // quiet in between: a permanently absent interface
+                        // should not fill the journal.
+                        if policy_attempts == 1 || policy_attempts % 20 == 0 {
+                            warn!(provider = %name, attempts = policy_attempts, error = %e,
+                                  "routing table still cannot be set up; retrying");
+                        } else {
+                            debug!(provider = %name, error = %e, "routing table retry failed");
+                        }
                     }
                 }
             }
@@ -671,6 +903,7 @@ impl Balancer {
             if let Err(e) = self.reconcile_active().await {
                 error!(error = %e, "failed to reconcile active provider");
             }
+            self.publish_status().await;
         }
     }
 
@@ -966,8 +1199,43 @@ impl Balancer {
             failback_stable,
         });
 
+        // The countdown is only meaningful while a failback is pending;
+        // every other outcome clears it.
+        {
+            let pending = match &decision {
+                Decision::WaitingForFailback {
+                    candidate,
+                    stable_for,
+                    required,
+                } => Some(FailbackPending {
+                    candidate: candidate.clone(),
+                    stable_for_secs: stable_for.as_secs(),
+                    required_secs: required.as_secs(),
+                }),
+                _ => None,
+            };
+            *self.failback_pending.lock().unwrap() = pending;
+        }
+
         match decision {
             Decision::Keep => {
+                // An adopted incumbent that has now passed its checks is,
+                // from here on, simply ours. Assert the route once so it
+                // carries our metric/proto and any rival at metric 0 is
+                // removed — `replace` on an identical route changes nothing
+                // the kernel forwards on, so no flush is needed or done.
+                let verifying = self.active_adopted.swap(false, Ordering::SeqCst);
+                if verifying && let Some(cur) = current.as_ref().and_then(|c| by_name.get(c)) {
+                    self.router
+                        .set_default_route(cur.gateway, &cur.interface)
+                        .await?;
+                    info!(
+                        provider = %cur.name,
+                        "{} the adopted route's provider passed its health checks — \
+                         the route is now verified and owned by this process",
+                        "VERIFIED".bright_green().bold()
+                    );
+                }
                 if always_install {
                     // Operator-initiated: re-assert the route in case an
                     // external tool (NetworkManager, netplan apply, a DHCP
@@ -984,6 +1252,19 @@ impl Balancer {
                         );
                     }
                 }
+                Ok(())
+            }
+
+            Decision::WaitingForVerdict {
+                incumbent,
+                candidate,
+            } => {
+                debug!(
+                    incumbent = %incumbent,
+                    candidate = %candidate,
+                    "keeping the adopted route while its provider is still being probed \
+                     — a healthy alternative exists but 'unknown' is not 'broken'"
+                );
                 Ok(())
             }
 
@@ -1048,6 +1329,9 @@ impl Balancer {
                 });
 
                 *active_guard = Some(to.clone());
+                // Whatever was adopted at startup, this is now our own
+                // choice, made on our own evidence.
+                self.active_adopted.store(false, Ordering::SeqCst);
                 drop(active_guard);
 
                 // Only count real switches — not the initial installation,
@@ -1106,7 +1390,14 @@ impl Balancer {
                 }
             }
 
-            let Some(active) = self.active.read().await.clone() else {
+            // Hold the read side of `active` across the whole check-and-fix.
+            // `reconcile` installs a new route and *then* updates `active`
+            // under the write lock; a watchdog tick landing between those two
+            // steps would read the old name, see the new route as foreign,
+            // and put the old — possibly dead — provider's route back for a
+            // full watchdog period. Holding the lock serialises the two.
+            let active_guard = self.active.read().await;
+            let Some(active) = active_guard.clone() else {
                 continue;
             };
             let expected = {
@@ -1181,6 +1472,7 @@ impl Balancer {
                 }
                 Err(e) => debug!(error = %e, "route watchdog could not read the default route"),
             }
+            drop(active_guard);
         }
     }
 
@@ -1297,6 +1589,7 @@ impl Balancer {
     }
 
     pub async fn shutdown(&self) {
+        notify::stopping();
         let handles = std::mem::take(&mut *self.handles.lock().unwrap());
         for h in &handles {
             h.abort();
@@ -1304,7 +1597,14 @@ impl Balancer {
         for h in handles {
             let _ = h.await;
         }
-        info!("{}", "balancer stopped".bright_white().bold());
+        // Deliberately no teardown: the default route, the per-provider
+        // tables, the NAT rules and the sysctls all stay exactly as they are,
+        // so clients keep flowing through the restart and the next instance
+        // adopts the route rather than choosing afresh.
+        info!(
+            "{} — routes, rules and NAT left in place so traffic keeps flowing",
+            "balancer stopped".bright_white().bold()
+        );
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -1312,6 +1612,11 @@ impl Balancer {
     // ────────────────────────────────────────────────────────────────────
 
     pub async fn snapshot(&self) -> ControlSnapshot {
+        // Read the kernel first, outside every lock: it is a subprocess.
+        let kernel_route = match self.router.current_default().await {
+            Ok(Some(r)) => Some(r.to_string()),
+            _ => None,
+        };
         let ps = self.providers.read().await;
         let active = self.active.read().await.clone();
         let forced = self.force_override.read().await.clone();
@@ -1346,7 +1651,17 @@ impl Balancer {
             active,
             forced,
             providers,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            started_at: Some(self.started_at),
+            active_adopted: self.active_adopted.load(Ordering::Relaxed),
+            kernel_route,
+            failback_pending: self.failback_pending.lock().unwrap().clone(),
         }
+    }
+
+    /// Most recent failover events, newest first.
+    pub fn recent_failovers(&self, limit: u32) -> Result<Vec<FailoverEvent>> {
+        self.stats.recent_failovers(limit.clamp(1, 1_000))
     }
 
     pub async fn force_provider(self: &Arc<Self>, name: &str) -> Result<()> {
@@ -1373,6 +1688,10 @@ impl Balancer {
             let mut f = self.force_override.write().await;
             *f = Some(name.to_string());
         }
+        // Persist so the pin outlives a restart (an update, say).
+        if let Err(e) = self.stats.set_kv(KV_FORCED_PROVIDER, name) {
+            warn!(error = %e, "could not persist the operator pin; it will not survive a restart");
+        }
         match state {
             State::Up => info!(provider = %name, "operator override installed"),
             State::Down => warn!(
@@ -1395,6 +1714,7 @@ impl Balancer {
             warn!(error = %e, "failed to reconcile after force");
             return Err(e);
         }
+        self.publish_status().await;
         Ok(())
     }
 
@@ -1403,10 +1723,14 @@ impl Balancer {
             let mut f = self.force_override.write().await;
             *f = None;
         }
+        if let Err(e) = self.stats.del_kv(KV_FORCED_PROVIDER) {
+            warn!(error = %e, "could not clear the persisted operator pin");
+        }
         info!("operator override cleared");
         if let Err(e) = self.reconcile_active_forced().await {
             warn!(error = %e, "failed to reconcile after clearing force");
         }
+        self.publish_status().await;
     }
 
     pub fn recent_system(&self, limit: u32) -> Result<Vec<SystemPoint>> {

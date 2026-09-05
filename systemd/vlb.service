@@ -1,26 +1,62 @@
+# vlb — Virtual Load Balancer
+#
+# Managed by scripts/install.sh: on update the installer replaces this file
+# when it is still the stock one. Do not edit it in place — put local
+# changes in a drop-in, which survives updates:
+#
+#     sudo systemctl edit vlb
+#
+# vlb-unit-revision: 2
+
 [Unit]
 Description=Virtual Load Balancer — multi-provider failover gateway
-After=network-online.target
-Wants=network-online.target
+Documentation=https://github.com/DenisHumen/vlb-Virtual-Load-Balancer
+# network.target, deliberately not network-online.target. On a gateway the
+# latter waits for every uplink to be configured, so a dead ISP at boot would
+# hold the failover daemon back for up to two minutes — precisely when it is
+# needed. vlb tolerates interfaces that are not up yet and keeps retrying
+# them on its own.
+After=network.target
+# Never give up on a gateway daemon. systemd's default stops restarting a
+# unit after five failures in ten seconds; a transient crash loop at boot
+# (an interface late to appear, say) would then leave the box without
+# failover until somebody notices.
+StartLimitIntervalSec=0
 
 [Service]
-Type=simple
+# `exec`, not `simple`: `systemctl start` reports success only once the
+# binary has actually been executed, so a missing or broken binary fails the
+# start rather than reporting it started. Not `notify`: that would make an
+# older binary — the one a rollback restores — unable to start under this
+# unit.
+Type=exec
 ExecStart=/usr/local/bin/vlb --config /etc/vlb/vlb.toml
-Restart=on-failure
+Restart=always
 RestartSec=2
+TimeoutStopSec=20
+# Lets the daemon put a one-line summary — active provider, per-provider
+# state, pin — into `systemctl status vlb`.
+NotifyAccess=main
 # The service needs root for ip route / iptables / sysctl.
 User=root
 Group=root
-# Keep the journal clean and colorized logs flowing.
-Environment=RUST_LOG=info,virtual_load_balancer=debug
+Environment=RUST_LOG=info
 Environment=CLICOLOR_FORCE=1
 StandardOutput=journal
 StandardError=journal
+# The process routing the whole site is the last one the OOM killer should
+# pick.
+OOMScoreAdjust=-900
+LimitNOFILE=65536
 # Light hardening — still allows network admin.
 NoNewPrivileges=false
 ProtectSystem=full
 ProtectHome=true
 PrivateTmp=true
+# ProtectSystem=full makes /etc read-only. vlb persists its sysctl settings
+# to /etc/sysctl.d so IP forwarding is on from early boot, before this unit
+# starts; the leading '-' means "ignore if the directory does not exist".
+ReadWritePaths=-/etc/sysctl.d
 
 [Install]
 WantedBy=multi-user.target

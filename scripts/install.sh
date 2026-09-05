@@ -17,7 +17,14 @@
 #     is caught while the working binary is still in place;
 #   * the previous binary is kept, and restored automatically if the service
 #     fails to come back;
+#   * the systemd unit is upgraded when it is still the stock one, and left
+#     alone (with a note) when it was edited by hand; a rollback restores it
+#     together with the binary;
 #   * an existing /etc/vlb/vlb.toml is never overwritten.
+#
+# Traffic is not interrupted by the restart: the daemon leaves its routes in
+# place on shutdown and the new one adopts them, so clients keep flowing
+# while it re-verifies the uplinks.
 #
 # Environment overrides:
 #   VLB_VERSION   install a specific tag (default: latest release)
@@ -99,7 +106,7 @@ trap cleanup EXIT
 
 [[ $EUID -eq 0 ]] || die "must run as root — pipe this into 'sudo bash', or run 'sudo $0'"
 
-for tool in curl tar sha256sum install; do
+for tool in curl tar sha256sum install cmp; do
     command -v "$tool" >/dev/null || die "required tool '$tool' is not installed"
 done
 
@@ -298,7 +305,15 @@ Fix ${CONFIG_PATH}, then re-run this installer."
         log "checking the content canary can reach its targets (pre-flight)"
         PROBE_OUT="${WORKDIR}/probe.out"
         if "${WORKDIR}/vlb" --config "$CONFIG_PATH" probe >"$PROBE_OUT" 2>&1; then
-            if grep -q 'canary verdict: [1-9][0-9]*/' "$PROBE_OUT"; then
+            # Builds from 0.3.0 on print one summary line for exactly this
+            # purpose; older ones (a rollback target, say) only print
+            # per-provider verdicts, so fall back to those.
+            if grep -q '^canary quorum: MET via' "$PROBE_OUT"; then
+                ok "canary pre-flight passed ($(grep -o '^canary quorum: MET via .*' "$PROBE_OUT" | head -1))"
+            elif grep -q '^canary quorum: not applicable' "$PROBE_OUT"; then
+                log "canary is disabled in this config — nothing to pre-flight"
+            elif ! grep -q '^canary quorum:' "$PROBE_OUT" \
+                 && grep -q 'canary verdict: [1-9][0-9]*/' "$PROBE_OUT"; then
                 VERIFIED=$(grep -o 'canary verdict: [0-9]*/[0-9]* canary targets verified' "$PROBE_OUT" | head -1)
                 ok "canary pre-flight passed (${VERIFIED:-verified})"
             else
@@ -349,16 +364,74 @@ mv -f "${BIN_PATH}.new" "$BIN_PATH"
 ok "installed ${NEW_VERSION} to ${BIN_PATH}"
 
 # ── systemd unit ─────────────────────────────────────────────────────────
+#
+# The unit carries settings that matter for a gateway (never give up
+# restarting; do not wait for a dead uplink at boot; keep the OOM killer
+# away), so an old stock unit is upgraded along with the binary. Only a
+# *stock* unit is touched: one that matches a revision this project shipped,
+# byte for byte, or that carries the managed-by marker. Anything else was
+# edited by hand and is left exactly as it is, with a note. Local changes
+# belong in a drop-in (`systemctl edit vlb`), which survives all of this.
+#
+# SHA-256 of every stock revision published so far. When the unit changes,
+# the previous revision's hash is added here so it is still recognised.
+STOCK_UNIT_SHA256=(
+    2efbb3f53f84e19dc95772585712af964999915a7e9fc952db6e0a5fb7d2e5f3   # v0.0.1 – v0.2.1
+)
+UNIT_BACKUP=""
+UNIT_CHANGED=0
 
-if command -v systemctl >/dev/null; then
+is_stock_unit() {
+    local sum; sum=$(sha256sum "$1" | awk '{print $1}')
+    local known
+    for known in "${STOCK_UNIT_SHA256[@]}"; do
+        [[ "$sum" == "$known" ]] && return 0
+    done
+    grep -q '^# Managed by scripts/install.sh' "$1" 2>/dev/null
+}
+
+install_or_upgrade_unit() {
+    "${CURL[@]}" -o "${WORKDIR}/vlb.service" \
+        "https://raw.githubusercontent.com/${REPO}/${TAG}/systemd/vlb.service" \
+        || die "could not fetch the systemd unit"
+
+    # Keep whatever paths the existing unit was adopted from.
+    if [[ "$BIN_PATH" != "/usr/local/bin/vlb" || "$CONFIG_PATH" != "/etc/vlb/vlb.toml" ]]; then
+        sed -i "s|^ExecStart=.*|ExecStart=${BIN_PATH} --config ${CONFIG_PATH}|" "${WORKDIR}/vlb.service"
+    fi
+
     if [[ ! -f "$UNIT_PATH" ]]; then
         log "installing the systemd unit"
-        "${CURL[@]}" -o "${WORKDIR}/vlb.service" \
-            "https://raw.githubusercontent.com/${REPO}/${TAG}/systemd/vlb.service" \
-            || die "could not fetch the systemd unit"
         install -m 0644 "${WORKDIR}/vlb.service" "$UNIT_PATH"
         systemctl daemon-reload
+        UNIT_CHANGED=1
+        return 0
     fi
+
+    if cmp -s "${WORKDIR}/vlb.service" "$UNIT_PATH"; then
+        log "systemd unit is current"
+        return 0
+    fi
+
+    if is_stock_unit "$UNIT_PATH"; then
+        UNIT_BACKUP="${UNIT_PATH}.bak"
+        cp -f "$UNIT_PATH" "$UNIT_BACKUP"
+        install -m 0644 "${WORKDIR}/vlb.service" "$UNIT_PATH"
+        systemctl daemon-reload
+        UNIT_CHANGED=1
+        ok "systemd unit upgraded (previous saved as ${UNIT_BACKUP})"
+        log "  local changes to the unit belong in a drop-in:  sudo systemctl edit ${SERVICE}"
+    else
+        warn "the systemd unit at ${UNIT_PATH} was edited by hand — leaving it alone."
+        warn "  the stock unit now sets:  After=network.target  StartLimitIntervalSec=0"
+        warn "  Restart=always  OOMScoreAdjust=-900  ReadWritePaths=-/etc/sysctl.d"
+        warn "  Consider moving your changes into a drop-in (systemctl edit ${SERVICE})"
+        warn "  and replacing the file with:  ${BASE%/releases/download/*}/blob/${TAG}/systemd/vlb.service"
+    fi
+}
+
+if command -v systemctl >/dev/null; then
+    install_or_upgrade_unit
 else
     warn "systemctl not found — the binary is installed but no service was configured"
 fi
@@ -366,11 +439,33 @@ fi
 # ── restart and verify ───────────────────────────────────────────────────
 
 rollback() {
+    local restored=0
     if [[ -n "$BACKUP" && -f "$BACKUP" ]]; then
         warn "rolling back to the previous binary"
-        cp -f "$BACKUP" "$BIN_PATH"
+        # Same atomic dance as the install: never leave a half-written
+        # binary where the service will look for it.
+        install -m 0755 "$BACKUP" "${BIN_PATH}.rollback"
+        mv -f "${BIN_PATH}.rollback" "$BIN_PATH"
+        restored=1
+    fi
+    if [[ -n "$UNIT_BACKUP" && -f "$UNIT_BACKUP" ]]; then
+        warn "restoring the previous systemd unit"
+        install -m 0644 "$UNIT_BACKUP" "$UNIT_PATH"
+        systemctl daemon-reload 2>/dev/null || true
+        restored=1
+    fi
+    if [[ $restored -eq 1 ]]; then
         systemctl restart "$SERVICE" 2>/dev/null || true
     fi
+}
+
+# One field out of the daemon's JSON status. Pretty-printed output leaves a
+# trailing comma on every value, which is stripped here.
+status_field() {
+    "$BIN_PATH" --config "$CONFIG_PATH" status 2>/dev/null \
+        | grep -m1 "\"$1\"" \
+        | sed 's/.*"'"$1"'"[^:]*: *//; s/^"//; s/",\{0,1\}$//; s/,$//' \
+        || true
 }
 
 if [[ "${VLB_NO_START:-0}" == "1" ]]; then
@@ -397,31 +492,30 @@ elif command -v systemctl >/dev/null; then
         systemctl enable --now "$SERVICE" || { rollback; die "could not start ${SERVICE}"; }
     fi
 
-    # Wait for the gateway to actually be carrying traffic again, rather than
-    # merely for systemd to report the process as started. A provider is only
-    # selected after `success_threshold` consecutive probe rounds — six
-    # seconds at the shipped defaults, longer on slow links — so a fixed
-    # short sleep would report "no provider yet" on a perfectly healthy
-    # update and leave the operator unsure whether something broke.
-    # Both the command substitution and the test below need explicit
-    # handling under `set -euo pipefail`. Immediately after a restart the
-    # control socket is not listening yet, so `vlb status` exits non-zero;
-    # with pipefail that propagates out of the assignment and `set -e` kills
-    # the script — which looked exactly like a failed update even though the
-    # service had come back fine. Likewise a bare `[[ … ]] && break` aborts
-    # the script on the iterations where the condition is false.
+    # Wait for the gateway to be carrying traffic on a *verified* provider,
+    # not merely for systemd to report the process as started. Since 0.3.0
+    # the daemon adopts the route it finds at startup, so `active` is set at
+    # once; it stays flagged `active_adopted` until the provider has passed
+    # this process's own checks — `success_threshold` consecutive rounds, six
+    # seconds at the shipped defaults, longer on slow links. Waiting for that
+    # flag to clear is what makes "carrying traffic via" below a statement
+    # about this build, not the previous one.
+    #
+    # Both the command substitution and the tests need explicit handling
+    # under `set -euo pipefail`: right after a restart the control socket is
+    # not listening yet, `vlb status` exits non-zero, and with pipefail that
+    # would kill the script — looking exactly like a failed update.
     ACTIVE=""
-    for _ in $(seq 1 30); do
+    ADOPTED=""
+    for _ in $(seq 1 40); do
         if ! systemctl is-active --quiet "$SERVICE"; then
             rollback
             die "${SERVICE} stopped after the restart; rolled back to the previous binary.
 Logs: journalctl -u ${SERVICE} -n 50"
         fi
-        ACTIVE=$("$BIN_PATH" --config "$CONFIG_PATH" status 2>/dev/null \
-                   | grep -m1 '"active"' \
-                   | sed 's/.*"active"[^:]*: *//; s/^"//; s/",\{0,1\}$//; s/,$//' \
-                 || true)
-        if [[ -n "$ACTIVE" && "$ACTIVE" != "null" ]]; then
+        ACTIVE=$(status_field active)
+        ADOPTED=$(status_field active_adopted)
+        if [[ -n "$ACTIVE" && "$ACTIVE" != "null" && "$ADOPTED" != "true" ]]; then
             break
         fi
         sleep 1
@@ -434,19 +528,26 @@ Logs: journalctl -u ${SERVICE} -n 50"
     fi
     ok "${SERVICE} is active"
 
-    if [[ -n "$ACTIVE" && "$ACTIVE" != "null" ]]; then
-        ok "carrying traffic via: ${ACTIVE}"
+    if [[ -n "$ACTIVE" && "$ACTIVE" != "null" && "$ADOPTED" != "true" ]]; then
+        ok "carrying traffic via: ${ACTIVE} (verified by the new build)"
+    elif [[ -n "$ACTIVE" && "$ACTIVE" != "null" ]]; then
+        # Traffic is flowing on the route the previous instance chose; the
+        # new build has just not finished confirming that provider yet —
+        # slow links, or a canary that takes a while. Say so plainly.
+        warn "carrying traffic via: ${ACTIVE} (route adopted from the previous run; the new
+      build has not finished verifying it after 40s — check with:  sudo vlb --config ${CONFIG_PATH} status)"
     else
         # Not fatal: the daemon is up and will select a provider as soon as
         # one passes. But it does mean no uplink is healthy right now, which
         # the operator needs to hear rather than discover later.
-        warn "the daemon is running but no provider has passed its checks in 30s.
+        warn "the daemon is running but no provider has passed its checks in 40s.
       Investigate with:  sudo vlb --config ${CONFIG_PATH} probe"
     fi
 fi
 
 echo
 ok "vlb ${CURRENT_VERSION:+${CURRENT_VERSION} → }${NEW_VERSION} installed."
+[[ $UNIT_CHANGED -eq 1 ]] && log "systemd unit: ${UNIT_PATH} (revision from ${TAG})"
 echo
 echo "  status:    sudo vlb --config ${CONFIG_PATH} status"
 echo "  dashboard: sudo vlb --config ${CONFIG_PATH} tui        (press 'u' to update)"

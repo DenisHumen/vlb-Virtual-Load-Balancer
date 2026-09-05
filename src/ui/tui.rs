@@ -1,11 +1,15 @@
 //! Interactive terminal dashboard — vlb's "btop on steroids".
 //!
 //! Layout (top → bottom):
-//!   1. system panel: CPU/RAM/SWAP/DISK gauges, load averages, per-core
+//!   1. gateway panel: active provider (and whether it is verified or merely
+//!      adopted from the routing table), pin, failback countdown, the
+//!      kernel's own default route, daemon version and uptime
+//!   2. system panel: CPU/RAM/SWAP/DISK gauges, load averages, per-core
 //!      grid, CPU history sparkline (btop-style)
-//!   2. providers table
-//!   3. traffic chart for selected provider (rx/tx bits per second)
-//!   4. footer with keybind hints and ephemeral status messages
+//!   3. providers table
+//!   4. recent failover events — what happened, when, and why
+//!   5. traffic chart for selected provider (rx/tx bits per second)
+//!   6. footer with keybind hints and ephemeral status messages
 //!
 //! Keys:
 //!   ↑/↓ or j/k    — select provider
@@ -32,14 +36,19 @@ use ratatui::widgets::{
 };
 use std::collections::HashMap;
 use std::io::{self, Stdout};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
+use tokio::task::JoinHandle;
 
 use crate::balancer::{ControlSnapshot, ProviderSnapshot, State};
 use crate::config::Config;
-use crate::control::{self, Request, Response, SystemPointWire, TrafficPointWire};
+use crate::control::{
+    self, FailoverEventWire, Request, Response, SystemPointWire, TrafficPointWire,
+};
 use crate::update;
 
-pub async fn run(config: Config) -> Result<()> {
+pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
     let listen = config.control.listen.clone();
     let initial = match control::send(&listen, &Request::Status).await {
         Ok(Response::Status { snapshot }) => snapshot,
@@ -55,7 +64,7 @@ pub async fn run(config: Config) -> Result<()> {
     };
 
     let mut terminal = setup_terminal()?;
-    let result = run_app(&mut terminal, config, initial).await;
+    let result = run_app(&mut terminal, config, config_path, initial).await;
     restore_terminal(&mut terminal)?;
     result
 }
@@ -90,28 +99,42 @@ enum UpdateState {
 struct App {
     listen: String,
     config: Config,
+    config_path: PathBuf,
     snapshot: ControlSnapshot,
     selected: usize,
     traffic: HashMap<String, Vec<TrafficPointWire>>,
     system: Vec<SystemPointWire>,
+    events: Vec<FailoverEventWire>,
     last_message: Option<(String, Instant)>,
     last_refresh: Instant,
+    /// Consecutive refreshes that could not reach the daemon — during an
+    /// update restart this is expected for a few seconds.
+    unreachable_for: u32,
     update: UpdateState,
+    /// The update runs in its own task so the dashboard keeps drawing and
+    /// the progress lines below are visible while it works.
+    update_task: Option<JoinHandle<Result<update::Outcome>>>,
+    update_log: Arc<StdMutex<Vec<String>>>,
     should_quit: bool,
 }
 
 impl App {
-    fn new(config: Config, snapshot: ControlSnapshot) -> Self {
+    fn new(config: Config, config_path: PathBuf, snapshot: ControlSnapshot) -> Self {
         Self {
             listen: config.control.listen.clone(),
             config,
+            config_path,
             snapshot,
             selected: 0,
             traffic: HashMap::new(),
             system: Vec::new(),
+            events: Vec::new(),
             last_message: None,
             last_refresh: Instant::now(),
+            unreachable_for: 0,
             update: UpdateState::Idle,
+            update_task: None,
+            update_log: Arc::new(StdMutex::new(Vec::new())),
             should_quit: false,
         }
     }
@@ -127,6 +150,17 @@ impl App {
     async fn refresh(&mut self) {
         match control::send(&self.listen, &Request::Status).await {
             Ok(Response::Status { snapshot }) => {
+                if self.unreachable_for > 0 {
+                    self.set_message(format!(
+                        "daemon is back (v{})",
+                        if snapshot.version.is_empty() {
+                            "?".to_string()
+                        } else {
+                            snapshot.version.clone()
+                        }
+                    ));
+                }
+                self.unreachable_for = 0;
                 self.snapshot = snapshot;
                 if self.selected >= self.snapshot.providers.len() {
                     self.selected = self.snapshot.providers.len().saturating_sub(1);
@@ -134,7 +168,19 @@ impl App {
             }
             Ok(Response::Error { error }) => self.set_message(format!("status error: {error}")),
             Ok(_) => self.set_message("unexpected response to status"),
-            Err(e) => self.set_message(format!("refresh failed: {e}")),
+            Err(e) => {
+                self.unreachable_for = self.unreachable_for.saturating_add(1);
+                self.set_message(format!(
+                    "daemon unreachable ({}×): {e}",
+                    self.unreachable_for
+                ));
+            }
+        }
+
+        match control::send(&self.listen, &Request::Events { limit: 8 }).await {
+            Ok(Response::Events { events }) => self.events = events,
+            Ok(_) => {}
+            Err(_) => {}
         }
 
         for p in self.snapshot.providers.clone() {
@@ -219,61 +265,65 @@ impl App {
     /// Deliberately re-queries the API rather than caching the asset URLs
     /// from the check: those URLs are what we are about to execute as root,
     /// and the gap between checking and confirming can be arbitrarily long.
-    async fn apply_update(&mut self) {
+    ///
+    /// Runs as a background task: the whole flow — download, pre-flight
+    /// probe, restart, waiting for the daemon to come back — takes a while,
+    /// and the dashboard should show its progress rather than freeze.
+    fn apply_update(&mut self) {
         let UpdateState::Available { tag, .. } = self.update.clone() else {
             return;
         };
         self.update = UpdateState::Installing { tag: tag.clone() };
+        self.update_log.lock().unwrap().clear();
 
+        let repo = self.config.update.repo.clone();
         let allow_pre = self.config.update.allow_prerelease;
-        let release = match update::check(&self.config.update.repo, allow_pre).await {
-            Ok(r) => r,
-            Err(e) => {
-                self.update = UpdateState::Failed {
-                    error: format!("{e:#}"),
-                };
-                return;
-            }
+        let plan = update::Plan {
+            config_path: self.config_path.clone(),
+            control_listen: self.listen.clone(),
+            service: self.config.update.service_name.clone(),
+            restart_service: self.config.update.restart_service,
+            skip_preflight: false,
         };
+        let log = Arc::clone(&self.update_log);
 
-        let dest = match std::env::current_exe() {
-            Ok(d) => d,
-            Err(e) => {
-                self.update = UpdateState::Failed {
-                    error: format!("cannot locate the running binary: {e}"),
-                };
-                return;
-            }
-        };
-
-        if let Err(e) = update::install(&release, &dest).await {
-            self.update = UpdateState::Failed {
-                error: format!("{e:#}"),
+        self.update_task = Some(tokio::spawn(async move {
+            let release = update::check(&repo, allow_pre).await?;
+            let dest = std::env::current_exe().context("cannot locate the running binary")?;
+            let mut progress = |line: String| {
+                log.lock().unwrap().push(line);
             };
+            update::perform(&release, &dest, &plan, &mut progress).await
+        }));
+    }
+
+    /// Collect the result of a finished update task, if any.
+    async fn poll_update_task(&mut self) {
+        let finished = matches!(&self.update_task, Some(h) if h.is_finished());
+        if !finished {
             return;
         }
-
-        let mut message = format!("installed {} to {}", release.tag, dest.display());
-        if self.config.update.restart_service {
-            let unit = self.config.update.service_name.clone();
-            if update::service_is_active(&unit).await {
-                match update::restart_service(&unit).await {
-                    Ok(()) => message.push_str(&format!("; restarted {unit}")),
-                    Err(e) => {
-                        self.update = UpdateState::Failed {
-                            error: format!("installed, but restarting {unit} failed: {e:#}"),
-                        };
-                        return;
-                    }
-                }
-            } else {
-                message.push_str(&format!("; {unit} is not active, nothing restarted"));
-            }
-        }
-        self.update = UpdateState::Done { message };
+        let Some(handle) = self.update_task.take() else {
+            return;
+        };
+        self.update = match handle.await {
+            Ok(Ok(outcome)) => UpdateState::Done {
+                message: outcome.summary(),
+            },
+            Ok(Err(e)) => UpdateState::Failed {
+                error: format!("{e:#}"),
+            },
+            Err(e) => UpdateState::Failed {
+                error: format!("the update task panicked: {e}"),
+            },
+        };
     }
 
     fn dismiss_update(&mut self) {
+        if self.update_task.is_some() {
+            // Never abandon a half-done install by dismissing its modal.
+            return;
+        }
         self.update = UpdateState::Idle;
     }
 
@@ -286,9 +336,10 @@ impl App {
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     config: Config,
+    config_path: PathBuf,
     initial: ControlSnapshot,
 ) -> Result<()> {
-    let mut app = App::new(config, initial);
+    let mut app = App::new(config, config_path, initial);
     app.refresh().await;
 
     let tick = Duration::from_millis(1500);
@@ -296,12 +347,20 @@ async fn run_app(
     loop {
         terminal.draw(|f| draw(f, &app))?;
 
-        let remaining = tick.saturating_sub(app.last_refresh.elapsed());
-        if event::poll(remaining.max(Duration::from_millis(50)))?
+        // Poll more often while an update is running so its progress lines
+        // appear as they happen.
+        let poll_for = if app.update_task.is_some() {
+            Duration::from_millis(250)
+        } else {
+            tick.saturating_sub(app.last_refresh.elapsed())
+        };
+        if event::poll(poll_for.max(Duration::from_millis(50)))?
             && let Event::Key(k) = event::read()?
         {
             handle_key(&mut app, k).await;
         }
+
+        app.poll_update_task().await;
 
         if app.last_refresh.elapsed() >= tick {
             app.refresh().await;
@@ -330,15 +389,15 @@ async fn handle_key(app: &mut App, key: KeyEvent) {
         match app.update.clone() {
             UpdateState::Available { .. } => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    app.apply_update().await;
+                    app.apply_update();
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
                     app.dismiss_update();
                 }
                 _ => {}
             },
-            // Checking / Installing are not interruptible: they run inline,
-            // so by the time a key is read the operation has finished.
+            // Checking runs inline; Installing runs in its own task and
+            // must not be dismissed halfway through.
             UpdateState::Checking | UpdateState::Installing { .. } => {}
             UpdateState::UpToDate { .. }
             | UpdateState::Done { .. }
@@ -390,24 +449,161 @@ async fn handle_key(app: &mut App, key: KeyEvent) {
 }
 
 fn draw(f: &mut ratatui::Frame, app: &App) {
+    let events_h = 2 + (app.events.len().clamp(1, 5) as u16);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(4),
             Constraint::Length(9),
             Constraint::Length(3 + app.snapshot.providers.len() as u16),
+            Constraint::Length(events_h),
             Constraint::Min(6),
             Constraint::Length(3),
         ])
         .split(f.area());
 
-    draw_system(f, chunks[0], app);
-    draw_providers(f, chunks[1], app);
-    draw_traffic(f, chunks[2], app);
-    draw_footer(f, chunks[3], app);
+    draw_gateway(f, chunks[0], app);
+    draw_system(f, chunks[1], app);
+    draw_providers(f, chunks[2], app);
+    draw_events(f, chunks[3], app);
+    draw_traffic(f, chunks[4], app);
+    draw_footer(f, chunks[5], app);
 
     if app.update_modal_open() {
         draw_update_modal(f, f.area(), app);
     }
+}
+
+/// The one-glance panel: what is carrying traffic right now, whether that
+/// is a verified choice or one inherited from the routing table at startup,
+/// the pin, the failback countdown, and what the kernel itself says.
+fn draw_gateway(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let s = &app.snapshot;
+    let daemon_version = if s.version.is_empty() {
+        "?".to_string()
+    } else {
+        s.version.clone()
+    };
+    let uptime = s
+        .started_at
+        .map(|t| {
+            let secs = (chrono::Utc::now() - t).num_seconds().max(0) as u64;
+            fmt_duration(secs)
+        })
+        .unwrap_or_else(|| "?".into());
+    let title = format!(
+        " gateway · daemon v{daemon_version} up {uptime} · tui v{} ",
+        update::current_version()
+    );
+
+    let mut line1: Vec<Span> = vec![Span::styled("active ", Style::default().fg(Color::Gray))];
+    match &s.active {
+        Some(a) => {
+            line1.push(Span::styled(
+                a.clone(),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            if s.active_adopted {
+                line1.push(Span::styled(
+                    "  (adopted from the routing table — verifying)",
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+        }
+        None => line1.push(Span::styled(
+            "none yet",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )),
+    }
+    line1.push(Span::raw("   "));
+    line1.push(Span::styled("pin ", Style::default().fg(Color::Gray)));
+    match &s.forced {
+        Some(p) => line1.push(Span::styled(
+            format!("📌 {p}"),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        )),
+        None => line1.push(Span::styled("auto", Style::default().fg(Color::DarkGray))),
+    }
+    if let Some(fb) = &s.failback_pending {
+        let left = fb.required_secs.saturating_sub(fb.stable_for_secs);
+        line1.push(Span::raw("   "));
+        line1.push(Span::styled(
+            format!(
+                "failback → {} in {}s ({}/{}s stable)",
+                fb.candidate, left, fb.stable_for_secs, fb.required_secs
+            ),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+
+    let line2 = Line::from(vec![
+        Span::styled("kernel ", Style::default().fg(Color::Gray)),
+        Span::styled(
+            s.kernel_route
+                .clone()
+                .unwrap_or_else(|| "(no default route)".into()),
+            Style::default().fg(Color::White),
+        ),
+    ]);
+
+    let block = Block::default().borders(Borders::ALL).title(title);
+    f.render_widget(
+        Paragraph::new(vec![Line::from(line1), line2]).block(block),
+        area,
+    );
+}
+
+/// Recent failovers, newest first: the answer to "what happened last night".
+fn draw_events(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" recent events ");
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let lines: Vec<Line> = if app.events.is_empty() {
+        vec![Line::from(Span::styled(
+            "(no failover events recorded)",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        app.events
+            .iter()
+            .take(5)
+            .map(|e| {
+                let when = chrono::DateTime::parse_from_rfc3339(&e.ts)
+                    .map(|t| {
+                        t.with_timezone(&chrono::Local)
+                            .format("%m-%d %H:%M:%S")
+                            .to_string()
+                    })
+                    .unwrap_or_else(|_| e.ts.clone());
+                let from = e.from.as_deref().unwrap_or("—");
+                let head = format!("{when}  {from} → {}  ", e.to);
+                let room = inner_w.saturating_sub(head.chars().count());
+                Line::from(vec![
+                    Span::styled(when.clone(), Style::default().fg(Color::DarkGray)),
+                    Span::raw("  "),
+                    Span::styled(from.to_string(), Style::default().fg(Color::Yellow)),
+                    Span::raw(" → "),
+                    Span::styled(
+                        e.to.clone(),
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(
+                        truncate(&e.reason, room.max(8)),
+                        Style::default().fg(Color::Gray),
+                    ),
+                ])
+            })
+            .collect()
+    };
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// Cut a string to `max` characters, adding an ellipsis. Operates on chars,
@@ -487,36 +683,48 @@ fn draw_update_modal(f: &mut ratatui::Frame, area: Rect, app: &App) {
             ],
             Color::Green,
         ),
-        UpdateState::Installing { tag } => (
-            " installing ",
-            vec![
-                Line::from(format!("Installing {tag}...")),
-                Line::from(""),
-                Line::from("Downloading, verifying the checksum, swapping the binary."),
-                Line::from("Do not interrupt."),
-            ],
-            Color::Cyan,
-        ),
-        UpdateState::Done { message } => (
-            " update complete ",
-            vec![
-                Line::from(truncate(message, 90)),
-                Line::from(""),
-                Line::from("Press any key."),
-            ],
-            Color::Green,
-        ),
-        UpdateState::Failed { error } => (
-            " update failed ",
-            vec![
-                Line::from("Nothing was changed."),
-                Line::from(""),
-                Line::from(truncate(error, 180)),
-                Line::from(""),
-                Line::from("Press any key."),
-            ],
-            Color::Red,
-        ),
+        UpdateState::Installing { tag } => {
+            let mut body = vec![Line::from(format!("Installing {tag}... do not interrupt."))];
+            body.push(Line::from(""));
+            let log = app.update_log.lock().unwrap();
+            let start = log.len().saturating_sub(8);
+            for line in log.iter().skip(start) {
+                body.push(Line::from(vec![
+                    Span::styled("  · ", Style::default().fg(Color::Cyan)),
+                    Span::raw(truncate(line, 76)),
+                ]));
+            }
+            if log.is_empty() {
+                body.push(Line::from("  · querying GitHub..."));
+            }
+            (" installing ", body, Color::Cyan)
+        }
+        UpdateState::Done { message } => {
+            let mut body: Vec<Line> = message
+                .lines()
+                .map(|l| Line::from(truncate(l, 78)))
+                .collect();
+            body.push(Line::from(""));
+            body.push(Line::from("Press any key."));
+            (" update complete ", body, Color::Green)
+        }
+        UpdateState::Failed { error } => {
+            // The message says whether anything changed and whether a
+            // rollback happened; do not assert either here.
+            let mut body: Vec<Line> = Vec::new();
+            for para in error.split('\n') {
+                let mut rest = para;
+                while !rest.is_empty() {
+                    let take: String = rest.chars().take(78).collect();
+                    body.push(Line::from(take.clone()));
+                    rest = &rest[take.len()..];
+                }
+            }
+            body.truncate(12);
+            body.push(Line::from(""));
+            body.push(Line::from("Press any key."));
+            (" update failed ", body, Color::Red)
+        }
     };
 
     let height = (body.len() as u16 + 4).min(area.height);
@@ -768,6 +976,8 @@ fn draw_providers(f: &mut ratatui::Frame, area: Rect, app: &App) {
         Cell::from("iface"),
         Cell::from("latency"),
         Cell::from("canary"),
+        Cell::from("speed"),
+        Cell::from("up for"),
         Cell::from("last check"),
         Cell::from("why"),
     ])
@@ -808,6 +1018,28 @@ fn draw_providers(f: &mut ratatui::Frame, area: Rect, app: &App) {
                 (true, false) => Cell::from("FAIL")
                     .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
             };
+            // The throughput floor: the layer that sees a link which is
+            // reachable, authentic and useless.
+            let speed_cell = match (p.last_throughput_at.is_some(), p.throughput_ok) {
+                (false, _) => Cell::from("-").style(Style::default().fg(Color::DarkGray)),
+                (true, true) => {
+                    let short = p
+                        .last_throughput_summary
+                        .as_deref()
+                        .and_then(|s| s.split(" (").next())
+                        .map(|s| s.replace(" kbit/s", "k"))
+                        .unwrap_or_else(|| "ok".into());
+                    Cell::from(truncate(&short, 9)).style(Style::default().fg(Color::Green))
+                }
+                (true, false) => Cell::from("SLOW")
+                    .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            };
+            let up_for = match (p.state, p.up_since) {
+                (State::Up, Some(t)) => {
+                    fmt_duration((chrono::Utc::now() - t).num_seconds().max(0) as u64)
+                }
+                _ => "-".into(),
+            };
             let why = p
                 .failure_layer
                 .map(|l| l.as_str().to_string())
@@ -829,6 +1061,8 @@ fn draw_providers(f: &mut ratatui::Frame, area: Rect, app: &App) {
                 Cell::from(p.interface.clone()),
                 Cell::from(latency),
                 canary_cell,
+                speed_cell,
+                Cell::from(up_for),
                 Cell::from(last),
                 why_cell,
             ]);
@@ -850,12 +1084,17 @@ fn draw_providers(f: &mut ratatui::Frame, area: Rect, app: &App) {
         Constraint::Length(8),
         Constraint::Length(16),
         Constraint::Length(10),
-        Constraint::Length(12),
+        Constraint::Length(11),
+        Constraint::Length(7),
         Constraint::Length(10),
+        Constraint::Length(9),
+        Constraint::Length(10),
+        Constraint::Min(12),
     ];
     let title = match &app.snapshot.active {
-        Some(a) => format!(" vlb — active: {a} "),
-        None => " vlb — no active provider ".into(),
+        Some(a) if app.snapshot.active_adopted => format!(" providers — active: {a} (verifying) "),
+        Some(a) => format!(" providers — active: {a} "),
+        None => " providers — no active provider ".into(),
     };
     let table = Table::new(rows, widths)
         .header(header)
@@ -1052,11 +1291,14 @@ fn fmt_duration(secs: u64) -> String {
     let days = secs / 86_400;
     let hours = (secs % 86_400) / 3_600;
     let minutes = (secs % 3_600) / 60;
+    let seconds = secs % 60;
     if days > 0 {
         format!("{days}d {hours}h{minutes:02}m")
     } else if hours > 0 {
         format!("{hours}h{minutes:02}m")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
     } else {
-        format!("{minutes}m")
+        format!("{seconds}s")
     }
 }

@@ -20,10 +20,11 @@ installs the highest-priority healthy one as the kernel default route,
 flushes conntrack on switch, and ships a TUI / control protocol / SQLite
 stats so you can actually see what's happening.
 
-> **Status:** `0.2.1`. Runs in production, and the failover behaviour is
-> covered by a docker lab that breaks the network eight different ways on
-> every CI run. Still pre-1.0: config keys can change between minor versions,
-> and `vlb check` will tell you when they do.
+> **Status:** `0.3.0`. Runs in production, and the failover behaviour is
+> covered by a docker lab that breaks the network eight different ways — and
+> restarts the daemon under it three more — on every CI run. Still pre-1.0:
+> config keys can change between minor versions, and `vlb check` will tell
+> you when they do.
 
 ---
 
@@ -89,6 +90,16 @@ fast, and gives you a real dashboard.
   them — failback to the primary actually works.
 * **Conntrack flush on every switchover** so live flows reset
   immediately instead of black-holing until TCP timeout.
+* **Restarts and updates do not interrupt traffic.** Nothing is torn down
+  on shutdown, and the next instance *adopts* the default route it finds
+  rather than choosing afresh: the incumbent keeps carrying traffic until
+  this process has probed it to a verdict of its own. No route change, no
+  conntrack flush, no thirty-second detour through the backup because its
+  probes happened to finish first. The operator's pin and the flap history
+  survive the restart too.
+* **Starts even when an uplink's interface is not there yet.** A provider
+  whose NIC is late to appear at boot (or gone) is reported down and
+  retried every health interval; the others are managed normally.
 * **Force / auto control** via TCP control socket (and TUI hotkey `f`):
   pin a specific provider as long as you like; pin survives even when
   the pinned provider is briefly Down (we serve the best healthy one
@@ -117,26 +128,38 @@ curl -fsSL https://raw.githubusercontent.com/DenisHumen/vlb-Virtual-Load-Balance
 
 Safe to re-run: it is the update path as well as the install path. Your
 `/etc/vlb/vlb.toml` is never overwritten. If the new build rejects your config,
-or the service fails to come back, it rolls back to the previous binary and
-tells you why.
+cannot reach the canary targets, or the service fails to come back, it rolls
+back to the previous binary — and the previous unit — and tells you why.
+
+The restart in the middle does not interrupt traffic. The old daemon leaves
+its routes in place and the new one adopts them, re-verifying the active
+provider with its own probes before it will consider moving anything. The
+installer waits for that verification and reports `carrying traffic via:
+isp-main (verified by the new build)`.
 
 It adopts whatever is already there. If a `vlb` systemd unit exists, the
 installer reads its `ExecStart` and updates *that* binary with *that* config
 — so a box running out of `/opt/vlb` with its config beside it is updated in
 place, rather than having a second copy quietly installed at the default
-paths while the running one stays stale.
+paths while the running one stays stale. A stock unit file is upgraded along
+with the binary (the previous one is kept as `vlb.service.bak`); a unit you
+edited by hand is left alone with a note. Put local changes in a drop-in
+(`sudo systemctl edit vlb`) and they survive every update.
 
 On a machine with no existing config it installs the annotated example and
 stops short of starting the service, so it cannot bring up a gateway pointed
 at example addresses.
 
-Once installed, the box can update itself:
+Once installed, the box can update itself with exactly the same safety net:
 
 ```bash
 sudo vlb update
 ```
 
-…or from the dashboard (`sudo vlb tui`), press `u`.
+…or from the dashboard (`sudo vlb tui`), press `u`. Both run the new build's
+`check` against your config, run its `probe` to confirm the canary quorum is
+reachable, swap the binary, restart the service, wait for the daemon to
+answer, and roll back if it does not.
 
 <details>
 <summary>Options</summary>
@@ -150,7 +173,7 @@ sudo vlb update
 | `VLB_REPO`     | Pull from a fork                                 |
 
 ```bash
-curl -fsSL .../install.sh | sudo VLB_VERSION=v0.1.0 bash
+curl -fsSL .../install.sh | sudo VLB_VERSION=v0.2.1 bash
 ```
 </details>
 
@@ -195,14 +218,33 @@ sudo ./scripts/vlb.sh install-service
 #   enables and starts the unit.
 
 # Operate via systemd
-sudo systemctl status vlb
+sudo systemctl status vlb        # one-line summary: active provider, per-provider state, pin
 sudo journalctl -u vlb -f
-sudo systemctl restart vlb
+sudo systemctl restart vlb       # traffic keeps flowing; the route is adopted, not re-chosen
 
 # Or talk to the running daemon directly
 vlb --config /etc/vlb/vlb.toml status
 vlb --config /etc/vlb/vlb.toml tui
 vlb --config /etc/vlb/vlb.toml stats --hours 24
+```
+
+The unit is written for a gateway, and the choices are deliberate:
+
+| Setting                         | Why                                                                 |
+|---------------------------------|---------------------------------------------------------------------|
+| `After=network.target`          | *not* `network-online.target`: that one waits for every uplink, so a dead ISP at boot would delay the failover daemon by up to two minutes |
+| `StartLimitIntervalSec=0`       | systemd's default gives up after five failures in ten seconds; a gateway daemon is never given up on |
+| `Restart=always`, `RestartSec=2`| any exit — clean or not — is followed by a restart, and the routes it left are adopted |
+| `Type=exec`                     | `systemctl start` fails if the binary cannot be executed, instead of reporting success |
+| `NotifyAccess=main`             | the daemon writes its status line into `systemctl status` |
+| `OOMScoreAdjust=-900`           | the process routing the site is the last one the OOM killer should pick |
+| `ProtectSystem=full` + `ReadWritePaths=-/etc/sysctl.d` | hardening, with the one write the daemon needs: persisting `ip_forward=1` so forwarding is on from early boot |
+
+To change anything, use a drop-in rather than editing the file — the
+installer upgrades the stock unit on update and leaves an edited one alone:
+
+```bash
+sudo systemctl edit vlb      # e.g. [Service] Environment=RUST_LOG=debug
 ```
 
 Uninstall with `sudo ./scripts/vlb.sh uninstall-service` (keeps
@@ -454,8 +496,14 @@ vlb stats  [--config <path>] [--hours N] [--recent N]
 vlb system [--config <path>] [--recent N]
 vlb diag   [--config <path>]                # interfaces, DB, ports
 vlb probe  [--config <path>] [--provider <name>] [--repeat N]
-vlb update [--config <path>] [--check] [--pre] [--yes] [--force]
+vlb update [--config <path>] [--check] [--pre] [--yes] [--force] [--skip-probe]
 ```
+
+`vlb status` is JSON, meant for scripts. Besides the per-provider table it
+carries `active`, `forced` (the pin), `active_adopted` (the route was taken
+over at startup and the new process has not confirmed its provider yet),
+`kernel_route` (what the kernel actually has), `failback_pending` (the
+countdown, if one is running), `version` and `started_at`.
 
 ### `vlb probe` — size your timeouts from measurements
 
@@ -480,11 +528,26 @@ sudo vlb --config /etc/vlb/vlb.toml update --check   # look, change nothing
 sudo vlb --config /etc/vlb/vlb.toml update           # install, with a prompt
 ```
 
-Downloads the release asset for this host's architecture from GitHub,
-verifies it against the published SHA-256, proves the new binary runs
-(`--version`) *before* replacing the old one, keeps the previous binary as
-`vlb.bak`, and restarts the systemd unit. The same flow is on the TUI's `u`
-key.
+In order, and nothing on the box changes until step 4 has passed:
+
+1. downloads the release asset for this host's architecture and verifies it
+   against the published SHA-256;
+2. proves the new binary runs here (`--version`);
+3. runs the new binary's `check` against the config in use — a release that
+   tightened validation is caught while the working binary is still in
+   place, not after the restart with the gateway down;
+4. runs the new binary's `probe` and refuses to continue if the canary
+   quorum cannot be met through any provider, since restarting into that
+   would switch automatic failover off (`--skip-probe` overrides);
+5. swaps the binary atomically, keeping the previous one as `vlb.bak`;
+6. restarts the unit and waits for the daemon to answer on its control
+   socket. If the service dies, the previous binary is put back and
+   restarted.
+
+The restart itself does not touch the routing table: the new daemon adopts
+the route the old one left and re-verifies its provider before it would
+move anything. The same flow is on the TUI's `u` key, with progress shown
+while it runs.
 
 ---
 
@@ -500,6 +563,15 @@ key.
 | `r`     | Force redraw                              |
 | `u`     | Check for a new release and install it    |
 | `q`     | Quit                                      |
+
+Top to bottom: the **gateway** panel (active provider and whether it is
+verified or still adopted from the routing table, the pin, the failback
+countdown, the kernel's own default route, daemon version and uptime), host
+metrics, the **providers** table (state, latency, canary, throughput, how
+long each has been up, and *why* one is down), **recent events** — every
+switchover with its timestamp and reason — and the traffic chart for the
+selected provider. The TUI keeps running through a daemon restart and says
+so when the daemon is back.
 
 ---
 
@@ -536,6 +608,10 @@ so live flows reset and reconnect.
 | **Hostname resolves into RFC1918 / CGNAT space**      | **canary rejects the answer before even connecting** |
 | External tool replaces our default route (DHCP renew) | route watchdog re-installs it |
 | A provider that keeps bouncing up and down            | failback stability window + flap backoff |
+| **Daemon restart / update while traffic is flowing**  | **the installed route is adopted and kept until its provider has a verdict; no flush, no detour through the backup; the pin and the flap history are persisted** |
+| **An uplink's interface absent at boot**              | **that provider is retried every health interval; the daemon starts and manages the rest** |
+| The watchdog ticking in the middle of a switchover    | serialised on the same lock, so it cannot re-install the route just left |
+| Crash loop at boot                                    | `StartLimitIntervalSec=0`, `Restart=always` — systemd never gives up on the gateway |
 
 ---
 
@@ -579,21 +655,28 @@ Each ISP can be switched between failure modes at runtime:
 | Mode          | What it simulates                                                    |
 |---------------|----------------------------------------------------------------------|
 | `good`        | everything works                                                     |
+| `slow`        | everything works, 60 ms further away — a healthy uplink whose probes finish *later* than the other's |
 | `dead`        | the router is gone — even the next-hop ping fails                    |
 | `blackhole`   | answers pings, forwards nothing (defeats naive gateway checks)       |
 | `lossy`       | 60% packet loss                                                      |
 | `throttled`   | **link up, everything reachable, capped at 64 kbit/s** — only the throughput floor can see it |
-
-Beyond the per-provider fault modes, the suite also covers the operational
-cases that break gateways in the field: competing default routes from
-netplan/networkd, a missing `conntrack`, operator `force`/`auto` racing a
-switchover, a daemon restart on a healthy gateway, and a soak that runs six
-full failover/failback cycles and then checks the daemon has not grown.
-61 assertions in 18 scenarios, all on Ubuntu 24.04.
 | `dns-blocked` | ICMP fine, UDP/53 dropped                                            |
 | `portal-http` | **transparent HTTP proxy with DNS left completely honest** — every layer except the content check passes, so only the canary can see it |
 | `expired`     | **unpaid account: DNS hijacked to a portal, HTTP answered by a billing page, ICMP left working** |
 | `mitm`        | as `expired`, plus TLS interception with a forged certificate        |
+
+Beyond the per-provider fault modes, the suite also covers the operational
+cases that break gateways in the field: competing default routes from
+netplan/networkd, a missing `conntrack`, operator `force`/`auto` racing a
+switchover, a soak that runs six full failover/failback cycles and then
+checks the daemon has not grown — and the restart, four ways. The daemon
+process is killed and restarted in place (what an update and `Restart=always`
+do) on a healthy gateway whose primary is *slower* than its backup, while
+failed over to the backup, and with an operator pin in place; the container
+is restarted outright for the reboot case; and it is brought up with a
+provider on an interface that does not exist. In every one the route must not
+move, no switchover may be logged, the pin must come back, and client traffic
+must keep flowing. 85 assertions in 22 scenarios, all on Ubuntu 24.04.
 
 `expired` and `portal-http` are the two that matter. `expired` is the full
 production symptom. `portal-http` is the stricter test: it leaves DNS entirely
@@ -695,9 +778,21 @@ things differ from older releases and all three are handled:
 A `netplan apply` or a DHCP renewal that replaces our route outright is
 reclaimed within one `route_watchdog_secs` period.
 
+* **systemd 255.** The unit relies on `StartLimitIntervalSec=` in `[Unit]`,
+  `Type=exec` and `ReadWritePaths=-…`, all of which have been there for years;
+  `systemctl status vlb` shows the daemon's own status line (active provider,
+  per-provider state, pin) via `NotifyAccess=main`.
+
 ---
 
 ## Troubleshooting
+
+**`vlb status` says `"active_adopted": true` / the TUI says "adopted — verifying".**  
+Normal for a few seconds after a restart: the daemon took over the route it
+found in the kernel and is confirming that provider with its own probes
+(`success_threshold` rounds). Traffic is flowing the whole time. If it stays
+that way, the adopted provider is not passing its checks *and* nothing else
+is healthy either — run `vlb probe`.
 
 **Port already in use on start.**  
 Another `vlb` is alive (systemd unit, leftover daemon, etc). Stop it
@@ -746,7 +841,14 @@ raise `canary.timeout_ms` — `vlb probe --repeat 5` prints a suggested value.
 **Failback to the primary is slower than expected.**  
 By design: `failback_stable_secs` (30 s default) plus flap backoff. If the
 primary has been bouncing, the wait doubles for each extra switch inside
-`flap_window_secs`. `RUST_LOG=debug` logs the countdown on every tick.
+`flap_window_secs`. `RUST_LOG=debug` logs the countdown on every tick, and
+the TUI's gateway panel shows it. The flap history is persisted, so a restart
+does not reset the backoff.
+
+**`vlb force` was undone.**  
+Not by a restart — the pin is persisted and restored (`operator pin restored`
+in the journal). Check `vlb status` for `forced`; `vlb auto` is the only thing
+that clears it, and that is persisted too.
 
 **`ping: invalid argument: '0x200'`.**  
 `iputils-ping`'s `-m` takes decimal. Inside the daemon we always pass
@@ -802,7 +904,8 @@ runs as root. If you're running by hand, prefix with `sudo`.
     │   └── traffic.rs        # /proc/net/dev sampling
     ├── obs/
     │   ├── logger.rs         # tracing setup
-    │   ├── stats.rs          # SQLite schema, queries, retention
+    │   ├── notify.rs         # sd_notify without libsystemd (status line in systemctl)
+    │   ├── stats.rs          # SQLite schema, queries, retention, persisted pin
     │   └── sysmon.rs         # host metric sampling
     └── ui/
         ├── control.rs        # tiny line-delimited JSON control protocol

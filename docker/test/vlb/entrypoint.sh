@@ -1,6 +1,6 @@
 #!/bin/bash
 # Start vlb inside the test lab.
-set -euo pipefail
+set -uo pipefail
 
 # Docker gives this container a default route to the host, which would let
 # every probe reach the real internet and make all the fault scenarios pass
@@ -14,4 +14,31 @@ done
 echo "[vlb-test] docker default route removed; vlb now owns the default route"
 
 ip -brief addr show
-exec /usr/local/bin/vlb --config /etc/vlb/vlb.toml "${@:-run}"
+
+CONFIG="${VLB_CONFIG:-/etc/vlb/vlb.toml}"
+
+# Supervise the daemon rather than exec into it. The restart scenarios kill
+# the daemon process and expect it back in the *same* network namespace —
+# with the routes, rules and NAT it left behind — exactly as systemd's
+# Restart=always does on a real box. Restarting the container instead would
+# tear the namespace down and take every route with it; that is the reboot
+# case, and it is tested separately.
+child=0
+forward() {
+    if [ "$child" -gt 0 ]; then
+        kill -TERM "$child" 2>/dev/null
+        wait "$child" 2>/dev/null
+    fi
+    exit 0
+}
+trap forward TERM INT
+
+while :; do
+    /usr/local/bin/vlb --config "$CONFIG" "${@:-run}" &
+    child=$!
+    wait "$child"
+    code=$?
+    child=0
+    echo "[vlb-test] vlb exited with status $code; restarting in 1s (as Restart=always would)"
+    sleep 1
+done

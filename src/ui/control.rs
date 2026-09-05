@@ -70,10 +70,19 @@ pub enum Request {
         #[serde(default = "default_limit")]
         limit: u32,
     },
+    /// Recent failover events, newest first — the "what happened" panel.
+    Events {
+        #[serde(default = "default_events_limit")]
+        limit: u32,
+    },
 }
 
 fn default_limit() -> u32 {
     120
+}
+
+fn default_events_limit() -> u32 {
+    20
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -83,7 +92,16 @@ pub enum Response {
     Ok { message: String },
     Traffic { points: Vec<TrafficPointWire> },
     System { points: Vec<SystemPointWire> },
+    Events { events: Vec<FailoverEventWire> },
     Error { error: String },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FailoverEventWire {
+    pub ts: String,
+    pub from: Option<String>,
+    pub to: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -103,11 +121,34 @@ pub struct SystemPointWire {
 }
 
 pub async fn serve(listen: String, balancer: Arc<Balancer>, mut shutdown: watch::Receiver<bool>) {
-    let listener = match TcpListener::bind(&listen).await {
-        Ok(l) => l,
-        Err(e) => {
-            error!(addr = %listen, error = %e, "control server: bind failed");
-            return;
+    // Retry the bind for a while rather than giving up on the first
+    // failure. Right after a restart the previous instance's socket can
+    // still be in the middle of closing, and a daemon that silently runs
+    // without its control socket is unmanageable: `vlb status`, the TUI
+    // and the installer's post-restart check all go dark.
+    let mut attempt = 0u32;
+    let listener = loop {
+        match TcpListener::bind(&listen).await {
+            Ok(l) => break l,
+            Err(e) if attempt < 15 => {
+                attempt += 1;
+                warn!(addr = %listen, error = %e, attempt, "control server: bind failed; retrying");
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() { return; }
+                    }
+                }
+            }
+            Err(e) => {
+                error!(
+                    addr = %listen,
+                    error = %e,
+                    "control server: bind failed repeatedly — is another vlb running? \
+                     The daemon continues, but `vlb status` and the TUI cannot reach it"
+                );
+                return;
+            }
         }
     };
     info!(addr = %listen, "control server listening");
@@ -253,6 +294,22 @@ async fn dispatch(req: Request, balancer: &Arc<Balancer>) -> Response {
                 error: e.to_string(),
             },
         },
+        Request::Events { limit } => match balancer.recent_failovers(limit) {
+            Ok(events) => Response::Events {
+                events: events
+                    .into_iter()
+                    .map(|e| FailoverEventWire {
+                        ts: e.ts.to_rfc3339(),
+                        from: e.from_provider,
+                        to: e.to_provider,
+                        reason: e.reason,
+                    })
+                    .collect(),
+            },
+            Err(e) => Response::Error {
+                error: e.to_string(),
+            },
+        },
     }
 }
 
@@ -308,6 +365,10 @@ impl Serialize for Request {
             Request::Traffic { provider, limit } => {
                 m.serialize_entry("op", "traffic")?;
                 m.serialize_entry("provider", provider)?;
+                m.serialize_entry("limit", limit)?;
+            }
+            Request::Events { limit } => {
+                m.serialize_entry("op", "events")?;
                 m.serialize_entry("limit", limit)?;
             }
         }

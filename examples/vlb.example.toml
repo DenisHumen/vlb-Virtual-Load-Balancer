@@ -197,7 +197,11 @@ interval_secs = 2
 retention_hours = 72
 per_core = true
 
-# Used by `vlb update` and by the TUI's `u` key.
+# Used by `vlb update` and by the TUI's `u` key. Before the binary is
+# replaced, the new build must run here, accept this config (`check`) and
+# reach the canary targets (`probe`); after the restart the service must
+# answer on `control.listen`, or the previous binary is put back. The restart
+# does not interrupt traffic: the new daemon adopts the installed route.
 [update]
 repo = "DenisHumen/vlb-Virtual-Load-Balancer"
 allow_prerelease = false

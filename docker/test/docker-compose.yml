@@ -123,8 +123,14 @@ services:
       # debug so the lab can assert on decisions the daemon logs at that
       # level (failback countdown, conntrack-flush skip).
       RUST_LOG: ${VLB_LOG:-info,vlb=debug}
+      # Which config the entrypoint starts the daemon with. The harness
+      # overrides this to bring the container up with a variant config
+      # (a provider on an interface that does not exist, for instance).
+      VLB_CONFIG: ${VLB_CONFIG:-/etc/vlb/vlb.toml}
     volumes:
       - ./vlb.test.toml:/etc/vlb/vlb.toml:ro
+      # Variant configs the harness generates at startup.
+      - ./generated:/etc/vlb/generated:ro
     networks:
       edge:
         ipv4_address: 10.77.0.100

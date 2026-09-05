@@ -161,10 +161,284 @@ pub async fn check(repo: &str, allow_prerelease: bool) -> Result<ReleaseInfo> {
     })
 }
 
-/// Download, verify, and install `release`, replacing the running binary.
+/// Everything `perform` needs beyond the release itself.
+#[derive(Debug, Clone)]
+pub struct Plan {
+    /// The config the new build must accept, and probe with.
+    pub config_path: PathBuf,
+    /// Where the daemon's control socket listens — polled after the restart
+    /// to confirm the new build is actually serving.
+    pub control_listen: String,
+    pub service: String,
+    pub restart_service: bool,
+    /// Skip the canary reachability pre-flight.
+    pub skip_preflight: bool,
+}
+
+/// What an update did.
+#[derive(Debug, Clone)]
+pub struct Outcome {
+    pub tag: String,
+    pub path: PathBuf,
+    pub restarted: bool,
+    /// Provider carrying traffic after the restart, when the daemon could be
+    /// asked; `adopted` means it was taken over from the routing table and
+    /// is still being verified.
+    pub active: Option<String>,
+    pub active_adopted: bool,
+    pub notes: Vec<String>,
+}
+
+impl Outcome {
+    pub fn summary(&self) -> String {
+        let mut s = format!("vlb {} installed at {}", self.tag, self.path.display());
+        if self.restarted {
+            match &self.active {
+                Some(a) if self.active_adopted => s.push_str(&format!(
+                    "; the service is back and carrying traffic via {a} (route adopted from the \
+                     previous run, verification in progress)"
+                )),
+                Some(a) => s.push_str(&format!(
+                    "; the service is back and carrying traffic via {a}"
+                )),
+                None => s.push_str("; the service is back"),
+            }
+        }
+        for n in &self.notes {
+            s.push_str("\nnote: ");
+            s.push_str(n);
+        }
+        s
+    }
+}
+
+/// Download, verify, prove, install and restart — with a way back.
 ///
-/// Returns the path that was replaced.
-pub async fn install(release: &ReleaseInfo, dest: &Path) -> Result<PathBuf> {
+/// The order is the point. Nothing on the box changes until the new build
+/// has (1) been checksum-verified, (2) executed on this machine, (3) accepted
+/// the config that is actually in use, and (4) — unless skipped — reached
+/// the canary targets through at least one provider, since restarting into a
+/// config whose canary cannot verify anything would leave the gateway with
+/// automatic failover switched off. After the swap the service must come
+/// back, or the previous binary is restored and restarted.
+///
+/// `progress` receives one line per step, for the CLI to print and the TUI
+/// to show.
+pub async fn perform(
+    release: &ReleaseInfo,
+    dest: &Path,
+    plan: &Plan,
+    progress: &mut (dyn FnMut(String) + Send),
+) -> Result<Outcome> {
+    let dir = dest
+        .parent()
+        .ok_or_else(|| anyhow!("cannot determine the directory of {}", dest.display()))?;
+    // Say so before downloading anything, rather than after.
+    if dest.exists() {
+        let probe = dir.join(".vlb.update.probe");
+        match tokio::fs::write(&probe, b"").await {
+            Ok(()) => {
+                let _ = tokio::fs::remove_file(&probe).await;
+            }
+            Err(e) => bail!(
+                "{} is not writable ({e}) — run the update as root (sudo vlb update)",
+                dir.display()
+            ),
+        }
+    }
+
+    progress(format!(
+        "downloading {} ({})",
+        release.asset_name, release.tag
+    ));
+    let binary = fetch_verified_binary(release).await?;
+    progress("checksum verified, binary extracted".into());
+
+    // Stage next to the destination so the final rename is atomic — a
+    // cross-filesystem rename is not, and a half-written binary on a routing
+    // gateway is a very bad outcome.
+    let staged = dir.join(".vlb.update.new");
+    let backup = dir.join("vlb.bak");
+    tokio::fs::write(&staged, &binary)
+        .await
+        .with_context(|| format!("failed to write {}", staged.display()))?;
+    set_executable(&staged).await?;
+
+    // Everything from here until the rename must clean up the staged file on
+    // failure, so a refused update leaves no trace behind.
+    let discard = |staged: &Path| {
+        let _ = std::fs::remove_file(staged);
+    };
+
+    // ── prove the new binary actually runs, before committing to it ─────
+    let reported = verify_runnable(&staged)
+        .await
+        .inspect_err(|_| discard(&staged))?;
+    progress(format!("new binary runs on this host ({reported})"));
+
+    // ── the config in use must be accepted by the new build ─────────────
+    match validate_config_with(&staged, &plan.config_path).await {
+        Ok(()) => progress(format!(
+            "existing config {} validates against {}",
+            plan.config_path.display(),
+            release.tag
+        )),
+        Err(e) => {
+            discard(&staged);
+            bail!(
+                "the new build rejects the existing config — nothing was changed. \
+                 Fix {} and re-run:\n{e:#}",
+                plan.config_path.display()
+            );
+        }
+    }
+
+    // ── the canary must be reachable, or failover would be off ──────────
+    if plan.skip_preflight {
+        progress("canary pre-flight skipped (--skip-probe)".into());
+    } else {
+        progress(
+            "pre-flight: checking the canary can reach its targets (this takes a moment)".into(),
+        );
+        match preflight_canary(&staged, &plan.config_path).await {
+            Preflight::Met(via) => progress(format!("canary quorum met via {via}")),
+            Preflight::NotApplicable => progress("canary is disabled in this config".into()),
+            Preflight::NotMet(detail) => {
+                discard(&staged);
+                bail!(
+                    "the content canary did not meet its quorum through any provider. \
+                     Restarting now would mark every provider unhealthy and switch automatic \
+                     failover off, while the currently installed binary keeps working.\n\
+                     Nothing was changed. Either open egress to the canary targets, point \
+                     [[canary.targets]] at endpoints you can reach, lower `quorum`, or re-run \
+                     with --skip-probe if you know this is a false alarm.\n{detail}"
+                );
+            }
+            Preflight::Unknown(why) => {
+                progress(format!(
+                    "could not run the canary pre-flight ({why}); continuing"
+                ));
+            }
+        }
+    }
+
+    // ── commit ──────────────────────────────────────────────────────────
+    let was_active = plan.restart_service && service_is_active(&plan.service).await;
+
+    if dest.exists()
+        && let Err(e) = tokio::fs::copy(dest, &backup).await
+    {
+        warn!(error = %e, "could not save a backup of the current binary");
+    }
+    tokio::fs::rename(&staged, dest).await.with_context(|| {
+        format!(
+            "failed to replace {} — is it on the same filesystem as {}?",
+            dest.display(),
+            dir.display()
+        )
+    })?;
+    info!(path = %dest.display(), backup = %backup.display(), "binary replaced");
+    progress(format!(
+        "installed to {} (previous binary kept as {})",
+        dest.display(),
+        backup.display()
+    ));
+
+    let mut outcome = Outcome {
+        tag: release.tag.clone(),
+        path: dest.to_path_buf(),
+        restarted: false,
+        active: None,
+        active_adopted: false,
+        notes: Vec::new(),
+    };
+
+    if !plan.restart_service {
+        outcome.notes.push(
+            "update.restart_service = false — restart vlb yourself to use the new binary".into(),
+        );
+        return Ok(outcome);
+    }
+    if !was_active {
+        outcome.notes.push(format!(
+            "the `{}` service is not active, so nothing was restarted; the new binary is \
+             used on the next start",
+            plan.service
+        ));
+        return Ok(outcome);
+    }
+
+    // ── restart, and make sure it came back ─────────────────────────────
+    progress(format!(
+        "restarting {} (the default route stays in place; traffic keeps flowing)",
+        plan.service
+    ));
+    if let Err(e) = restart_service(&plan.service).await {
+        progress("restart failed — rolling back to the previous binary".into());
+        let rb = rollback(dest, &backup, &plan.service).await;
+        bail!(
+            "`systemctl restart {}` failed: {e:#}. {}",
+            plan.service,
+            describe_rollback(rb)
+        );
+    }
+    outcome.restarted = true;
+
+    // Wait for the daemon to be serving again, not merely for systemd to
+    // report the process started. The control socket answering means the
+    // new build got through its own startup — sysctls, NAT, routing tables,
+    // the adopted route — and is probing.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut answered = false;
+    while std::time::Instant::now() < deadline {
+        if !service_is_active(&plan.service).await {
+            progress("the service stopped after the restart — rolling back".into());
+            let rb = rollback(dest, &backup, &plan.service).await;
+            bail!(
+                "the `{}` service did not stay up on {} (see `journalctl -u {} -n 50`). {}",
+                plan.service,
+                release.tag,
+                plan.service,
+                describe_rollback(rb)
+            );
+        }
+        if let Ok(crate::control::Response::Status { snapshot }) =
+            crate::control::send(&plan.control_listen, &crate::control::Request::Status).await
+        {
+            answered = true;
+            outcome.active = snapshot.active.clone();
+            outcome.active_adopted = snapshot.active_adopted;
+            if !snapshot.version.is_empty()
+                && snapshot.version != release.tag.trim_start_matches('v')
+            {
+                outcome.notes.push(format!(
+                    "the daemon that answered reports version {} — expected {}",
+                    snapshot.version, release.tag
+                ));
+            }
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    if answered {
+        progress(match &outcome.active {
+            Some(a) => format!("the service is back; active provider: {a}"),
+            None => "the service is back; no provider selected yet".into(),
+        });
+    } else {
+        outcome.notes.push(format!(
+            "the service is active but its control socket at {} did not answer within 30s; \
+             check `journalctl -u {} -n 50`",
+            plan.control_listen, plan.service
+        ));
+    }
+
+    Ok(outcome)
+}
+
+/// Download the archive, verify it against the published checksum, and pull
+/// the `vlb` binary out of it. Nothing touches the disk.
+async fn fetch_verified_binary(release: &ReleaseInfo) -> Result<Vec<u8>> {
     info!(tag = %release.tag, asset = %release.asset_name, "downloading release");
     let archive = get_following_redirects(&release.archive_url, MAX_ASSET_BYTES)
         .await
@@ -208,48 +482,152 @@ pub async fn install(release: &ReleaseInfo, dest: &Path) -> Result<PathBuf> {
     if binary.is_empty() {
         bail!("the extracted binary is empty");
     }
+    Ok(binary)
+}
 
-    // Stage next to the destination so the final rename is atomic — a
-    // cross-filesystem rename is not, and a half-written binary on a routing
-    // gateway is a very bad outcome.
+/// Ask the *new* binary whether it accepts the config in use. A release that
+/// tightened validation must be caught while the working binary is still in
+/// place, not after the restart with the gateway down.
+async fn validate_config_with(binary: &Path, config: &Path) -> Result<()> {
+    let out = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::process::Command::new(binary)
+            .arg("--config")
+            .arg(config)
+            .arg("check")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow!("`check` did not finish within 30s"))?
+    .context("could not run the new binary's `check`")?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let text = if stderr.trim().is_empty() {
+        stdout
+    } else {
+        stderr
+    };
+    bail!(
+        "{}",
+        text.lines()
+            .filter(|l| !l.trim().is_empty())
+            .take(20)
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
+enum Preflight {
+    Met(String),
+    NotMet(String),
+    NotApplicable,
+    /// The probe could not run or its output has no verdict line (an older
+    /// build being installed for a rollback, say). Not evidence either way.
+    Unknown(String),
+}
+
+/// Run the new binary's `probe` and read its canary verdict.
+///
+/// `probe` needs the running daemon's fwmark rules, which is why this runs
+/// while the old daemon is still up. Read from the summary line the probe
+/// prints for exactly this purpose, with a fallback for builds that predate
+/// it.
+async fn preflight_canary(binary: &Path, config: &Path) -> Preflight {
+    let run = tokio::time::timeout(
+        Duration::from_secs(240),
+        tokio::process::Command::new(binary)
+            .arg("--config")
+            .arg(config)
+            .arg("probe")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
+    let out = match run {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => return Preflight::Unknown(format!("could not run probe: {e}")),
+        Err(_) => return Preflight::Unknown("probe did not finish within 240s".into()),
+    };
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    classify_preflight(&text, out.status.success())
+}
+
+fn classify_preflight(text: &str, exited_ok: bool) -> Preflight {
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(via) = line.strip_prefix("canary quorum: MET via ") {
+            return Preflight::Met(via.trim().to_string());
+        }
+        if line.starts_with("canary quorum: NOT MET") {
+            let detail: Vec<&str> = text
+                .lines()
+                .filter(|l| {
+                    l.contains("TAMPERED") || l.contains("unreach") || l.contains("verdict")
+                })
+                .take(12)
+                .collect();
+            return Preflight::NotMet(detail.join("\n"));
+        }
+        if line.starts_with("canary quorum: not applicable") {
+            return Preflight::NotApplicable;
+        }
+    }
+    if !exited_ok {
+        return Preflight::Unknown("probe exited non-zero".into());
+    }
+    // Older builds print only per-provider verdicts.
+    if text
+        .lines()
+        .any(|l| l.contains("canary verdict:") && !l.contains("canary verdict: 0/"))
+    {
+        return Preflight::Met("(per-provider verdict)".into());
+    }
+    if text.contains("canary verdict:") {
+        return Preflight::NotMet(String::new());
+    }
+    Preflight::Unknown("no canary verdict in the probe output".into())
+}
+
+/// Put the previous binary back and restart the service.
+async fn rollback(dest: &Path, backup: &Path, service: &str) -> Result<()> {
+    if !backup.exists() {
+        bail!("no backup at {} to roll back to", backup.display());
+    }
     let dir = dest
         .parent()
         .ok_or_else(|| anyhow!("cannot determine the directory of {}", dest.display()))?;
-    let staged = dir.join(".vlb.update.new");
-    let backup = dir.join("vlb.bak");
-
-    tokio::fs::write(&staged, &binary)
+    // Same dance as the install: stage, then rename, so the swap is atomic.
+    let staged = dir.join(".vlb.rollback.new");
+    tokio::fs::copy(backup, &staged)
         .await
-        .with_context(|| format!("failed to write {}", staged.display()))?;
+        .with_context(|| format!("failed to copy {} back", backup.display()))?;
     set_executable(&staged).await?;
+    tokio::fs::rename(&staged, dest)
+        .await
+        .with_context(|| format!("failed to restore {}", dest.display()))?;
+    restart_service(service).await?;
+    warn!(path = %dest.display(), "rolled back to the previous binary");
+    Ok(())
+}
 
-    // ── prove the new binary actually runs, before committing to it ─────
-    verify_runnable(&staged).await.inspect_err(|_| {
-        let _ = std::fs::remove_file(&staged);
-    })?;
-
-    // Keep the old binary recoverable.
-    if dest.exists()
-        && let Err(e) = tokio::fs::copy(dest, &backup).await
-    {
-        warn!(error = %e, "could not save a backup of the current binary");
+fn describe_rollback(rb: Result<()>) -> String {
+    match rb {
+        Ok(()) => "Rolled back to the previous binary and restarted it.".to_string(),
+        Err(e) => format!(
+            "ROLLBACK FAILED ({e:#}) — the previous binary is at vlb.bak next to the \
+             installed one; restore it by hand and restart the service."
+        ),
     }
-
-    tokio::fs::rename(&staged, dest).await.with_context(|| {
-        format!(
-            "failed to replace {} — is it on the same filesystem as {}?",
-            dest.display(),
-            dir.display()
-        )
-    })?;
-    info!(path = %dest.display(), backup = %backup.display(), "binary replaced");
-
-    Ok(dest.to_path_buf())
 }
 
 /// Run `<path> --version` to prove the download is a working binary for this
 /// machine before it replaces the one currently keeping the site online.
-async fn verify_runnable(path: &Path) -> Result<()> {
+/// Returns what it reported.
+async fn verify_runnable(path: &Path) -> Result<String> {
     let out = tokio::time::timeout(
         Duration::from_secs(20),
         tokio::process::Command::new(path)
@@ -270,7 +648,7 @@ async fn verify_runnable(path: &Path) -> Result<()> {
     }
     let reported = String::from_utf8_lossy(&out.stdout).trim().to_string();
     info!(version = %reported, "downloaded binary verified as runnable");
-    Ok(())
+    Ok(reported)
 }
 
 #[cfg(unix)]
@@ -791,6 +1169,63 @@ mod tests {
     #[test]
     fn extract_rejects_garbage() {
         assert!(extract_vlb_binary(b"not a gzip stream at all").is_err());
+    }
+
+    /// The pre-flight reads a summary line the probe prints for exactly this
+    /// purpose, and must fall back sensibly for builds that predate it —
+    /// which is what a rollback installs.
+    #[test]
+    fn preflight_verdicts_are_read_from_probe_output() {
+        assert!(matches!(
+            classify_preflight("...\ncanary quorum: MET via isp-main, isp-backup\n", true),
+            Preflight::Met(v) if v == "isp-main, isp-backup"
+        ));
+        assert!(matches!(
+            classify_preflight(
+                "canary verdict: 0/3 ...\ncanary quorum: NOT MET via any provider",
+                true
+            ),
+            Preflight::NotMet(_)
+        ));
+        assert!(matches!(
+            classify_preflight("canary quorum: not applicable (canary disabled)", true),
+            Preflight::NotApplicable
+        ));
+        // An older build: only per-provider verdict lines exist.
+        assert!(matches!(
+            classify_preflight("    canary verdict: 3/3 canary targets verified\n", true),
+            Preflight::Met(_)
+        ));
+        assert!(matches!(
+            classify_preflight("    canary verdict: 0/3 canary targets verified\n", true),
+            Preflight::NotMet(_)
+        ));
+        // No verdict at all is not evidence either way.
+        assert!(matches!(
+            classify_preflight("== vlb probe ==\n", true),
+            Preflight::Unknown(_)
+        ));
+        assert!(matches!(
+            classify_preflight("", false),
+            Preflight::Unknown(_)
+        ));
+    }
+
+    #[test]
+    fn outcome_summary_mentions_the_active_provider() {
+        let o = Outcome {
+            tag: "v9.9.9".into(),
+            path: PathBuf::from("/usr/local/bin/vlb"),
+            restarted: true,
+            active: Some("isp-main".into()),
+            active_adopted: true,
+            notes: vec!["extra".into()],
+        };
+        let s = o.summary();
+        assert!(s.contains("v9.9.9"), "{s}");
+        assert!(s.contains("isp-main"), "{s}");
+        assert!(s.contains("adopted"), "{s}");
+        assert!(s.contains("note: extra"), "{s}");
     }
 
     #[test]

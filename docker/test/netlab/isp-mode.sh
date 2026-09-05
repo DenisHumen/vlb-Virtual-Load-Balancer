@@ -5,6 +5,11 @@
 # roughly by how hard they are to detect:
 #
 #   good        everything works
+#   slow        everything works, with 60 ms of added latency. Not a fault:
+#               a perfectly healthy uplink that is simply further away than
+#               the other one, which makes its health round finish *later*.
+#               Exists to catch the restart race where the faster backup
+#               used to win the initial selection.
 #   dead        the router itself is gone (cable pulled, power cut)
 #   blackhole   the router answers pings but forwards nothing
 #   lossy       heavy packet loss, the classic "is it down or not" case
@@ -25,7 +30,7 @@
 #   mitm        as `expired`, plus TLS interception with a forged certificate
 set -euo pipefail
 
-MODE="${1:?usage: isp-mode <good|dead|blackhole|lossy|dns-blocked|expired|mitm>}"
+MODE="${1:?usage: isp-mode <good|slow|dead|blackhole|lossy|throttled|dns-blocked|portal-http|expired|mitm>}"
 # The entrypoint already resolved which interface is which by subnet,
 # because docker's ethN ordering is not guaranteed. Reuse that mapping rather
 # than guessing it a second time.
@@ -68,6 +73,15 @@ reset_rules
 
 case "$MODE" in
 good)
+    ;;
+
+slow)
+    # Delay on the edge side only: everything this ISP sends back towards
+    # the gateway arrives 60 ms late. Small enough that every probe still
+    # passes its timeout comfortably and the throughput floor is cleared;
+    # large enough that this provider's health round reliably completes
+    # after the other one's.
+    tc qdisc add dev "$EDGE_IF" root netem delay 60ms 2>/dev/null || true
     ;;
 
 dead)

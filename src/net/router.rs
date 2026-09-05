@@ -253,6 +253,19 @@ pub struct InstalledRoute {
     pub proto: Option<String>,
 }
 
+impl std::fmt::Display for InstalledRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "via {} dev {} metric {} proto {}",
+            self.gateway,
+            self.interface,
+            self.metric.unwrap_or(0),
+            self.proto.as_deref().unwrap_or("-")
+        )
+    }
+}
+
 /// Parse `ip -4 route show default` output.
 ///
 /// Lines look like:
@@ -268,7 +281,7 @@ fn parse_default_route_from(routes: &[InstalledRoute]) -> Option<InstalledRoute>
 }
 
 /// Every default route in the output, in the order the kernel listed them.
-fn parse_all_defaults(stdout: &str) -> Vec<InstalledRoute> {
+pub(crate) fn parse_all_defaults(stdout: &str) -> Vec<InstalledRoute> {
     let mut found = Vec::new();
     for line in stdout.lines() {
         let line = line.trim();

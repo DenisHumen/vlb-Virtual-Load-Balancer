@@ -1,6 +1,6 @@
 [package]
 name = "vlb"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 # Pinned to stable 1.88+ because several transitive crates (darling 0.23,
 # instability 0.3.12 pulled by ratatui) require it.

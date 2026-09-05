@@ -29,6 +29,16 @@ pub struct FailoverRecord {
     pub reason: String,
 }
 
+/// One row of `failover_events`, as read back for the TUI and the control
+/// protocol.
+#[derive(Debug, Clone)]
+pub struct FailoverEvent {
+    pub ts: DateTime<Utc>,
+    pub from_provider: Option<String>,
+    pub to_provider: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct TrafficPoint {
     pub ts: DateTime<Utc>,
@@ -145,6 +155,102 @@ impl Stats {
             params![Utc::now().to_rfc3339(), provider, state],
         )?;
         Ok(())
+    }
+
+    // ── small durable key/value store ───────────────────────────────────
+    //
+    // For the handful of facts that must outlive a restart: the operator's
+    // pin, chiefly. An update restarts the daemon, and an operator who pinned
+    // a provider an hour ago does not expect the pin to evaporate because a
+    // new release came out.
+
+    pub fn set_kv(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO kv(key, value, updated_at) VALUES(?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                                            updated_at = excluded.updated_at",
+            params![key, value, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_kv(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT value FROM kv WHERE key = ?1")?;
+        let mut rows = stmt.query(params![key])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn del_kv(&self, key: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM kv WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
+    /// Timestamps of real switchovers since `since`, newest first.
+    ///
+    /// "Real" excludes the initial selection (no `from`) and the watchdog's
+    /// re-installs (`from == to`): neither is a flap. Used to rebuild the
+    /// flap tracker after a restart, so a bouncing uplink cannot reset its
+    /// own backoff by having the daemon restarted.
+    pub fn failover_times_since(
+        &self,
+        since: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<DateTime<Utc>>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT ts FROM failover_events
+             WHERE ts >= ?1
+               AND from_provider IS NOT NULL
+               AND from_provider != to_provider
+             ORDER BY id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![since.to_rfc3339(), limit], |row| {
+            let ts: String = row.get(0)?;
+            Ok(ts)
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            if let Ok(t) = DateTime::parse_from_rfc3339(&r?) {
+                out.push(t.with_timezone(&Utc));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The most recent failover events, newest first.
+    pub fn recent_failovers(&self, limit: u32) -> Result<Vec<FailoverEvent>> {
+        let limit = limit.min(1_000);
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT ts, from_provider, to_provider, reason
+             FROM failover_events
+             ORDER BY id DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| {
+            let ts_str: String = row.get(0)?;
+            let ts = DateTime::parse_from_rfc3339(&ts_str)
+                .map(|t| t.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+            Ok(FailoverEvent {
+                ts,
+                from_provider: row.get(1)?,
+                to_provider: row.get(2)?,
+                reason: row.get(3)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     pub fn record_traffic(
@@ -655,6 +761,13 @@ CREATE TABLE IF NOT EXISTS system_samples (
 );
 CREATE INDEX IF NOT EXISTS idx_system_ts ON system_samples(ts);
 
+-- Durable odds and ends that must survive a restart (the operator pin).
+CREATE TABLE IF NOT EXISTS kv (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 -- Convenience view: per-provider rolling success ratio over last 1h.
 CREATE VIEW IF NOT EXISTS provider_health_summary AS
 SELECT
@@ -808,6 +921,81 @@ mod tests {
 
         // 0-hour retention is a no-op
         assert_eq!(stats.prune_traffic(0).unwrap(), 0);
+
+        drop(stats);
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp.with_extension("db-wal"));
+        let _ = std::fs::remove_file(tmp.with_extension("db-shm"));
+    }
+
+    /// The pin is the one piece of operator intent the daemon holds, and it
+    /// has to come back after an update restarts the process.
+    #[test]
+    fn kv_roundtrip_survives_reopen() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vlb-kv-{}-{}.db",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        {
+            let stats = Stats::open(&tmp, &mk_providers()).unwrap();
+            assert_eq!(stats.get_kv("forced_provider").unwrap(), None);
+            stats.set_kv("forced_provider", "isp-backup").unwrap();
+            // Overwrite, not duplicate.
+            stats.set_kv("forced_provider", "isp-main").unwrap();
+        }
+        {
+            // A fresh process: the value must still be there.
+            let stats = Stats::open(&tmp, &mk_providers()).unwrap();
+            assert_eq!(
+                stats.get_kv("forced_provider").unwrap().as_deref(),
+                Some("isp-main")
+            );
+            stats.del_kv("forced_provider").unwrap();
+            assert_eq!(stats.get_kv("forced_provider").unwrap(), None);
+            // Deleting a missing key is not an error.
+            stats.del_kv("forced_provider").unwrap();
+        }
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp.with_extension("db-wal"));
+        let _ = std::fs::remove_file(tmp.with_extension("db-shm"));
+    }
+
+    /// Flap history is rebuilt from `failover_events` after a restart. Only
+    /// genuine switches may count: the initial selection has no `from`, and a
+    /// watchdog re-install goes from a provider to itself.
+    #[test]
+    fn failover_history_counts_only_real_switches() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vlb-flap-{}-{}.db",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let stats = Stats::open(&tmp, &mk_providers()).unwrap();
+        let now = Utc::now();
+        let rec = |age_s: i64, from: Option<&str>, to: &str| FailoverRecord {
+            timestamp: now - chrono::Duration::seconds(age_s),
+            from_provider: from.map(String::from),
+            to_provider: to.into(),
+            reason: "test".into(),
+        };
+        stats.record_failover(&rec(500, None, "a")).unwrap(); // initial
+        stats.record_failover(&rec(400, Some("a"), "b")).unwrap(); // real
+        stats.record_failover(&rec(300, Some("b"), "b")).unwrap(); // watchdog
+        stats.record_failover(&rec(200, Some("b"), "a")).unwrap(); // real
+        stats.record_failover(&rec(5000, Some("a"), "b")).unwrap(); // too old
+
+        let since = now - chrono::Duration::seconds(1000);
+        let times = stats.failover_times_since(since, 256).unwrap();
+        assert_eq!(times.len(), 2, "{times:?}");
+        // Newest first.
+        assert!(times[0] > times[1]);
+
+        let recent = stats.recent_failovers(3).unwrap();
+        assert_eq!(recent.len(), 3);
+        // Newest first: the 200 s-old one was inserted last.
+        assert_eq!(recent[0].to_provider, "b");
+        assert_eq!(recent[0].from_provider.as_deref(), Some("a"));
 
         drop(stats);
         let _ = std::fs::remove_file(&tmp);

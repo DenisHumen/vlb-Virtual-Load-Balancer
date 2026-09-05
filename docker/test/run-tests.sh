@@ -82,6 +82,49 @@ for p in d.get('snapshot', {}).get('providers', []):
 "
 }
 
+# One top-level field of the snapshot (`active_adopted`, `forced`, …).
+# Non-strings are printed as JSON so booleans read `true`/`false` and an
+# absent value reads `null`, which is what the assertions below match on.
+snapshot_field() {
+    status_json | "$PY" -c "
+import json,sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(0)
+v = d.get('snapshot', {}).get('$1')
+print(v if isinstance(v, str) else json.dumps(v))
+"
+}
+
+# How many times a line matching the pattern has appeared in the daemon's
+# log so far. Compared before/after an action, so history does not count.
+log_count() {
+    local n
+    n=$("${COMPOSE[@]}" logs vlb 2>&1 | grep -c -- "$1" || true)
+    printf '%s' "${n:-0}"
+}
+
+# Restart the daemon *process* in place — what systemd's Restart=always (and
+# an update) does on a real box. The container, and with it the network
+# namespace and every route in it, stays as it is. Waits for the new process
+# to answer on the control socket.
+restart_daemon() {
+    local old_pid new_pid
+    old_pid=$(vlb_exec sh -c 'pgrep -x vlb | head -1' | tr -d '[:space:]')
+    vlb_exec sh -c 'pkill -TERM -x vlb' >/dev/null 2>&1
+    local waited=0
+    while [ "$waited" -lt 30 ]; do
+        sleep 1; waited=$((waited+1))
+        new_pid=$(vlb_exec sh -c 'pgrep -x vlb | head -1' | tr -d '[:space:]')
+        [ -n "$new_pid" ] && [ "$new_pid" != "$old_pid" ] || continue
+        if status_json | grep -q '"active"'; then
+            printf '%s' "$waited"
+            return 0
+        fi
+    done
+    printf '%s' "$waited"
+    return 1
+}
+
 # The gateway the kernel is really using — the ground truth, independent of
 # what vlb believes.
 kernel_default_gw() {
@@ -535,6 +578,206 @@ scenario_restart() {
     fi
 }
 
+# The update, as it actually happens on a live box: the process is
+# restarted while the routes it installed stay in the kernel. The new
+# process must take that route over rather than start from nothing.
+#
+# The primary is made *slower* than the backup first. Without adoption the
+# first provider to finish its probe rounds won the initial selection, and
+# on links of unequal speed that was the backup — the gateway then moved all
+# traffic to the backup, flushed conntrack, and thirty seconds later moved
+# it back and flushed again. Two outages, caused by an update, on a network
+# where nothing was wrong.
+scenario_restart_slow_primary() {
+    info "daemon restart with a slower primary — the faster backup must not win"
+    reset_lab
+    isp_mode isp1 slow
+    if ! wait_until_stable isp-main 60 3 >/dev/null; then
+        bad "restart-slow: the primary did not stay active with 60 ms of added latency"
+        return
+    fi
+    local before_gw; before_gw=$(kernel_default_gw)
+    local adopted_before; adopted_before=$(log_count "adopted the installed default route")
+    local failovers_before; failovers_before=$(log_count "FAILOVER")
+
+    local t
+    if ! t=$(restart_daemon); then
+        bad "restart-slow: the daemon did not come back within ${t}s"
+        return
+    fi
+    ok "daemon back in ${t}s"
+
+    # Watch the window in which the race used to happen: the backup's second
+    # round finishes well before the primary's.
+    local waited=0 flipped=0 moved=0
+    while [ "$waited" -lt 20 ]; do
+        [ "$(active_provider)" = "isp-backup" ] && flipped=1
+        [ "$(kernel_default_gw)" != "$before_gw" ] && moved=1
+        sleep 1; waited=$((waited+1))
+    done
+    [ "$flipped" -eq 0 ] \
+        && ok "never switched to the faster backup after the restart" \
+        || bad "restart-slow: switched to isp-backup after the restart — the initial-selection race"
+    [ "$moved" -eq 0 ] \
+        && ok "default route never moved ($before_gw)" \
+        || bad "restart-slow: the default route moved during the restart"
+
+    local adopted_after; adopted_after=$(log_count "adopted the installed default route")
+    [ "$adopted_after" -gt "$adopted_before" ] \
+        && ok "the new process adopted the installed route as its incumbent" \
+        || bad "restart-slow: no adoption logged"
+
+    local failovers_after; failovers_after=$(log_count "FAILOVER")
+    [ "$failovers_after" -eq "$failovers_before" ] \
+        && ok "no switchover logged — verified in place, nothing flushed" \
+        || bad "restart-slow: a FAILOVER was logged across the restart"
+
+    local adopted
+    if adopted=$(eventually 30 'false' snapshot_field active_adopted); then
+        ok "adopted route verified by the new process's own probes"
+    else
+        bad "restart-slow: route still unverified after 30s (active_adopted=$adopted)"
+    fi
+    real_traffic_works && ok "client traffic flowed throughout" \
+        || bad "restart-slow: client traffic broken after the restart"
+}
+
+# The other half: restarting while failed over. The backup is carrying the
+# traffic; the primary is dead. The new process must come back *on the
+# backup*, at once, without re-deciding — and the primary's return must
+# still go through the failback window.
+scenario_restart_on_backup() {
+    info "daemon restart while failed over — the backup route is adopted, not re-chosen"
+    reset_lab
+    isp_mode isp1 dead
+    wait_for_active isp-backup 40 >/dev/null
+    [ "$(active_provider)" = "isp-backup" ] || { bad "restart-on-backup: setup failed"; return; }
+    local before_gw; before_gw=$(kernel_default_gw)
+    local failovers_before; failovers_before=$(log_count "FAILOVER")
+
+    local t
+    if ! t=$(restart_daemon); then
+        bad "restart-on-backup: the daemon did not come back within ${t}s"
+        return
+    fi
+    local a; a=$(active_provider)
+    [ "$a" = "isp-backup" ] \
+        && ok "back on isp-backup immediately (${t}s, adopted)" \
+        || bad "restart-on-backup: active='$a' right after the restart"
+    [ "$(kernel_default_gw)" = "$before_gw" ] \
+        && ok "default route unchanged ($before_gw)" \
+        || bad "restart-on-backup: route moved to $(kernel_default_gw)"
+
+    local adopted
+    if adopted=$(eventually 30 'false' snapshot_field active_adopted); then
+        ok "backup verified in place by the new process"
+    else
+        bad "restart-on-backup: still unverified after 30s (active_adopted=$adopted)"
+    fi
+    local failovers_after; failovers_after=$(log_count "FAILOVER")
+    [ "$failovers_after" -eq "$failovers_before" ] \
+        && ok "no switchover logged — no conntrack flush across the restart" \
+        || bad "restart-on-backup: a FAILOVER was logged across the restart"
+    real_traffic_works && ok "client traffic flows on the adopted backup" \
+        || bad "restart-on-backup: client traffic broken"
+
+    # The primary returns. Failback must still wait its window rather than
+    # snapping back because the daemon is "new".
+    isp_mode isp1 good
+    sleep 2
+    [ "$(active_provider)" = "isp-backup" ] \
+        && ok "held on the backup while the primary proved itself" \
+        || bad "restart-on-backup: switched back within 2s, ignoring the stability window"
+    t=$(wait_for_active isp-main 60)
+    [ "$(active_provider)" = "isp-main" ] \
+        && ok "failed back to the primary after ${t}s" \
+        || bad "restart-on-backup: never returned to the primary (${t}s)"
+}
+
+# An operator's pin is the one piece of intent the daemon holds. It used to
+# evaporate on restart — so an update quietly undid `vlb force`.
+scenario_pin_survives_restart() {
+    info "operator pin survives a daemon restart"
+    reset_lab
+    vlb_exec vlb --config /etc/vlb/vlb.toml force isp-backup >/dev/null 2>&1
+    wait_for_active isp-backup 20 >/dev/null
+    if [ "$(active_provider)" != "isp-backup" ]; then
+        bad "pin-restart: the pin did not take effect"
+        vlb_exec vlb --config /etc/vlb/vlb.toml auto >/dev/null 2>&1
+        return
+    fi
+
+    local t
+    if ! t=$(restart_daemon); then
+        bad "pin-restart: the daemon did not come back within ${t}s"
+        return
+    fi
+    local f
+    if f=$(eventually 20 'isp-backup' snapshot_field forced); then
+        ok "pin restored after the restart (forced = $f)"
+    else
+        bad "pin-restart: the pin was lost across the restart (forced = '$f')"
+    fi
+    if eventually 20 'isp-backup' active_provider >/dev/null; then
+        ok "still carrying traffic on the pinned provider"
+    else
+        bad "pin-restart: left the pinned provider (active = $(active_provider))"
+    fi
+    "${COMPOSE[@]}" logs --tail 300 vlb 2>&1 | grep -q "operator pin restored" \
+        && ok "the restore is logged, so it is not a surprise later" \
+        || note "no 'pin restored' line found in the log"
+
+    vlb_exec vlb --config /etc/vlb/vlb.toml auto >/dev/null 2>&1
+    t=$(wait_for_active isp-main 40)
+    [ "$(active_provider)" = "isp-main" ] \
+        && ok "released the pin; back on the primary in ${t}s" \
+        || bad "pin-restart: did not return to the primary after release (${t}s)"
+    # The release must be durable too: a restart must not resurrect the pin.
+    if restart_daemon >/dev/null; then
+        f=$(eventually 15 'null' snapshot_field forced)
+        [ "$f" = "null" ] \
+            && ok "a released pin stays released across a restart" \
+            || bad "pin-restart: a released pin came back after the restart (forced = $f)"
+    fi
+}
+
+# A provider whose interface does not exist at startup — a NIC that is late
+# to appear at boot, or one that was removed. Startup used to fail outright
+# on it, which took the *other* providers down with it: the daemon that
+# exists to survive one broken uplink would not start because of one.
+scenario_missing_interface() {
+    info "a provider on an interface that does not exist — startup must carry on"
+    reset_lab
+    if ! VLB_CONFIG=/etc/vlb/generated/vlb.ghost.toml "${COMPOSE[@]}" up -d vlb >/dev/null 2>&1; then
+        bad "missing-iface: could not bring the daemon up with the variant config"
+        return
+    fi
+    if wait_until_stable isp-main 90 3 >/dev/null; then
+        ok "daemon started and selected isp-main despite the unusable third provider"
+    else
+        bad "missing-iface: no provider selected (active = $(active_provider))"
+        note "$("${COMPOSE[@]}" logs --tail 20 vlb 2>&1)"
+    fi
+    local st
+    if st=$(eventually 30 'down' provider_field isp-ghost state); then
+        ok "the ghost provider is reported down, not silently skipped"
+    else
+        bad "missing-iface: ghost provider state is '$st', expected down"
+    fi
+    if "${COMPOSE[@]}" logs --tail 400 vlb 2>&1 | grep -q "could not set up this provider's routing table yet"; then
+        ok "startup explained the unusable interface and carried on"
+    else
+        bad "missing-iface: startup did not explain the unusable interface"
+    fi
+    real_traffic_works && ok "client traffic flows through the working providers" \
+        || bad "missing-iface: client traffic broken"
+
+    # Back to the standard config for the remaining scenarios.
+    VLB_CONFIG=/etc/vlb/vlb.toml "${COMPOSE[@]}" up -d vlb >/dev/null 2>&1
+    wait_until_stable isp-main 90 3 >/dev/null \
+        || bad "missing-iface: the lab did not recover after restoring the standard config"
+}
+
 scenario_watchdog() {
     info "route watchdog — an external tool overwrites our default route"
     reset_lab
@@ -798,7 +1041,7 @@ scenario_probe_cli() {
 
 # ─────────────────────────────────────────────────────────────────────────
 
-SCENARIOS=(baseline priority_gap dead blackhole lossy dns_blocked expired canary_only throttled failback both_down restart watchdog netplan_fight missing_conntrack concurrent_force soak force probe_cli)
+SCENARIOS=(baseline priority_gap dead blackhole lossy dns_blocked expired canary_only throttled failback both_down restart restart_slow_primary restart_on_backup pin_survives_restart missing_interface watchdog netplan_fight missing_conntrack concurrent_force soak force probe_cli)
 
 cleanup() {
     if [ "$KEEP" -eq 1 ]; then
@@ -821,6 +1064,27 @@ seed_origin_payload() {
         'test -f /var/www/origin/big.bin || head -c 262144 /dev/urandom > /var/www/origin/big.bin' \
         >/dev/null 2>&1 || true
 }
+
+# Variant configs, derived from the standard one so they never drift from
+# it. Mounted read-only into the vlb container; the harness picks one with
+# VLB_CONFIG when it brings the container up.
+generate_variant_configs() {
+    mkdir -p generated
+    {
+        cat vlb.test.toml
+        cat <<'EOF'
+
+# ── appended by run-tests.sh: a provider whose interface does not exist ──
+[[providers]]
+name = "isp-ghost"
+gateway = "10.99.0.1"
+interface = "eth7"
+priority = 5
+role = "backup"
+EOF
+    } > generated/vlb.ghost.toml
+}
+generate_variant_configs
 
 info "building the lab"
 if ! "${COMPOSE[@]}" build >/tmp/vlb-lab-build.log 2>&1; then

@@ -3,7 +3,19 @@ use std::process::Command as StdCommand;
 use tokio::process::Command;
 use tracing::{info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, Provider};
+
+/// What `prepare` left behind for the balancer to know about.
+#[derive(Debug, Default)]
+pub struct Prepared {
+    /// A provisional default route was installed (or a leftover one from a
+    /// previous run adopted) and is ours to remove once a real one exists.
+    pub installed_bootstrap: bool,
+    /// Providers whose per-provider routing table could not be set up yet —
+    /// typically because the interface does not exist or has no address at
+    /// this point in boot. The health loop keeps retrying them.
+    pub policy_pending: Vec<String>,
+}
 
 /// Ensure the process is running as uid 0. Routing-table mutation, iptables
 /// rules, and sysctl writes all require CAP_NET_ADMIN + write access to
@@ -114,7 +126,7 @@ pub async fn check_dependencies(firewall_managed: bool) -> Result<Vec<&'static s
 ///   - per-provider routing tables and fwmark-based ip rules, used by
 ///     health probes to verify each provider's internet path independently
 ///   - optionally stop ufw/firewalld (opt-in via config)
-pub async fn prepare(cfg: &Config) -> Result<bool> {
+pub async fn prepare(cfg: &Config) -> Result<Prepared> {
     info!("preparing host: sysctl, forwarding, NAT, policy routing");
     check_dependencies(cfg.firewall.manage).await?;
     tune_sysctl().await?;
@@ -129,11 +141,14 @@ pub async fn prepare(cfg: &Config) -> Result<bool> {
         warn!("firewall.manage = false — NAT/forward rules NOT installed (manual setup required)");
     }
 
-    setup_policy_routing(cfg).await?;
+    let policy_pending = setup_policy_routing(cfg).await;
     // Reported back so the router only removes a provisional route that this
     // process actually created.
     let installed_bootstrap = ensure_bootstrap_default(cfg).await;
-    Ok(installed_bootstrap)
+    Ok(Prepared {
+        installed_bootstrap,
+        policy_pending,
+    })
 }
 
 /// Make sure the main table has *a* default route before probing starts.
@@ -162,6 +177,25 @@ async fn ensure_bootstrap_default(cfg: &Config) -> bool {
         .await;
     match out {
         Ok(o) if o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty() => {
+            let routes = crate::router::parse_all_defaults(&String::from_utf8_lossy(&o.stdout));
+            let only_our_bootstrap = !routes.is_empty()
+                && routes.iter().all(|r| {
+                    r.metric == Some(crate::router::BOOTSTRAP_METRIC)
+                        && r.proto.as_deref() == Some("static")
+                });
+            if only_our_bootstrap {
+                // The previous run of this daemon installed a provisional
+                // route and was stopped before any provider proved healthy —
+                // an update on a box whose uplinks were all down, say. Nothing
+                // but vlb writes a default at exactly this metric and proto,
+                // so adopt it: it will be removed the moment a real choice
+                // is installed, exactly as if this run had created it.
+                info!(
+                    metric = crate::router::BOOTSTRAP_METRIC,
+                    "adopting the provisional default route left by a previous run"
+                );
+                return true;
+            }
             // Something already owns a default; leave it alone. The balancer
             // replaces it at `metric 0 proto static` once a provider proves
             // healthy.
@@ -420,78 +454,113 @@ async fn allow_forward() -> Result<()> {
 ///
 /// Idempotent: repeated runs overwrite existing state, and stale rules at
 /// our pref values are removed in a delete-until-ENOENT loop.
-async fn setup_policy_routing(cfg: &Config) -> Result<()> {
+///
+/// A provider whose interface is not usable yet does **not** abort startup.
+/// This daemon is started early in boot — deliberately, so a dead uplink
+/// cannot delay it — and at that point an interface may still be waiting for
+/// its address. Refusing to start would leave the *other* providers
+/// unmanaged too, which is the opposite of what a failover daemon is for.
+/// The names of the providers that could not be set up are returned; the
+/// balancer keeps retrying them from the health loop, and meanwhile their
+/// probes simply fail, which is the truth.
+async fn setup_policy_routing(cfg: &Config) -> Vec<String> {
+    let mut pending = Vec::new();
     for p in &cfg.providers {
-        let table = cfg.table_for(p);
-        let mark = cfg.mark_for(p);
-        let pref = cfg.rule_pref_for(p);
-
-        let gw = p.gateway.to_string();
-        let table_str = table.to_string();
-        let mark_str = mark.to_string();
-        let pref_str = pref.to_string();
-
-        // (1) Default route inside the per-provider table. `ip route replace`
-        //     handles both "no route yet" and "route from a prior run".
-        let route = Command::new("ip")
-            .args([
-                "route",
-                "replace",
-                "default",
-                "via",
-                &gw,
-                "dev",
-                &p.interface,
-                "table",
-                &table_str,
-            ])
-            .status()
-            .await
-            .context("failed to invoke `ip route replace` for per-provider table")?;
-        if !route.success() {
-            bail!(
-                "failed to install default route in table {table} via {gw} dev {}",
-                p.interface
+        if let Err(e) = setup_provider_policy_route(cfg, p).await {
+            warn!(
+                provider = %p.name,
+                interface = %p.interface,
+                error = %e,
+                "could not set up this provider's routing table yet — it will be \
+                 treated as down and retried every health interval until it works"
             );
+            pending.push(p.name.clone());
         }
-
-        // (2) Remove any stale rule(s) sitting at our pref. `ip rule del`
-        //     removes a SINGLE matching rule per call, so we loop until
-        //     deletion fails (ENOENT) to drain prior-run leftovers or
-        //     duplicates added by other tooling.
-        loop {
-            let del = Command::new("ip")
-                .args(["rule", "del", "pref", &pref_str])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .await
-                .context("failed to invoke `ip rule del`")?;
-            if !del.success() {
-                break;
-            }
-        }
-
-        // (3) Install a fresh rule: fwmark M lookup T at pref P.
-        let add = Command::new("ip")
-            .args([
-                "rule", "add", "pref", &pref_str, "fwmark", &mark_str, "lookup", &table_str,
-            ])
-            .status()
-            .await
-            .context("failed to invoke `ip rule add`")?;
-        if !add.success() {
-            bail!("failed to add ip rule: fwmark {mark_str} lookup {table_str} pref {pref_str}");
-        }
-
-        let mark_hex = format!("0x{mark:x}");
-        info!(
-            provider = %p.name,
-            table,
-            mark = %mark_hex,
-            pref,
-            "policy route installed"
+    }
+    if pending.len() == cfg.providers.len() && !pending.is_empty() {
+        warn!(
+            "no provider's routing table could be set up; probes cannot succeed \
+             until at least one interface comes up"
         );
     }
+    pending
+}
+
+/// One provider's routing table and fwmark rule. Safe to call repeatedly.
+pub async fn setup_provider_policy_route(cfg: &Config, p: &Provider) -> Result<()> {
+    let table = cfg.table_for(p);
+    let mark = cfg.mark_for(p);
+    let pref = cfg.rule_pref_for(p);
+
+    let gw = p.gateway.to_string();
+    let table_str = table.to_string();
+    let mark_str = mark.to_string();
+    let pref_str = pref.to_string();
+
+    // (1) Default route inside the per-provider table. `ip route replace`
+    //     handles both "no route yet" and "route from a prior run".
+    let route = Command::new("ip")
+        .args([
+            "route",
+            "replace",
+            "default",
+            "via",
+            &gw,
+            "dev",
+            &p.interface,
+            "table",
+            &table_str,
+        ])
+        .kill_on_drop(true)
+        .output()
+        .await
+        .context("failed to invoke `ip route replace` for per-provider table")?;
+    if !route.status.success() {
+        bail!(
+            "`ip route replace default via {gw} dev {} table {table}` failed: {}",
+            p.interface,
+            String::from_utf8_lossy(&route.stderr).trim()
+        );
+    }
+
+    // (2) Remove any stale rule(s) sitting at our pref. `ip rule del`
+    //     removes a SINGLE matching rule per call, so we loop until
+    //     deletion fails (ENOENT) to drain prior-run leftovers or
+    //     duplicates added by other tooling.
+    loop {
+        let del = Command::new("ip")
+            .args(["rule", "del", "pref", &pref_str])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .status()
+            .await
+            .context("failed to invoke `ip rule del`")?;
+        if !del.success() {
+            break;
+        }
+    }
+
+    // (3) Install a fresh rule: fwmark M lookup T at pref P.
+    let add = Command::new("ip")
+        .args([
+            "rule", "add", "pref", &pref_str, "fwmark", &mark_str, "lookup", &table_str,
+        ])
+        .kill_on_drop(true)
+        .status()
+        .await
+        .context("failed to invoke `ip rule add`")?;
+    if !add.success() {
+        bail!("failed to add ip rule: fwmark {mark_str} lookup {table_str} pref {pref_str}");
+    }
+
+    let mark_hex = format!("0x{mark:x}");
+    info!(
+        provider = %p.name,
+        table,
+        mark = %mark_hex,
+        pref,
+        "policy route installed"
+    );
     Ok(())
 }

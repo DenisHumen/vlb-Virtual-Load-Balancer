@@ -81,6 +81,15 @@ pub enum Decision {
         stable_for: Duration,
         required: Duration,
     },
+    /// The installed route belongs to a provider that has not been probed to
+    /// a verdict yet, while another one is already healthy. Keep the route:
+    /// "not yet known" is not "broken". This is the state right after a
+    /// restart, when the route was adopted from the kernel and the incumbent
+    /// is most likely fine — it was carrying all the traffic a moment ago.
+    WaitingForVerdict {
+        incumbent: String,
+        candidate: String,
+    },
     /// Nothing is healthy. The caller keeps whatever route is installed —
     /// a black-holing route is still better than no route at all, and the
     /// alternative would drop even the traffic that might still work.
@@ -164,15 +173,26 @@ pub fn decide(input: &SelectionInput) -> Decision {
                 reason: format!("current provider '{cur_name}' is no longer configured"),
             };
         }
-        Some(c) if !c.is_up() => {
+        Some(c) if c.state == State::Down => {
             return Decision::Switch {
                 to: best.name.clone(),
                 reason: format!(
-                    "'{cur_name}' is {} — switching to healthy '{}' (priority {})",
-                    c.state.as_label(),
-                    best.name,
-                    best.priority
+                    "'{cur_name}' is down — switching to healthy '{}' (priority {})",
+                    best.name, best.priority
                 ),
+            };
+        }
+        Some(c) if c.state == State::Unknown => {
+            // Only reachable right after startup, when the route was adopted
+            // from the kernel and its provider has not completed enough probe
+            // rounds for a verdict. Abandoning it now would move traffic off
+            // a link that was carrying everything a moment ago — and flush
+            // every connection to do it — on no evidence at all. A verdict
+            // arrives within a few rounds either way; if it is Down, the arm
+            // above takes over at once.
+            return Decision::WaitingForVerdict {
+                incumbent: cur_name.to_string(),
+                candidate: best.name.clone(),
             };
         }
         Some(_) => {}
@@ -246,6 +266,21 @@ pub struct FlapTracker {
 impl FlapTracker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A tracker pre-loaded with switches from before this process started.
+    ///
+    /// Without this a restart wipes the flap history, and an update landing
+    /// in the middle of a bouncing uplink would hand that uplink a fresh,
+    /// undamped failback window the moment the daemon comes back.
+    pub fn with_history(mut switches: Vec<DateTime<Utc>>) -> Self {
+        switches.sort_unstable();
+        let mut t = Self { switches };
+        if t.switches.len() > 256 {
+            let drain = t.switches.len() - 256;
+            t.switches.drain(..drain);
+        }
+        t
     }
 
     pub fn record_switch(&mut self, at: DateTime<Utc>) {
@@ -465,6 +500,111 @@ mod tests {
                 "should still be waiting after restart at {restart}s, got {d:?}"
             );
         }
+    }
+
+    // ── restart: the adopted route ─────────────────────────────────────
+
+    /// Right after a restart the daemon adopts whatever default route the
+    /// kernel already has, and its provider has no verdict yet. A backup
+    /// whose probes happen to finish first must not take the route away
+    /// from it: that is exactly the "update switched us to the backup for
+    /// thirty seconds and reset every connection twice" failure.
+    #[test]
+    fn unverified_incumbent_is_kept_until_it_has_a_verdict() {
+        let d = decide(&input(
+            secs(3),
+            Some("main"),
+            vec![unknown("main", 0), up("backup", 2, secs(3))],
+        ));
+        assert_eq!(
+            d,
+            Decision::WaitingForVerdict {
+                incumbent: "main".into(),
+                candidate: "backup".into(),
+            }
+        );
+
+        // Verdict: healthy. Now it is simply the best provider — Keep.
+        let d = decide(&input(
+            secs(6),
+            Some("main"),
+            vec![up("main", 0, secs(6)), up("backup", 2, secs(3))],
+        ));
+        assert_eq!(d, Decision::Keep);
+
+        // Verdict: down. Leave at once, as with any broken provider.
+        let d = decide(&input(
+            secs(6),
+            Some("main"),
+            vec![down("main", 0), up("backup", 2, secs(3))],
+        ));
+        assert_eq!(switched_to(&d), Some("backup"));
+    }
+
+    /// The adopted incumbent may be the *backup* — the daemon was restarted
+    /// while failed over. The primary coming up must still go through the
+    /// failback window rather than snapping straight back.
+    #[test]
+    fn adopted_backup_still_waits_for_failback() {
+        let d = decide(&input(
+            secs(5),
+            Some("backup"),
+            vec![up("main", 0, secs(4)), unknown("backup", 2)],
+        ));
+        assert!(matches!(d, Decision::WaitingForVerdict { .. }), "{d:?}");
+
+        let d = decide(&input(
+            secs(8),
+            Some("backup"),
+            vec![up("main", 0, secs(4)), up("backup", 2, secs(8))],
+        ));
+        assert!(matches!(d, Decision::WaitingForFailback { .. }), "{d:?}");
+    }
+
+    /// An operator pin outranks the incumbent's missing verdict: the pin is
+    /// explicit intent, the adoption is only a default.
+    #[test]
+    fn pin_outranks_an_unverified_incumbent() {
+        let mut i = input(
+            secs(3),
+            Some("main"),
+            vec![unknown("main", 0), up("backup", 2, secs(3))],
+        );
+        i.forced = Some("backup".into());
+        assert_eq!(switched_to(&decide(&i)), Some("backup"));
+    }
+
+    /// With nothing healthy at all the adopted route stays, unverified or
+    /// not — a route that might work beats no route.
+    #[test]
+    fn unverified_incumbent_with_nothing_healthy_keeps_the_route() {
+        let d = decide(&input(
+            secs(3),
+            Some("main"),
+            vec![unknown("main", 0), down("backup", 2)],
+        ));
+        assert_eq!(d, Decision::NoHealthyProvider);
+    }
+
+    #[test]
+    fn flap_history_is_restored_and_bounded() {
+        let history: Vec<_> = (0..5).map(secs).collect();
+        let f = FlapTracker::with_history(history);
+        assert_eq!(f.switches_in_window(secs(10), Duration::from_secs(600)), 5);
+        // Restored history damps failback exactly as live history would.
+        assert_eq!(
+            f.effective_failback(
+                secs(10),
+                Duration::from_secs(30),
+                3,
+                Duration::from_secs(600),
+                Duration::from_secs(900)
+            ),
+            Duration::from_secs(120)
+        );
+
+        let huge: Vec<_> = (0..1000).map(secs).collect();
+        assert!(FlapTracker::with_history(huge).switches.len() <= 256);
     }
 
     #[test]

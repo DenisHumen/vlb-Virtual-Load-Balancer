@@ -35,6 +35,8 @@ mod traffic;
 
 #[path = "obs/logger.rs"]
 mod logger;
+#[path = "obs/notify.rs"]
+mod notify;
 #[path = "obs/stats.rs"]
 mod stats;
 #[path = "obs/sysmon.rs"]
@@ -127,6 +129,11 @@ enum Command {
         repeat: u32,
     },
     /// Check for a newer release on GitHub and install it.
+    ///
+    /// The same safety net as the installer script: the new build must run,
+    /// must accept the existing config, and must be able to reach the canary
+    /// targets before the old one is replaced; after the restart the service
+    /// must come back, or the previous binary is put back automatically.
     Update {
         /// Only report what is available; change nothing.
         #[arg(long)]
@@ -141,6 +148,9 @@ enum Command {
         /// running binary. Needed to roll back.
         #[arg(long)]
         force: bool,
+        /// Skip the pre-flight canary reachability check.
+        #[arg(long)]
+        skip_probe: bool,
     },
 }
 
@@ -174,7 +184,7 @@ async fn main() -> Result<()> {
         Command::Tui => {
             let config = Config::load(&cli.config)?;
             config.validate()?;
-            tui::run(config).await
+            tui::run(config, cli.config.clone()).await
         }
         Command::Status => {
             let config = Config::load(&cli.config)?;
@@ -219,10 +229,11 @@ async fn main() -> Result<()> {
             pre,
             yes,
             force,
+            skip_probe,
         } => {
             let config = Config::load(&cli.config)?;
             config.validate()?;
-            do_update(&config, check, pre, yes, force).await
+            do_update(&config, &cli.config, check, pre, yes, force, skip_probe).await
         }
         Command::Run => run(cli).await,
     }
@@ -246,21 +257,29 @@ async fn run(cli: Cli) -> Result<()> {
         "configuration loaded"
     );
 
+    notify::status("starting: preparing routing tables, NAT and sysctls");
+
     // `prepare` reports whether it had to install a provisional default
     // route, so the router knows whether the cleanup afterwards is removing
-    // something we created or something the operator did.
-    let installed_bootstrap = if !cli.dry_run {
+    // something we created or something the operator did — and which
+    // providers' tables could not be set up yet, so the health loops keep
+    // retrying those.
+    let prepared = if !cli.dry_run {
         system::check_root()?;
         system::prepare(&config).await?
     } else {
         tracing::warn!("dry-run mode: system state will not be modified");
-        false
+        system::Prepared::default()
     };
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let balancer = Balancer::new(config, cli.dry_run, installed_bootstrap).await?;
+    let balancer = Balancer::new(config, cli.dry_run, prepared).await?;
     balancer.spawn_tasks(shutdown_rx);
+    // Operational from here: routes are in place (or adopted), the probes
+    // are running and the control socket is coming up. Provider selection
+    // is the daemon's ongoing job, not a precondition of being "ready".
+    notify::ready();
 
     wait_for_shutdown().await;
     tracing::warn!("shutdown signal received");
@@ -381,6 +400,13 @@ async fn probe_report(config: &Config, only: Option<&str>, repeat: u32) -> Resul
          of which one currently owns the default route."
     );
 
+    // Providers through which the canary met its quorum on the *last* run.
+    // Summarised at the end in a fixed, greppable form: the installer and
+    // `vlb update` read it to decide whether restarting into this config
+    // would leave the gateway with automatic failover switched off.
+    let mut quorum_met_via: Vec<String> = Vec::new();
+    let canary_active = config.canary.enabled && !canary_targets.is_empty();
+
     for p in providers {
         let mark = config.mark_for(p);
         println!(
@@ -465,6 +491,9 @@ async fn probe_report(config: &Config, only: Option<&str>, repeat: u32) -> Resul
                 )
                 .await;
                 record("canary".into(), t.elapsed().as_millis(), report.is_ok());
+                if report.is_ok() && round == repeat {
+                    quorum_met_via.push(p.name.clone());
+                }
                 for (label, verdict) in &report.per_target {
                     let mark_char = match verdict {
                         canary::CanaryVerdict::Ok { .. } => "ok  ",
@@ -534,16 +563,27 @@ async fn probe_report(config: &Config, only: Option<&str>, repeat: u32) -> Resul
             );
         }
     }
+
+    println!();
+    if !canary_active {
+        println!("canary quorum: not applicable (canary disabled)");
+    } else if quorum_met_via.is_empty() {
+        println!("canary quorum: NOT MET via any provider");
+    } else {
+        println!("canary quorum: MET via {}", quorum_met_via.join(", "));
+    }
     Ok(())
 }
 
 /// `vlb update` — check GitHub Releases and optionally install.
 async fn do_update(
     config: &Config,
+    config_path: &std::path::Path,
     check_only: bool,
     pre: bool,
     assume_yes: bool,
     force: bool,
+    skip_probe: bool,
 ) -> Result<()> {
     let allow_pre = pre || config.update.allow_prerelease;
     let current = update::current_version();
@@ -582,12 +622,17 @@ async fn do_update(
     println!("install target  : {}", dest.display());
 
     if !assume_yes {
-        // Replacing the binary of a live gateway briefly drops the daemon,
-        // so never do it without an explicit yes.
+        // Replacing the binary of a live gateway restarts the daemon, so
+        // never do it without an explicit yes. (Traffic keeps flowing: the
+        // route stays in place and the new daemon adopts it.)
         println!(
             "\nThis replaces the vlb binary{}.",
             if config.update.restart_service {
-                format!(" and restarts the `{}` service", config.update.service_name)
+                format!(
+                    " and restarts the `{}` service — the route stays in place, traffic is not \
+                     interrupted",
+                    config.update.service_name
+                )
             } else {
                 String::new()
             }
@@ -603,26 +648,17 @@ async fn do_update(
         }
     }
 
-    update::install(&release, &dest).await?;
-
-    if config.update.restart_service {
-        let unit = &config.update.service_name;
-        if update::service_is_active(unit).await {
-            println!("restarting {unit} …");
-            update::restart_service(unit).await?;
-            println!("done — {unit} is running {}", release.tag);
-        } else {
-            println!(
-                "note: the `{unit}` service is not active, so nothing was restarted. \
-                 The new binary is installed and will be used on next start."
-            );
-        }
-    } else {
-        println!(
-            "note: update.restart_service = false — restart vlb yourself to use the new binary."
-        );
-    }
-
+    let plan = update::Plan {
+        config_path: config_path.to_path_buf(),
+        control_listen: config.control.listen.clone(),
+        service: config.update.service_name.clone(),
+        restart_service: config.update.restart_service,
+        skip_preflight: skip_probe,
+    };
+    let mut progress = |line: String| println!("{line}");
+    let outcome = update::perform(&release, &dest, &plan, &mut progress).await?;
+    println!();
+    println!("{}", outcome.summary());
     Ok(())
 }
 
