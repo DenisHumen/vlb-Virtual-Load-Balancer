@@ -117,14 +117,21 @@ log_count() {
 }
 
 # Does the daemon's log contain a line matching the extended regex? Reads
-# the *whole* log and retries for a few seconds. Two things learned on CI:
-# the daemon logs far more there than on a laptop, so a `--tail N` read
-# silently drops the early lines an assertion is looking for; and `compose
-# logs` on a freshly (re)created container can come back empty for a moment.
+# the whole log and retries for a few seconds (`compose logs` on a freshly
+# recreated container can come back empty for a moment).
+#
+# The log is captured first and grepped second, never piped into `grep -q`.
+# This script runs with `pipefail`, and `grep -q` exits on the first match;
+# if `compose logs` is still writing at that point it dies of SIGPIPE, the
+# pipeline reports 141, and a line that *is* in the log is reported absent.
+# That happens precisely when the match sits early in a long log — which is
+# what every startup-line assertion looks for — and only on Linux, since a
+# Windows docker client has no SIGPIPE to die of. It cost three CI runs.
 daemon_log_has() {
-    local pattern="$1" deadline="${2:-10}" waited=0
+    local pattern="$1" deadline="${2:-10}" waited=0 log
     while [ "$waited" -lt "$deadline" ]; do
-        if "${COMPOSE[@]}" logs --tail 20000 vlb 2>&1 | grep -qE -- "$pattern"; then
+        log=$("${COMPOSE[@]}" logs --tail 20000 vlb 2>&1 || true)
+        if grep -qE -- "$pattern" <<<"$log"; then
             return 0
         fi
         sleep 1; waited=$((waited+1))
@@ -145,7 +152,7 @@ restart_daemon() {
         sleep 1; waited=$((waited+1))
         new_pid=$(vlb_exec sh -c 'pgrep -x vlb | head -1' | tr -d '[:space:]')
         [ -n "$new_pid" ] && [ "$new_pid" != "$old_pid" ] || continue
-        if status_json | grep -q '"active"'; then
+        if grep -q '"active"' <<<"$(status_json)"; then
             printf '%s' "$waited"
             return 0
         fi
@@ -226,11 +233,11 @@ real_traffic_works() {
     # switchover flushes conntrack, so a request issued in that window is
     # legitimately reset; a user sees a moment's hiccup, not an outage.
     # Asserting on a single attempt would call correct behaviour a failure.
-    local waited=0
+    local waited=0 body
     while [ "$waited" -lt 12 ]; do
-        if "${COMPOSE[@]}" exec -T client \
-            curl -s --max-time 5 http://192.0.2.10/canary.txt 2>/dev/null \
-            | grep -q 'vlb-canary-v1-do-not-edit'; then
+        body=$("${COMPOSE[@]}" exec -T client \
+            curl -s --max-time 5 http://192.0.2.10/canary.txt 2>/dev/null || true)
+        if grep -q 'vlb-canary-v1-do-not-edit' <<<"$body"; then
             return 0
         fi
         sleep 1
@@ -505,8 +512,8 @@ scenario_priority_gap() {
 
     # Kernel routing tables are derived from the priority, so the gap has to
     # show up there too rather than collapsing onto one table.
-    if vlb_exec ip route show table 200 | grep -q default \
-       && vlb_exec ip route show table 202 | grep -q default; then
+    if grep -q default <<<"$(vlb_exec ip route show table 200)" \
+       && grep -q default <<<"$(vlb_exec ip route show table 202)"; then
         ok "tables 200 and 202 both populated (201 unused, as intended)"
     else
         bad "priority-gap: expected routing tables 200 and 202 to exist"
@@ -551,7 +558,7 @@ scenario_both_down() {
     else
         bad "both-down: the daemon stopped answering the control socket"
     fi
-    if vlb_exec ip -4 route show default | grep -q default; then
+    if grep -q default <<<"$(vlb_exec ip -4 route show default)"; then
         ok "kept the last-known default route instead of removing it"
     else
         bad "both-down: default route was removed, guaranteeing a black hole"
