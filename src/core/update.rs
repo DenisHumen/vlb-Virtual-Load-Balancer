@@ -26,7 +26,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 use crate::canary::hex;
 use crate::http::{self, HttpRequest, Scheme, Url};
@@ -337,7 +337,7 @@ pub async fn perform(
             dir.display()
         )
     })?;
-    info!(path = %dest.display(), backup = %backup.display(), "binary replaced");
+    debug!(path = %dest.display(), backup = %backup.display(), "binary replaced");
     progress(format!(
         "installed to {} (previous binary kept as {})",
         dest.display(),
@@ -439,11 +439,11 @@ pub async fn perform(
 /// Download the archive, verify it against the published checksum, and pull
 /// the `vlb` binary out of it. Nothing touches the disk.
 async fn fetch_verified_binary(release: &ReleaseInfo) -> Result<Vec<u8>> {
-    info!(tag = %release.tag, asset = %release.asset_name, "downloading release");
+    debug!(tag = %release.tag, asset = %release.asset_name, "downloading release");
     let archive = get_following_redirects(&release.archive_url, MAX_ASSET_BYTES)
         .await
         .context("failed to download the release archive")?;
-    info!(bytes = archive.len(), "download complete");
+    debug!(bytes = archive.len(), "download complete");
 
     // ── verify before touching anything on disk ─────────────────────────
     match &release.checksum_url {
@@ -466,7 +466,7 @@ async fn fetch_verified_binary(release: &ReleaseInfo) -> Result<Vec<u8>> {
                     release.asset_name
                 );
             }
-            info!(sha256 = %actual, "checksum verified");
+            debug!(sha256 = %actual, "checksum verified");
         }
         None => bail!(
             "release {} publishes no .sha256 for {} — refusing to install an \
@@ -647,7 +647,7 @@ async fn verify_runnable(path: &Path) -> Result<String> {
         );
     }
     let reported = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    info!(version = %reported, "downloaded binary verified as runnable");
+    debug!(version = %reported, "downloaded binary verified as runnable");
     Ok(reported)
 }
 
