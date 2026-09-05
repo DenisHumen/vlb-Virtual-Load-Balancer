@@ -764,10 +764,24 @@ scenario_missing_interface() {
     else
         bad "missing-iface: ghost provider state is '$st', expected down"
     fi
-    if "${COMPOSE[@]}" logs --tail 400 vlb 2>&1 | grep -q "could not set up this provider's routing table yet"; then
+    # The explanation is logged once at startup and again from the health
+    # loop's first retry. Read the whole log rather than a tail, and give it
+    # a moment: `compose logs` on a freshly recreated container has been
+    # seen to come back empty on a loaded host.
+    local explained=0 waited=0
+    while [ "$waited" -lt 15 ]; do
+        if "${COMPOSE[@]}" logs --tail 5000 vlb 2>&1 \
+            | grep -qE "could not set up this provider's routing table yet|routing table still cannot be set up"; then
+            explained=1
+            break
+        fi
+        sleep 1; waited=$((waited+1))
+    done
+    if [ "$explained" -eq 1 ]; then
         ok "startup explained the unusable interface and carried on"
     else
         bad "missing-iface: startup did not explain the unusable interface"
+        note "$("${COMPOSE[@]}" logs --tail 60 vlb 2>&1 | grep -iE 'ghost|eth7|routing table|prepar' | head -20)"
     fi
     real_traffic_works && ok "client traffic flows through the working providers" \
         || bad "missing-iface: client traffic broken"
@@ -1051,6 +1065,15 @@ cleanup() {
         say "  shell: docker compose -f docker/test/docker-compose.yml exec vlb bash"
         say "  down:  docker compose -f docker/test/docker-compose.yml down -v"
     else
+        # On a failure, the daemon's log is the only evidence there is, and
+        # it goes down with the lab. Print it here, before the teardown: a
+        # CI step that runs afterwards finds no containers to ask.
+        if [ "${FAIL:-0}" -gt 0 ]; then
+            say ""
+            info "daemon log (last 250 lines) before teardown:"
+            "${COMPOSE[@]}" logs --tail 250 vlb 2>&1 | sed 's/^/    /'
+            say ""
+        fi
         info "tearing the lab down"
         "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1
     fi

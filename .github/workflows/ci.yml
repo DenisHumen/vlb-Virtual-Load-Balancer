@@ -72,9 +72,9 @@ jobs:
       # Invoked through `bash` rather than executed directly: a checkout on a
       # filesystem that does not carry the exec bit would otherwise fail with
       # a bare "exit code 126" and no hint as to why.
+      #
+      # On a failure the harness prints the daemon's log itself before it
+      # tears the lab down; a separate step afterwards would find no
+      # containers left to ask.
       - name: Run the failover scenarios
         run: bash ./docker/test/run-tests.sh
-
-      - name: Daemon logs on failure
-        if: failure()
-        run: docker compose -f docker/test/docker-compose.yml logs --tail 400 vlb
