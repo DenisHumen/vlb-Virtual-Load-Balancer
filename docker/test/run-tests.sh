@@ -103,6 +103,22 @@ log_count() {
     printf '%s' "${n:-0}"
 }
 
+# Does the daemon's log contain a line matching the extended regex? Reads
+# the *whole* log and retries for a few seconds. Two things learned on CI:
+# the daemon logs far more there than on a laptop, so a `--tail N` read
+# silently drops the early lines an assertion is looking for; and `compose
+# logs` on a freshly (re)created container can come back empty for a moment.
+daemon_log_has() {
+    local pattern="$1" deadline="${2:-10}" waited=0
+    while [ "$waited" -lt "$deadline" ]; do
+        if "${COMPOSE[@]}" logs --tail 20000 vlb 2>&1 | grep -qE -- "$pattern"; then
+            return 0
+        fi
+        sleep 1; waited=$((waited+1))
+    done
+    return 1
+}
+
 # Restart the daemon *process* in place — what systemd's Restart=always (and
 # an update) does on a real box. The container, and with it the network
 # namespace and every route in it, stays as it is. Waits for the new process
@@ -570,7 +586,7 @@ scenario_restart() {
     # The daemon logs whether it skipped the flush. That line is the actual
     # assertion -- conntrack counts on a near-idle lab are too noisy to
     # compare directly.
-    if "${COMPOSE[@]}" logs --tail 200 vlb 2>&1 | grep -q "skipping the conntrack flush"; then
+    if daemon_log_has "skipping the conntrack flush"; then
         ok "recognised the route was already correct and skipped the flush"
     else
         # Not fatal on its own: with RUST_LOG=info the debug line is absent.
@@ -723,9 +739,9 @@ scenario_pin_survives_restart() {
     else
         bad "pin-restart: left the pinned provider (active = $(active_provider))"
     fi
-    "${COMPOSE[@]}" logs --tail 300 vlb 2>&1 | grep -q "operator pin restored" \
+    daemon_log_has "operator pin restored" \
         && ok "the restore is logged, so it is not a surprise later" \
-        || note "no 'pin restored' line found in the log"
+        || bad "pin-restart: no 'operator pin restored' line in the log"
 
     vlb_exec vlb --config /etc/vlb/vlb.toml auto >/dev/null 2>&1
     t=$(wait_for_active isp-main 40)
@@ -765,19 +781,8 @@ scenario_missing_interface() {
         bad "missing-iface: ghost provider state is '$st', expected down"
     fi
     # The explanation is logged once at startup and again from the health
-    # loop's first retry. Read the whole log rather than a tail, and give it
-    # a moment: `compose logs` on a freshly recreated container has been
-    # seen to come back empty on a loaded host.
-    local explained=0 waited=0
-    while [ "$waited" -lt 15 ]; do
-        if "${COMPOSE[@]}" logs --tail 5000 vlb 2>&1 \
-            | grep -qE "could not set up this provider's routing table yet|routing table still cannot be set up"; then
-            explained=1
-            break
-        fi
-        sleep 1; waited=$((waited+1))
-    done
-    if [ "$explained" -eq 1 ]; then
+    # loop's first retry.
+    if daemon_log_has "could not set up this provider's routing table yet|routing table still cannot be set up" 15; then
         ok "startup explained the unusable interface and carried on"
     else
         bad "missing-iface: startup did not explain the unusable interface"
@@ -1010,7 +1015,7 @@ scenario_soak() {
     fi
 
     # Flap backoff should have kicked in and be visible, not silent.
-    if "${COMPOSE[@]}" logs --tail 400 vlb 2>&1 | grep -qi "failback pending"; then
+    if daemon_log_has "failback pending"; then
         ok "failback backoff engaged and logged during the flapping"
     else
         note "no failback-pending line (expected at RUST_LOG=debug)"
@@ -1074,6 +1079,9 @@ cleanup() {
             "${COMPOSE[@]}" logs --tail 250 vlb 2>&1 | sed 's/^/    /'
             say ""
         fi
+        # Volume differs a lot between hosts; knowing it is what explains a
+        # log-grep assertion that passes here and fails elsewhere.
+        note "daemon log size at teardown: $("${COMPOSE[@]}" logs vlb 2>/dev/null | wc -l | tr -d ' ') lines"
         info "tearing the lab down"
         "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1
     fi
