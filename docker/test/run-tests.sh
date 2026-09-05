@@ -45,7 +45,20 @@ bad()  { printf '  %sFAIL%s %s\n' "$RED" "$RST" "$*"; FAIL=$((FAIL+1)); FAILED_N
 note() { printf '  %s%s%s\n' "$DIM" "$*" "$RST"; }
 
 vlb_exec() { "${COMPOSE[@]}" exec -T vlb "$@" 2>/dev/null; }
-isp_mode() { "${COMPOSE[@]}" exec -T "$1" isp-mode "$2" >/dev/null 2>&1; }
+
+# Switch an ISP node's mode. A `docker exec` that fails under load would
+# leave the scenario running against a network it did not set up and blame
+# vlb for the result, so retry a couple of times and say so if it still
+# fails rather than ignoring it.
+isp_mode() {
+    local try=0
+    while [ "$try" -lt 3 ]; do
+        "${COMPOSE[@]}" exec -T "$1" isp-mode "$2" >/dev/null 2>&1 && return 0
+        try=$((try+1)); sleep 1
+    done
+    note "isp_mode $1 $2 failed three times — the scenario's setup is suspect"
+    return 1
+}
 
 # Parse the daemon's JSON status with a real JSON parser rather than
 # grep/cut. The pretty-printed output leaves a trailing comma on every value,
@@ -965,10 +978,19 @@ scenario_concurrent_force() {
 
     vlb_exec vlb --config /etc/vlb/vlb.toml auto >/dev/null 2>&1
     isp_mode isp1 good
-    local t; t=$(wait_for_active isp-main 60)
-    [ "$(active_provider)" = "isp-main" ] \
-        && ok "settled back onto the primary in ${t}s" \
-        || bad "concurrent-force: did not settle (${t}s)"
+    # "Settled" means stable, not glimpsed: the operator commands above
+    # were deliberately racing the health loop, so a single sample can land
+    # mid-transition — seen on CI as isp-main for one read and the backup on
+    # the next. Require several consecutive reads, as the other scenarios
+    # that follow a recovery do.
+    local t; t=$(wait_until_stable isp-main 60 3)
+    if [ "$(active_provider)" = "isp-main" ]; then
+        ok "settled back onto the primary in ${t}s"
+    else
+        bad "concurrent-force: did not settle (${t}s, active = $(active_provider))"
+        note "$(log_count FAILOVER) switchovers logged in total; the last ones:"
+        note "$("${COMPOSE[@]}" logs vlb 2>&1 | grep -E 'FAILOVER|override' | tail -6 | cut -c1-160)"
+    fi
     real_traffic_works && ok "client traffic works after the race" \
         || bad "concurrent-force: traffic broken"
 }
