@@ -90,6 +90,13 @@ pub enum Decision {
         incumbent: String,
         candidate: String,
     },
+    /// Nothing is installed yet, a provider is healthy, but one with a
+    /// *better* priority has not been probed to a verdict. Wait the few
+    /// rounds that takes rather than install the lesser one now and fail
+    /// back — with a conntrack flush each way — moments later. The wait is
+    /// bounded by the health loop: every provider reaches Up or Down within
+    /// `max(success_threshold, failure_threshold)` rounds.
+    WaitingForFirstVerdict { pending: String, candidate: String },
     /// Nothing is healthy. The caller keeps whatever route is installed —
     /// a black-holing route is still better than no route at all, and the
     /// alternative would drop even the traffic that might still work.
@@ -148,7 +155,27 @@ pub fn decide(input: &SelectionInput) -> Decision {
     };
 
     let Some(cur_name) = current.as_deref() else {
-        // Nothing installed yet — first healthy provider wins outright.
+        // Nothing installed yet (a cold start: boot, or a container whose
+        // routes did not survive). Before taking the first healthy provider,
+        // give any better-priority one that has not been probed to a verdict
+        // yet the few rounds it needs. On links of unequal speed the backup
+        // finishes its rounds first; installing it would mean a switch to
+        // the primary — and a flush of every connection made meanwhile —
+        // seconds later, when the primary was fine all along.
+        //
+        // Only *better* providers are waited for, only while still Unknown,
+        // and a verdict always arrives within a few rounds: a dead primary
+        // is proven dead just as quickly as a live one is proven live.
+        if let Some(pending) = providers
+            .iter()
+            .filter(|p| p.state == State::Unknown && p.priority < best.priority)
+            .min_by_key(|p| p.priority)
+        {
+            return Decision::WaitingForFirstVerdict {
+                pending: pending.name.clone(),
+                candidate: best.name.clone(),
+            };
+        }
         return Decision::Switch {
             to: best.name.clone(),
             reason: "initial selection".to_string(),
@@ -433,9 +460,83 @@ mod tests {
         let d = decide(&input(
             secs(0),
             None,
+            vec![unknown("main", 0), unknown("backup", 2)],
+        ));
+        assert_eq!(d, Decision::NoHealthyProvider);
+    }
+
+    // ── cold start: nothing installed yet ──────────────────────────────
+
+    /// The backup's probes finish first (it is the faster link). Installing
+    /// it now would mean switching to the primary — and flushing every
+    /// connection made in between — a few seconds later. Wait for the
+    /// primary's verdict instead; it is only a couple of rounds away.
+    #[test]
+    fn first_selection_waits_for_a_better_provider_still_being_probed() {
+        let d = decide(&input(
+            secs(0),
+            None,
             vec![unknown("main", 0), up("backup", 2, t0())],
         ));
+        assert_eq!(
+            d,
+            Decision::WaitingForFirstVerdict {
+                pending: "main".into(),
+                candidate: "backup".into(),
+            }
+        );
+
+        // Verdict: healthy — the primary is installed, one switch total.
+        let d = decide(&input(
+            secs(3),
+            None,
+            vec![up("main", 0, secs(3)), up("backup", 2, t0())],
+        ));
+        assert_eq!(switched_to(&d), Some("main"));
+
+        // Verdict: down — the backup is installed at once.
+        let d = decide(&input(
+            secs(3),
+            None,
+            vec![down("main", 0), up("backup", 2, t0())],
+        ));
         assert_eq!(switched_to(&d), Some("backup"));
+    }
+
+    /// Only a *better* provider is worth waiting for. An unprobed backup
+    /// must not delay installing a healthy primary.
+    #[test]
+    fn first_selection_does_not_wait_for_a_worse_provider() {
+        let d = decide(&input(
+            secs(0),
+            None,
+            vec![up("main", 0, t0()), unknown("backup", 2)],
+        ));
+        assert_eq!(switched_to(&d), Some("main"));
+
+        // Three tiers: the middle one is healthy, the best is still being
+        // probed, the worst is unknown. Wait for the best only.
+        let d = decide(&input(
+            secs(0),
+            None,
+            vec![unknown("a", 0), up("b", 1, t0()), unknown("c", 2)],
+        ));
+        assert!(
+            matches!(&d, Decision::WaitingForFirstVerdict { pending, .. } if pending == "a"),
+            "{d:?}"
+        );
+    }
+
+    /// An operator pin outranks the wait, as it outranks everything else.
+    #[test]
+    fn first_selection_with_a_pin_does_not_wait() {
+        let mut i = input(
+            secs(0),
+            None,
+            vec![unknown("main", 0), up("backup", 2, t0())],
+        );
+        i.forced = Some("backup".into());
+        assert_eq!(switched_to(&decide(&i)), Some("backup"));
     }
 
     // ── the failure we are fixing ──────────────────────────────────────

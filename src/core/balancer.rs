@@ -1268,6 +1268,16 @@ impl Balancer {
                 Ok(())
             }
 
+            Decision::WaitingForFirstVerdict { pending, candidate } => {
+                debug!(
+                    pending = %pending,
+                    candidate = %candidate,
+                    "cold start: a healthy provider is available but a better one is still \
+                     being probed — waiting for its verdict rather than switching twice"
+                );
+                Ok(())
+            }
+
             Decision::WaitingForFailback {
                 candidate,
                 stable_for,

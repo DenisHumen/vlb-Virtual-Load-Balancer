@@ -20,7 +20,7 @@ installs the highest-priority healthy one as the kernel default route,
 flushes conntrack on switch, and ships a TUI / control protocol / SQLite
 stats so you can actually see what's happening.
 
-> **Status:** `0.3.0`. Runs in production, and the failover behaviour is
+> **Status:** `0.3.1`. Runs in production, and the failover behaviour is
 > covered by a docker lab that breaks the network eight different ways — and
 > restarts the daemon under it three more — on every CI run. Still pre-1.0:
 > config keys can change between minor versions, and `vlb check` will tell
@@ -96,7 +96,10 @@ fast, and gives you a real dashboard.
   this process has probed it to a verdict of its own. No route change, no
   conntrack flush, no thirty-second detour through the backup because its
   probes happened to finish first. The operator's pin and the flap history
-  survive the restart too.
+  survive the restart too. On a cold start — a reboot, where there is no
+  route to adopt — it waits the few rounds a better-priority provider needs
+  for its verdict instead of installing the first healthy one and switching
+  again moments later.
 * **Starts even when an uplink's interface is not there yet.** A provider
   whose NIC is late to appear at boot (or gone) is reported down and
   retried every health interval; the others are managed normally.
