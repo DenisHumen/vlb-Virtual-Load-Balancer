@@ -2,9 +2,14 @@ use colored::Colorize;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::time::ChronoLocal;
 
-pub fn init() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,vlb=debug,virtual_load_balancer=debug"));
+/// Initialise tracing. `RUST_LOG` wins when set; `default` applies otherwise.
+///
+/// The daemon and the one-shot subcommands want different defaults: `vlb
+/// run` in a terminal is a debugging session and should be chatty, while
+/// `vlb update` or `vlb probe` are read by an operator who wants the
+/// command's own output, not the tracing stream interleaved with it.
+pub fn init(default: &str) {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)

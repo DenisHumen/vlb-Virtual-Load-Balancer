@@ -158,9 +158,15 @@ enum Command {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    logger::init();
-
     let command = cli.command.as_ref().cloned().unwrap_or(Command::Run);
+    // The daemon is chatty on purpose; the one-shot commands are not. An
+    // operator running `sudo vlb update` wants the updater's progress lines,
+    // not tracing's debug stream printed in between them.
+    logger::init(match command {
+        Command::Run => "info,vlb=debug",
+        _ => "info",
+    });
+
     match command {
         Command::Check => {
             let config = Config::load(&cli.config)?;

@@ -20,7 +20,7 @@ installs the highest-priority healthy one as the kernel default route,
 flushes conntrack on switch, and ships a TUI / control protocol / SQLite
 stats so you can actually see what's happening.
 
-> **Status:** `0.3.1`. Runs in production, and the failover behaviour is
+> **Status:** `0.3.2`. Runs in production, and the failover behaviour is
 > covered by a docker lab that breaks the network eight different ways — and
 > restarts the daemon under it three more — on every CI run. Still pre-1.0:
 > config keys can change between minor versions, and `vlb check` will tell
