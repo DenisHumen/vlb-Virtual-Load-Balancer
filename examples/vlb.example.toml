@@ -71,7 +71,10 @@ quorum = "majority"
 # symptom, so that acts immediately.
 failure_threshold = 2
 
-user_agent = "vlb/0.2.1 (uplink-canary)"
+# Left unset on purpose: the default is "vlb/<version> (uplink-canary)" and
+# follows the binary. Pinned here, every gateway set up from this template
+# would keep announcing the version it was installed at.
+# user_agent = "vlb/0.0.0 (uplink-canary)"
 
 # The two plain-HTTP endpoints are the industry-standard captive-portal
 # probes (what Android and Firefox use). Plain HTTP is exactly what an
