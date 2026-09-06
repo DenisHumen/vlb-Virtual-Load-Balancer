@@ -23,6 +23,7 @@
 #   system             Fetch recent host metric samples (JSON)
 #   diag               Diagnostic dump (interfaces, DB rows, control port)
 #   probe              Time every health layer per provider (sizes your timeouts)
+#   clients            Who is behind the gateway: traffic, uptime, drops
 #   update             Install the newest release from GitHub
 #   test               fmt + clippy + unit tests; `test --lab` adds the docker lab
 #   logs               Tail the daemon log file
@@ -30,11 +31,21 @@
 #   uninstall-service  Disable + remove the installed systemd unit
 #   help               Show this help
 #
+# Updating from a git checkout:
+#   git pull && sudo bash scripts/vlb.sh restart
+#
+#   Any command that needs the binary rebuilds it when the sources are newer,
+#   and then restarts the running daemon so the new build actually takes
+#   over — a rebuild alone leaves the old process running. The restart does
+#   not interrupt traffic: the new daemon adopts the route the old one left.
+#
 # Environment:
 #   VLB_CONFIG   path to the TOML config (default: examples/vlb.example.toml)
 #   VLB_BIN      path to the vlb binary   (default: ./target/release/vlb)
 #   VLB_LOG      path to the log file     (default: /var/log/vlb.log or /tmp/vlb.log)
 #   VLB_PID      path to the pid file     (default: /run/vlb.pid or /tmp/vlb.pid)
+#   VLB_SERVICE  systemd unit to restart  (default: vlb)
+#   VLB_NO_RESTART=1  rebuild without restarting the running daemon
 
 set -Eeuo pipefail
 
@@ -44,6 +55,7 @@ cd "${REPO_DIR}"
 
 VLB_CONFIG=${VLB_CONFIG:-"${REPO_DIR}/examples/vlb.example.toml"}
 VLB_BIN=${VLB_BIN:-"${REPO_DIR}/target/release/vlb"}
+VLB_SERVICE=${VLB_SERVICE:-vlb}
 
 # Choose writable locations based on effective UID so the script is usable
 # both as an operator smoke-test and as a production launcher.
@@ -131,6 +143,48 @@ require_bin() {
         ensure_rust
         log "building release binary..."
         cmd_build
+        restart_after_rebuild
+    fi
+}
+
+# A rebuild replaces the binary on disk; the *running* daemon carries on with
+# the old one until something restarts it. That is the confusing half of
+# updating from a git checkout: `git pull` followed by a command that
+# rebuilds looks like it updated everything, while the daemon keeps running
+# the previous build and none of the new behaviour appears.
+#
+# So restart it here. This is safe by design: since 0.3.0 a restart does not
+# disturb traffic — the new process adopts the default route the old one left
+# in the kernel and re-verifies it before it would move anything, so no route
+# changes and no connection is reset.
+restart_after_rebuild() {
+    [[ "${VLB_NO_RESTART:-0}" == "1" ]] && return 0
+
+    local systemd_active=0 pidfile_active=0
+    command -v systemctl >/dev/null \
+        && systemctl is-active --quiet "$VLB_SERVICE" 2>/dev/null \
+        && systemd_active=1
+    is_running && pidfile_active=1
+
+    (( systemd_active || pidfile_active )) || return 0
+
+    if [[ $EUID -ne 0 ]]; then
+        warn "the binary was rebuilt, but the running daemon is still the old build"
+        warn "  restart it with:  sudo bash scripts/vlb.sh restart"
+        return 0
+    fi
+
+    if (( systemd_active )); then
+        log "restarting ${VLB_SERVICE} so the new build takes over"
+        if systemctl restart "$VLB_SERVICE"; then
+            ok "${VLB_SERVICE} restarted — traffic kept flowing (the route is adopted, not re-chosen)"
+        else
+            warn "could not restart ${VLB_SERVICE}; it is still running the previous build"
+        fi
+    else
+        log "restarting the daemon so the new build takes over"
+        cmd_stop
+        cmd_start
     fi
 }
 require_cfg()   { [[ -r "$VLB_CONFIG" ]] || die "config not readable: $VLB_CONFIG"; }
@@ -266,7 +320,8 @@ cmd_uninstall_service() {
     ok "service removed (config at /etc/vlb kept intact)"
 }
 
-cmd_probe()  { require_bin; require_cfg; "$VLB_BIN" --config "$VLB_CONFIG" probe "$@"; }
+cmd_probe()   { require_bin; require_cfg; "$VLB_BIN" --config "$VLB_CONFIG" probe "$@"; }
+cmd_clients() { require_bin; require_cfg; "$VLB_BIN" --config "$VLB_CONFIG" clients "$@"; }
 
 cmd_update() {
     # Self-update needs to write the installed binary and bounce the unit,
@@ -318,7 +373,12 @@ cmd_test() {
     ok "all checks passed — safe to push"
 }
 
-cmd_help() { sed -n '2,37p' "$0"; }
+# Print the header comment as the help text. Derived from the file rather
+# than from a hard-coded line range, which silently went stale every time a
+# command was added.
+cmd_help() {
+    awk 'NR > 1 { if (/^#/) { sub(/^# ?/, ""); print } else { exit } }' "$0"
+}
 
 cmd_up() {
     # "just start everything" — build if needed, start daemon, show status.
@@ -349,6 +409,7 @@ main() {
         system)             cmd_system "$@" ;;
         diag)               cmd_diag ;;
         probe)              cmd_probe "$@" ;;
+        clients)            cmd_clients "$@" ;;
         update)             cmd_update "$@" ;;
         test)               cmd_test "$@" ;;
         logs)               cmd_logs ;;

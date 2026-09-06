@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
@@ -30,8 +31,146 @@ pub struct Config {
     #[serde(default)]
     pub system: SystemConfig,
     #[serde(default)]
+    pub clients: ClientsConfig,
+    #[serde(default)]
     pub update: UpdateConfig,
     pub providers: Vec<Provider>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// LAN clients
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Per-client accounting: who is behind the gateway, how much they move, and
+/// when they were connected.
+///
+/// The counting is done by the kernel through an iptables chain of
+/// counting-only rules (see [`crate::clients`]), so it costs one rule per
+/// client per direction and no packet handling of our own.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ClientsConfig {
+    /// Left unset, this follows `firewall.manage`. An operator who told vlb
+    /// not to touch their firewall should not find a new chain in it because
+    /// a feature defaulted to on; setting this explicitly overrides that
+    /// either way.
+    pub enabled: Option<bool>,
+    /// How often presence and counters are read. Cheap: two command
+    /// invocations per tick regardless of how many clients there are.
+    #[serde(default = "default_clients_interval")]
+    pub interval_secs: u64,
+    /// How often accumulated traffic is written to the database. Sampling is
+    /// frequent so the live rates are responsive; persistence is not, because
+    /// a row every few seconds per client is how a stats database becomes
+    /// gigabytes.
+    #[serde(default = "default_clients_persist")]
+    pub persist_every_secs: u64,
+    /// A client not seen for this long is considered disconnected. Must be
+    /// comfortably longer than the sampling interval, or an ordinary missed
+    /// ARP reply becomes a "disconnection" in the history.
+    #[serde(default = "default_offline_after")]
+    pub offline_after_secs: u64,
+    /// How long per-client history is kept. The roster is never pruned.
+    #[serde(default = "default_clients_retention")]
+    pub retention_hours: u32,
+    /// Ping stale neighbours to refresh their ARP entry. Without this an
+    /// idle-but-present host looks disconnected after half a minute.
+    #[serde(default = "default_true")]
+    pub presence_probe: bool,
+    /// Look names up through the system resolver (`getent hosts`) for
+    /// clients that no DHCP lease or hosts file explains.
+    #[serde(default = "default_true")]
+    pub resolve_hostnames: bool,
+    /// Ceiling on how many clients get accounting rules.
+    #[serde(default = "default_max_tracked")]
+    pub max_tracked: usize,
+    /// DHCP lease files to read hostnames from. The defaults cover dnsmasq,
+    /// OpenWrt and Kea; a file that does not exist is simply skipped.
+    #[serde(default = "default_lease_files")]
+    pub lease_files: Vec<String>,
+    /// Addresses that are never clients — a managed switch, an access point,
+    /// a second router on the same segment. Provider gateways and this
+    /// host's own addresses are excluded automatically.
+    #[serde(default)]
+    pub exclude: Vec<Ipv4Addr>,
+    /// Names for machines that cannot introduce themselves.
+    #[serde(default)]
+    pub names: Vec<ClientName>,
+}
+
+/// An operator-assigned name for one machine, keyed by MAC (survives a
+/// changed lease) or by IP (for anything static).
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ClientName {
+    pub name: String,
+    pub mac: Option<String>,
+    pub ip: Option<Ipv4Addr>,
+}
+
+impl Default for ClientsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: None,
+            interval_secs: default_clients_interval(),
+            persist_every_secs: default_clients_persist(),
+            offline_after_secs: default_offline_after(),
+            retention_hours: default_clients_retention(),
+            presence_probe: true,
+            resolve_hostnames: true,
+            max_tracked: default_max_tracked(),
+            lease_files: default_lease_files(),
+            exclude: Vec::new(),
+            names: Vec::new(),
+        }
+    }
+}
+
+fn default_clients_interval() -> u64 {
+    5
+}
+fn default_clients_persist() -> u64 {
+    60
+}
+fn default_offline_after() -> u64 {
+    180
+}
+fn default_clients_retention() -> u32 {
+    168 // a week
+}
+fn default_max_tracked() -> usize {
+    512
+}
+fn default_lease_files() -> Vec<String> {
+    vec![
+        "/var/lib/misc/dnsmasq.leases".into(),
+        "/var/lib/dnsmasq/dnsmasq.leases".into(),
+        "/tmp/dhcp.leases".into(), // OpenWrt
+        "/var/lib/kea/kea-leases4.csv".into(),
+    ]
+}
+
+impl ClientsConfig {
+    /// Whether accounting runs, given what the firewall settings say.
+    pub fn is_enabled(&self, firewall_manage: bool) -> bool {
+        self.enabled.unwrap_or(firewall_manage)
+    }
+
+    /// Operator labels, split by what they are keyed on. MACs are lowercased
+    /// so they match whatever case the kernel prints.
+    pub fn labels(&self) -> (HashMap<String, String>, HashMap<Ipv4Addr, String>) {
+        let mut by_mac = HashMap::new();
+        let mut by_ip = HashMap::new();
+        for n in &self.names {
+            if let Some(mac) = &n.mac {
+                by_mac.insert(mac.trim().to_ascii_lowercase(), n.name.clone());
+            }
+            if let Some(ip) = n.ip {
+                by_ip.insert(ip, n.name.clone());
+            }
+        }
+        (by_mac, by_ip)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -964,6 +1103,67 @@ impl Config {
             bail!("system.interval_secs must be >= 1 when system.enabled = true");
         }
 
+        // ── clients ─────────────────────────────────────────────────────
+        if self.clients.is_enabled(self.firewall.manage) {
+            let c = &self.clients;
+            if c.interval_secs == 0 {
+                bail!("clients.interval_secs must be >= 1");
+            }
+            // A client is declared gone when it has not been seen for
+            // `offline_after_secs`. Set that anywhere near the sampling
+            // interval and a single missed ARP reply is recorded as a
+            // disconnection, which turns the history into noise.
+            if c.offline_after_secs < c.interval_secs.saturating_mul(3) {
+                bail!(
+                    "clients.offline_after_secs ({}) must be at least 3× \
+                     clients.interval_secs ({}), otherwise one missed reply is recorded \
+                     as a disconnection",
+                    c.offline_after_secs,
+                    c.interval_secs
+                );
+            }
+            if c.persist_every_secs < c.interval_secs {
+                bail!(
+                    "clients.persist_every_secs ({}) must be >= clients.interval_secs ({})",
+                    c.persist_every_secs,
+                    c.interval_secs
+                );
+            }
+            if c.max_tracked == 0 || c.max_tracked > 4096 {
+                bail!("clients.max_tracked must be between 1 and 4096");
+            }
+            for n in &c.names {
+                if n.name.trim().is_empty() {
+                    bail!("every entry in [[clients.names]] needs a non-empty name");
+                }
+                match (&n.mac, n.ip) {
+                    (Some(_), Some(_)) => bail!(
+                        "[[clients.names]] entry {:?} sets both mac and ip — pick one",
+                        n.name
+                    ),
+                    (None, None) => bail!(
+                        "[[clients.names]] entry {:?} sets neither mac nor ip",
+                        n.name
+                    ),
+                    (Some(mac), None) => {
+                        let parts: Vec<&str> = mac.split(':').collect();
+                        let well_formed = parts.len() == 6
+                            && parts
+                                .iter()
+                                .all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()));
+                        if !well_formed {
+                            bail!(
+                                "[[clients.names]] entry {:?} has mac {mac:?}, which is not \
+                                 six colon-separated hex pairs (e.g. \"a4:5e:60:11:22:33\")",
+                                n.name
+                            );
+                        }
+                    }
+                    (None, Some(_)) => {}
+                }
+            }
+        }
+
         // ── canary ──────────────────────────────────────────────────────
         if self.canary.enabled {
             if self.canary.targets.is_empty() {
@@ -1194,6 +1394,42 @@ impl Config {
             self.failover.max_failback_stable_secs,
             self.failover.route_watchdog_secs
         );
+        let _ = writeln!(s, "clients (per-host accounting):");
+        if self.clients.is_enabled(self.firewall.manage) {
+            let _ = writeln!(
+                s,
+                "  interval={}s persist_every={}s offline_after={}s retention={}h max={}",
+                self.clients.interval_secs,
+                self.clients.persist_every_secs,
+                self.clients.offline_after_secs,
+                self.clients.retention_hours,
+                self.clients.max_tracked
+            );
+            let _ = writeln!(
+                s,
+                "  presence_probe={} resolve_hostnames={} named={} excluded={}",
+                self.clients.presence_probe,
+                self.clients.resolve_hostnames,
+                self.clients.names.len(),
+                self.clients.exclude.len()
+            );
+            let _ = writeln!(
+                s,
+                "  lan_interface={} (neighbour scan)",
+                self.general.lan_interface.as_deref().unwrap_or("(all)")
+            );
+        } else {
+            let _ = writeln!(
+                s,
+                "  DISABLED — `vlb clients` and the dashboard's client view will be empty{}",
+                if self.clients.enabled.is_none() {
+                    " (following firewall.manage = false; set clients.enabled = true to \
+                     account anyway)"
+                } else {
+                    ""
+                }
+            );
+        }
         let _ = writeln!(s, "update:");
         let _ = writeln!(
             s,
@@ -1305,6 +1541,7 @@ mod tests {
             control: ControlConfig::default(),
             traffic: TrafficConfig::default(),
             system: SystemConfig::default(),
+            clients: ClientsConfig::default(),
             providers,
         }
     }
@@ -1621,6 +1858,140 @@ mod tests {
                 .validate()
                 .is_err()
         );
+    }
+
+    // ── clients ────────────────────────────────────────────────────────
+
+    /// Accounting adds a chain to the firewall, so an operator who said
+    /// "don't touch my firewall" must not get one by default — but must be
+    /// able to ask for it.
+    #[test]
+    fn client_accounting_follows_the_firewall_setting_unless_told_otherwise() {
+        let mut cfg = base_cfg(vec![provider("p", 0)]);
+        assert!(cfg.clients.is_enabled(cfg.firewall.manage));
+
+        cfg.firewall.manage = false;
+        assert!(
+            !cfg.clients.is_enabled(cfg.firewall.manage),
+            "unset must follow firewall.manage"
+        );
+        assert!(cfg.summary().contains("following firewall.manage = false"));
+
+        cfg.clients.enabled = Some(true);
+        assert!(cfg.clients.is_enabled(cfg.firewall.manage));
+        cfg.validate().unwrap();
+
+        cfg.clients.enabled = Some(false);
+        cfg.firewall.manage = true;
+        assert!(!cfg.clients.is_enabled(cfg.firewall.manage));
+    }
+
+    /// A grace period near the sampling interval turns one missed ARP reply
+    /// into a recorded disconnection, which is worse than useless — it is
+    /// history that lies.
+    #[test]
+    fn clients_reject_an_offline_window_too_close_to_the_interval() {
+        let mut cfg = base_cfg(vec![provider("p", 0)]);
+        cfg.clients.interval_secs = 5;
+        cfg.clients.offline_after_secs = 10;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("recorded as a disconnection"), "{err}");
+
+        cfg.clients.offline_after_secs = 15;
+        cfg.validate().expect("3x the interval is the minimum");
+
+        cfg.clients.persist_every_secs = 2;
+        assert!(cfg.validate().is_err(), "persisting faster than sampling");
+    }
+
+    #[test]
+    fn client_names_need_exactly_one_key_and_a_valid_mac() {
+        let mut cfg = base_cfg(vec![provider("p", 0)]);
+
+        cfg.clients.names = vec![ClientName {
+            name: "Denis PC".into(),
+            mac: Some("a4:5e:60:11:22:33".into()),
+            ip: None,
+        }];
+        cfg.validate().unwrap();
+
+        cfg.clients.names = vec![ClientName {
+            name: "both".into(),
+            mac: Some("a4:5e:60:11:22:33".into()),
+            ip: Some("10.0.0.5".parse().unwrap()),
+        }];
+        assert!(cfg.validate().unwrap_err().to_string().contains("pick one"));
+
+        cfg.clients.names = vec![ClientName {
+            name: "neither".into(),
+            mac: None,
+            ip: None,
+        }];
+        assert!(cfg.validate().is_err());
+
+        cfg.clients.names = vec![ClientName {
+            name: "bad mac".into(),
+            mac: Some("a4-5e-60-11-22-33".into()),
+            ip: None,
+        }];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("colon-separated hex pairs"), "{err}");
+    }
+
+    #[test]
+    fn client_labels_are_indexed_by_lowercased_mac_and_by_ip() {
+        let mut cfg = base_cfg(vec![provider("p", 0)]);
+        cfg.clients.names = vec![
+            ClientName {
+                name: "Denis PC".into(),
+                mac: Some("A4:5E:60:11:22:33".into()),
+                ip: None,
+            },
+            ClientName {
+                name: "NAS".into(),
+                mac: None,
+                ip: Some("10.0.0.9".parse().unwrap()),
+            },
+        ];
+        let (by_mac, by_ip) = cfg.clients.labels();
+        assert_eq!(by_mac["a4:5e:60:11:22:33"], "Denis PC");
+        assert_eq!(by_ip[&"10.0.0.9".parse().unwrap()], "NAS");
+    }
+
+    #[test]
+    fn clients_section_parses_from_toml() {
+        let raw = r#"
+[clients]
+enabled = true
+interval_secs = 5
+offline_after_secs = 90
+exclude = ["10.0.0.3"]
+
+[[clients.names]]
+name = "Denis PC"
+mac = "a4:5e:60:11:22:33"
+
+[[clients.names]]
+name = "NAS"
+ip = "10.0.0.9"
+
+[[providers]]
+name = "main"
+gateway = "10.0.0.2"
+interface = "eth0"
+priority = 0
+"#;
+        let cfg: Config = toml::from_str(raw).expect("parse");
+        cfg.validate().expect("validate");
+        assert_eq!(cfg.clients.names.len(), 2);
+        assert_eq!(
+            cfg.clients.exclude,
+            vec!["10.0.0.3".parse::<Ipv4Addr>().unwrap()]
+        );
+        // Defaults fill in the rest.
+        assert_eq!(cfg.clients.retention_hours, 168);
+        assert!(cfg.clients.presence_probe);
+        assert!(!cfg.clients.lease_files.is_empty());
     }
 
     #[test]

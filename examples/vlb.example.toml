@@ -197,6 +197,62 @@ interval_secs = 2
 retention_hours = 72
 per_core = true
 
+# ─────────────────────────────────────────────────────────────────────────
+# Per-client accounting: who is behind the gateway, how much they move, and
+# when they were connected. Read it with `vlb clients`, or press `c` in the
+# dashboard.
+#
+# Traffic is counted by the kernel: vlb keeps an iptables chain of
+# counting-only rules, two per client, hooked into FORWARD. Presence comes
+# from the ARP table, refreshed by an occasional ping so an idle host is not
+# mistaken for one that has left.
+# ─────────────────────────────────────────────────────────────────────────
+[clients]
+# Unset, this follows `firewall.manage`: if vlb already manages your
+# firewall it will add the accounting chain too. Set it explicitly to decide
+# for yourself.
+enabled = true
+
+# How often presence and counters are read — two commands per tick,
+# regardless of how many clients there are.
+interval_secs = 5
+# How often accumulated traffic is written to the database. Sampling is
+# frequent so the live rates are responsive; writing is not, because a row
+# every few seconds per client is how a stats database becomes gigabytes.
+persist_every_secs = 60
+# A host not seen for this long counts as disconnected. Must be at least 3×
+# `interval_secs`, or one missed ARP reply is recorded as a disconnection.
+offline_after_secs = 180
+# How long per-client history is kept. The roster of known hosts is never
+# pruned, so a laptop that returns after a holiday is still recognised.
+retention_hours = 168
+
+# Ping stale neighbours to refresh their ARP entry. Without this, a host that
+# is present but idle looks disconnected after about half a minute.
+presence_probe = true
+# Look up names through the system resolver for clients no DHCP lease or
+# /etc/hosts entry explains.
+resolve_hostnames = true
+# Ceiling on how many hosts get accounting rules.
+max_tracked = 512
+
+# Hosts that are never clients. Provider gateways and this machine's own
+# addresses are excluded automatically; this is for the managed switch, the
+# access point, the second router.
+# exclude = ["192.168.8.2"]
+
+# Names for machines that cannot introduce themselves. Keyed by MAC (survives
+# a changed lease) or by IP (for anything static). These win over whatever
+# hostname the machine announced.
+# [[clients.names]]
+# name = "Denis PC"
+# mac  = "a4:5e:60:11:22:33"
+#
+# [[clients.names]]
+# name = "NAS"
+# ip   = "192.168.8.9"
+
+# ─────────────────────────────────────────────────────────────────────────
 # Used by `vlb update` and by the TUI's `u` key. Before the binary is
 # replaced, the new build must run here, accept this config (`check`) and
 # reach the canary targets (`probe`); after the restart the service must

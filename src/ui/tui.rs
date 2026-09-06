@@ -15,9 +15,13 @@
 //!   ↑/↓ or j/k    — select provider
 //!   f / Enter     — force-pin selected provider
 //!   a             — release pin (auto)
+//!   c             — LAN clients: who is connected, traffic, drops
 //!   r             — refresh immediately
 //!   u             — check for a new release and install it
 //!   q / Esc / ^C  — quit
+//!
+//! On the client screens ↑/↓ moves between hosts, Enter opens one host's
+//! full history, `w` cycles the reporting window and Esc goes back.
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -41,12 +45,34 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 
-use crate::balancer::{ControlSnapshot, ProviderSnapshot, State};
+use crate::balancer::{ClientDetail, ClientInfo, ControlSnapshot, ProviderSnapshot, State};
 use crate::config::Config;
 use crate::control::{
     self, FailoverEventWire, Request, Response, SystemPointWire, TrafficPointWire,
 };
+// Formatting lives in one module so the dashboard, the CLI reports and the
+// stats summary cannot drift apart on what a megabyte is.
+use crate::format::{
+    ago as fmt_ago, bytes as fmt_bytes, count as fmt_count, duration as fmt_duration,
+    rate as fmt_rate, rate_from_bytes as fmt_rate_bytes, stamp as fmt_stamp,
+    stamp_secs as fmt_stamp_secs,
+};
 use crate::update;
+
+/// Which screen the dashboard is showing.
+///
+/// The client views are screens rather than overlays: they are tables the
+/// operator navigates and reads, and squeezing them into a corner of the
+/// provider dashboard would make both unreadable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum View {
+    Dashboard,
+    Clients,
+    ClientDetail,
+}
+
+/// Reporting windows the client views cycle through with `w`.
+const WINDOWS: [(u32, &str); 4] = [(1, "1h"), (24, "24h"), (168, "7d"), (720, "30d")];
 
 pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
     let listen = config.control.listen.clone();
@@ -105,6 +131,13 @@ struct App {
     traffic: HashMap<String, Vec<TrafficPointWire>>,
     system: Vec<SystemPointWire>,
     events: Vec<FailoverEventWire>,
+    view: View,
+    clients: Vec<ClientInfo>,
+    client_selected: usize,
+    client_detail: Option<Box<ClientDetail>>,
+    /// Index into [`WINDOWS`].
+    window: usize,
+    client_error: Option<String>,
     last_message: Option<(String, Instant)>,
     last_refresh: Instant,
     /// Consecutive refreshes that could not reach the daemon — during an
@@ -129,6 +162,12 @@ impl App {
             traffic: HashMap::new(),
             system: Vec::new(),
             events: Vec::new(),
+            view: View::Dashboard,
+            clients: Vec::new(),
+            client_selected: 0,
+            client_detail: None,
+            window: 1, // 24h
+            client_error: None,
             last_message: None,
             last_refresh: Instant::now(),
             unreachable_for: 0,
@@ -177,6 +216,16 @@ impl App {
             }
         }
 
+        // Only fetch what the current screen shows. The client views ask for
+        // an aggregate the daemon computes from the database, and pulling
+        // per-provider traffic graphs at the same time would double the work
+        // for something nobody is looking at.
+        if self.view != View::Dashboard {
+            self.refresh_clients().await;
+            self.last_refresh = Instant::now();
+            return;
+        }
+
         match control::send(&self.listen, &Request::Events { limit: 8 }).await {
             Ok(Response::Events { events }) => self.events = events,
             Ok(_) => {}
@@ -207,6 +256,69 @@ impl App {
             Err(_) => {}
         }
         self.last_refresh = Instant::now();
+    }
+
+    /// The reporting window the client views are showing.
+    fn window_hours(&self) -> u32 {
+        WINDOWS[self.window.min(WINDOWS.len() - 1)].0
+    }
+
+    fn window_label(&self) -> &'static str {
+        WINDOWS[self.window.min(WINDOWS.len() - 1)].1
+    }
+
+    fn selected_client(&self) -> Option<&ClientInfo> {
+        self.clients.get(self.client_selected)
+    }
+
+    async fn refresh_clients(&mut self) {
+        let hours = self.window_hours();
+        match control::send(&self.listen, &Request::Clients { hours }).await {
+            Ok(Response::Clients { clients }) => {
+                self.client_error = None;
+                self.clients = clients;
+                if self.client_selected >= self.clients.len() {
+                    self.client_selected = self.clients.len().saturating_sub(1);
+                }
+            }
+            Ok(Response::Error { error }) => self.client_error = Some(error),
+            Ok(_) => self.client_error = Some("unexpected response to `clients`".into()),
+            Err(e) => self.client_error = Some(format!("{e}")),
+        }
+
+        if self.view == View::ClientDetail
+            && let Some(ip) = self.selected_client().map(|c| c.ip.clone())
+        {
+            match control::send(
+                &self.listen,
+                &Request::ClientDetail {
+                    ip,
+                    hours,
+                    limit: 600,
+                },
+            )
+            .await
+            {
+                Ok(Response::ClientDetail { detail }) => {
+                    self.client_detail = Some(detail);
+                    self.client_error = None;
+                }
+                Ok(Response::Error { error }) => self.client_error = Some(error),
+                Ok(_) => {}
+                Err(e) => self.client_error = Some(format!("{e}")),
+            }
+        }
+    }
+
+    /// Is the daemon we are talking to older than this dashboard?
+    ///
+    /// Worth surfacing rather than leaving as an empty screen: updating from
+    /// a git checkout rebuilds the binary but leaves the running daemon on
+    /// the old one until it is restarted, and "the client list is empty" is a
+    /// confusing way to find that out.
+    fn daemon_is_older(&self) -> bool {
+        let theirs = &self.snapshot.version;
+        !theirs.is_empty() && update::is_newer(update::current_version(), theirs)
     }
 
     async fn force_selected(&mut self) {
@@ -410,10 +522,70 @@ async fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // The client screens own the keyboard while they are up: there is
+    // nothing on them that a provider hotkey would mean.
+    if app.view != View::Dashboard {
+        match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.should_quit = true;
+            }
+            KeyCode::Char('q') => app.should_quit = true,
+            KeyCode::Esc | KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
+                if app.view == View::ClientDetail {
+                    app.view = View::Clients;
+                    app.client_detail = None;
+                } else {
+                    app.view = View::Dashboard;
+                }
+            }
+            KeyCode::Char('c') => {
+                app.view = View::Dashboard;
+                app.client_detail = None;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !app.clients.is_empty() {
+                    app.client_selected = (app.client_selected + 1) % app.clients.len();
+                    if app.view == View::ClientDetail {
+                        app.refresh_clients().await;
+                    }
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if !app.clients.is_empty() {
+                    app.client_selected = if app.client_selected == 0 {
+                        app.clients.len() - 1
+                    } else {
+                        app.client_selected - 1
+                    };
+                    if app.view == View::ClientDetail {
+                        app.refresh_clients().await;
+                    }
+                }
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                if app.view == View::Clients && !app.clients.is_empty() {
+                    app.view = View::ClientDetail;
+                    app.refresh_clients().await;
+                }
+            }
+            KeyCode::Char('w') => {
+                app.window = (app.window + 1) % WINDOWS.len();
+                app.refresh_clients().await;
+            }
+            KeyCode::Char('r') => app.refresh_clients().await,
+            _ => {}
+        }
+        return;
+    }
+
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.should_quit = true;
+        }
+        KeyCode::Char('c') => {
+            app.view = View::Clients;
+            app.refresh_clients().await;
         }
         KeyCode::Char('j') | KeyCode::Down => {
             if !app.snapshot.providers.is_empty() {
@@ -449,6 +621,17 @@ async fn handle_key(app: &mut App, key: KeyEvent) {
 }
 
 fn draw(f: &mut ratatui::Frame, app: &App) {
+    match app.view {
+        View::Dashboard => draw_dashboard(f, app),
+        View::Clients => draw_clients(f, f.area(), app),
+        View::ClientDetail => draw_client_detail(f, f.area(), app),
+    }
+    if app.update_modal_open() {
+        draw_update_modal(f, f.area(), app);
+    }
+}
+
+fn draw_dashboard(f: &mut ratatui::Frame, app: &App) {
     let events_h = 2 + (app.events.len().clamp(1, 5) as u16);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -468,10 +651,6 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     draw_events(f, chunks[3], app);
     draw_traffic(f, chunks[4], app);
     draw_footer(f, chunks[5], app);
-
-    if app.update_modal_open() {
-        draw_update_modal(f, f.area(), app);
-    }
 }
 
 /// The one-glance panel: what is carrying traffic right now, whether that
@@ -736,6 +915,603 @@ fn draw_update_modal(f: &mut ratatui::Frame, area: Rect, app: &App) {
         .title(title)
         .border_style(Style::default().fg(colour).add_modifier(Modifier::BOLD));
     f.render_widget(Paragraph::new(body).block(block), rect);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Client screens
+// ─────────────────────────────────────────────────────────────────────────
+
+/// A dot that reads as "connected" at a glance, and a word for anyone whose
+/// terminal or eyes do not do colour.
+fn online_cell(online: bool) -> Cell<'static> {
+    if online {
+        Cell::from("●").style(
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Cell::from("·").style(Style::default().fg(Color::DarkGray))
+    }
+}
+
+/// Trouble reaching the daemon, or the daemon not understanding the request.
+///
+/// The second case is the one worth explaining: updating from a git checkout
+/// rebuilds the binary but leaves the *running* daemon on the previous one,
+/// and an unexplained empty screen is a poor way to discover that.
+fn client_error_lines(app: &App) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    if let Some(err) = &app.client_error {
+        out.push(Line::from(vec![
+            Span::styled(
+                "cannot read clients: ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(truncate(err, 96)),
+        ]));
+        if err.contains("unknown variant") || err.contains("invalid request") {
+            out.push(Line::from(Span::styled(
+                "the running daemon is older than this dashboard — restart it to pick up \
+                 the new build:  sudo systemctl restart vlb",
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+    } else if app.daemon_is_older() {
+        out.push(Line::from(Span::styled(
+            format!(
+                "the running daemon is v{} while this dashboard is v{} — restart it to pick \
+                 up the new build",
+                app.snapshot.version,
+                update::current_version()
+            ),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    out
+}
+
+fn draw_clients(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    // ── summary ────────────────────────────────────────────────────────
+    let online = app.clients.iter().filter(|c| c.online).count();
+    let rx: i64 = app.clients.iter().map(|c| c.rx_bytes).sum();
+    let tx: i64 = app.clients.iter().map(|c| c.tx_bytes).sum();
+    let rx_now: f64 = app.clients.iter().map(|c| c.rx_bps).sum();
+    let tx_now: f64 = app.clients.iter().map(|c| c.tx_bps).sum();
+    let drops: i64 = app.clients.iter().map(|c| c.disconnects).sum();
+
+    let mut header = vec![Line::from(vec![
+        Span::styled(
+            format!("{online}"),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" of {} hosts connected", app.clients.len()),
+            Style::default().fg(Color::Gray),
+        ),
+        Span::raw("   "),
+        Span::styled("now ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("↓ {}", fmt_rate_bytes(rx_now)),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("↑ {}", fmt_rate_bytes(tx_now)),
+            Style::default().fg(Color::Magenta),
+        ),
+        Span::raw("   "),
+        Span::styled(
+            format!("total {} ", app.window_label()),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            format!("↓ {}", fmt_bytes(rx.max(0) as u64)),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("↑ {}", fmt_bytes(tx.max(0) as u64)),
+            Style::default().fg(Color::Magenta),
+        ),
+        Span::raw("   "),
+        Span::styled(
+            format!("{drops} drops"),
+            Style::default().fg(if drops > 0 {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            }),
+        ),
+    ])];
+    header.extend(client_error_lines(app));
+    if header.len() == 1 && app.clients.is_empty() {
+        header.push(Line::from(Span::styled(
+            "no hosts seen yet — traffic has to cross the gateway before a client appears",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    // Size the header to what it actually has to say. A fixed height would
+    // silently swallow the very line that explains an empty screen.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(header.len() as u16 + 2),
+            Constraint::Min(4),
+            Constraint::Length(3),
+        ])
+        .split(area);
+
+    f.render_widget(
+        Paragraph::new(header).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" clients · window {} ", app.window_label())),
+        ),
+        chunks[0],
+    );
+
+    // ── the table ──────────────────────────────────────────────────────
+    // Shed columns as the terminal narrows rather than letting every column
+    // be squeezed: a truncated MAC address and a truncated byte count are
+    // both useless, but only one of them is worth the width. Identity,
+    // totals, drops and last-seen are what survive to the end.
+    let width = chunks[1].width;
+    let show_mac = width >= 126;
+    let show_rates = width >= 106;
+    let now = chrono::Utc::now();
+
+    let mut head = vec!["", "name", "address"];
+    if show_mac {
+        head.push("mac");
+    }
+    if show_rates {
+        head.extend(["↓ now", "↑ now"]);
+    }
+    head.extend(["↓ total", "↑ total", "online", "drops", "last seen"]);
+    let header_row = Row::new(head.into_iter().map(Cell::from).collect::<Vec<_>>())
+        .style(Style::default().add_modifier(Modifier::BOLD));
+
+    let rows: Vec<Row> = app
+        .clients
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let named = c.label.is_some() || c.hostname.is_some();
+            let name_cell = Cell::from(if named {
+                truncate(c.display_name(), 16)
+            } else {
+                "—".to_string()
+            })
+            .style(if c.label.is_some() {
+                // An operator-assigned name is a fact about the machine, not
+                // a guess; it is worth distinguishing from a DHCP hostname.
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            });
+
+            let mut cells = vec![online_cell(c.online), name_cell, Cell::from(c.ip.clone())];
+            if show_mac {
+                cells.push(
+                    Cell::from(c.mac.clone().unwrap_or_else(|| "—".into()))
+                        .style(Style::default().fg(Color::DarkGray)),
+                );
+            }
+            if show_rates {
+                cells.push(
+                    Cell::from(fmt_rate_bytes(c.rx_bps)).style(Style::default().fg(Color::Cyan)),
+                );
+                cells.push(
+                    Cell::from(fmt_rate_bytes(c.tx_bps)).style(Style::default().fg(Color::Magenta)),
+                );
+            }
+            cells.extend([
+                Cell::from(fmt_bytes(c.rx_bytes.max(0) as u64)),
+                Cell::from(fmt_bytes(c.tx_bytes.max(0) as u64)),
+                Cell::from(fmt_duration(c.online_secs.max(0) as u64))
+                    .style(Style::default().fg(Color::Gray)),
+                Cell::from(c.disconnects.to_string()).style(if c.disconnects > 0 {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                }),
+                Cell::from(
+                    c.last_seen
+                        .map(|t| fmt_ago(t, now))
+                        .unwrap_or_else(|| "—".into()),
+                )
+                .style(Style::default().fg(Color::DarkGray)),
+            ]);
+
+            let row = Row::new(cells);
+            if i == app.client_selected {
+                row.style(
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                row
+            }
+        })
+        .collect();
+
+    let mut widths = vec![
+        Constraint::Length(2),
+        Constraint::Length(16),
+        Constraint::Length(15), // an IPv4 address is at most 15 characters
+    ];
+    if show_mac {
+        widths.push(Constraint::Length(17)); // and a MAC is exactly 17
+    }
+    if show_rates {
+        widths.push(Constraint::Length(11));
+        widths.push(Constraint::Length(11));
+    }
+    widths.extend([
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(8),
+        Constraint::Length(5),
+        Constraint::Min(9),
+    ]);
+
+    f.render_widget(
+        Table::new(rows, widths).header(header_row).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" hosts (↑/↓ select · Enter for details) "),
+        ),
+        chunks[1],
+    );
+
+    let keys = Line::from(vec![
+        Span::styled("↑/↓", Style::default().fg(Color::Yellow)),
+        Span::raw(" select  "),
+        Span::styled("Enter", Style::default().fg(Color::Yellow)),
+        Span::raw(" details  "),
+        Span::styled("w", Style::default().fg(Color::Yellow)),
+        Span::raw(format!(" window ({})  ", app.window_label())),
+        Span::styled("r", Style::default().fg(Color::Yellow)),
+        Span::raw(" refresh  "),
+        Span::styled("c/Esc", Style::default().fg(Color::Yellow)),
+        Span::raw(" back to providers  "),
+        Span::styled("q", Style::default().fg(Color::Yellow)),
+        Span::raw(" quit"),
+    ]);
+    let hint = Line::from(Span::styled(
+        "traffic is counted in the kernel per host; \"online\" comes from the ARP table, \
+         refreshed by an occasional ping",
+        Style::default().fg(Color::DarkGray),
+    ));
+    f.render_widget(
+        Paragraph::new(vec![keys, hint]).block(Block::default().borders(Borders::ALL)),
+        chunks[2],
+    );
+}
+
+fn draw_client_detail(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let Some(detail) = app.client_detail.as_deref() else {
+        let body = if let Some(err) = &app.client_error {
+            vec![
+                Line::from(Span::styled(
+                    "could not load this client",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(truncate(err, 100)),
+            ]
+        } else {
+            vec![Line::from("loading…")]
+        };
+        f.render_widget(
+            Paragraph::new(body).block(Block::default().borders(Borders::ALL).title(" client ")),
+            area,
+        );
+        return;
+    };
+
+    let sessions_h = 3 + detail.sessions.len().clamp(1, 8) as u16;
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(8),
+            Constraint::Min(7),
+            Constraint::Length(sessions_h),
+            Constraint::Length(3),
+        ])
+        .split(area);
+
+    let c = &detail.client;
+    let now = chrono::Utc::now();
+
+    // ── who, and how it is doing ───────────────────────────────────────
+    let state_line = match (c.online, c.session_secs) {
+        (true, Some(s)) => Line::from(vec![
+            Span::styled(
+                "● online",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  connected for {}", fmt_duration(s.max(0) as u64)),
+                Style::default().fg(Color::Gray),
+            ),
+        ]),
+        (true, None) => Line::from(Span::styled(
+            "● online",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )),
+        (false, _) => Line::from(vec![
+            Span::styled(
+                "· offline",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                c.last_seen
+                    .map(|t| format!("  last seen {}", fmt_ago(t, now)))
+                    .unwrap_or_default(),
+                Style::default().fg(Color::Gray),
+            ),
+        ]),
+    };
+
+    let info = vec![
+        Line::from(vec![
+            Span::styled(
+                c.display_name().to_string(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("   {}", c.ip), Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("   {}", c.mac.as_deref().unwrap_or("—")),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        state_line,
+        Line::from(vec![
+            Span::styled("traffic   ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("↓ {}", fmt_bytes(c.rx_bytes.max(0) as u64)),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::raw("   "),
+            Span::styled(
+                format!("↑ {}", fmt_bytes(c.tx_bytes.max(0) as u64)),
+                Style::default().fg(Color::Magenta),
+            ),
+            Span::styled(
+                format!("   over the last {}", app.window_label()),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("average   ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("↓ {}", fmt_rate_bytes(detail.avg_rx_bps)),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::raw("   "),
+            Span::styled(
+                format!("↑ {}", fmt_rate_bytes(detail.avg_tx_bps)),
+                Style::default().fg(Color::Magenta),
+            ),
+            Span::styled("   while connected", Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(vec![
+            Span::styled("peak      ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("↓ {}", fmt_rate_bytes(detail.peak_rx_bps)),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::raw("   "),
+            Span::styled(
+                format!("↑ {}", fmt_rate_bytes(detail.peak_tx_bps)),
+                Style::default().fg(Color::Magenta),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("connected ", Style::default().fg(Color::Gray)),
+            Span::raw(format!(
+                "{} of {}  ({:.1}%)",
+                fmt_duration(c.online_secs.max(0) as u64),
+                app.window_label(),
+                detail.availability_pct
+            )),
+            Span::raw("   "),
+            Span::styled(
+                format!("drops {}", c.disconnects),
+                Style::default().fg(if c.disconnects > 0 {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                }),
+            ),
+            Span::raw("   "),
+            Span::styled(
+                format!(
+                    "longest {}",
+                    fmt_duration(detail.longest_session_secs.max(0) as u64)
+                ),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                c.first_seen
+                    .map(|t| format!("   first seen {}", fmt_stamp(t)))
+                    .unwrap_or_default(),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+    ];
+    f.render_widget(
+        Paragraph::new(info).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" client {} ", c.ip)),
+        ),
+        chunks[0],
+    );
+
+    // ── traffic over time ──────────────────────────────────────────────
+    let rx: Vec<(f64, f64)> = detail
+        .samples
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i as f64, s.rx_bps * 8.0))
+        .collect();
+    let tx: Vec<(f64, f64)> = detail
+        .samples
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i as f64, s.tx_bps * 8.0))
+        .collect();
+    let max_y = rx
+        .iter()
+        .chain(tx.iter())
+        .map(|&(_, y)| y)
+        .fold(1.0_f64, f64::max);
+    let x_len = detail.samples.len().max(1) as f64 - 1.0;
+    let span = match (detail.samples.first(), detail.samples.last()) {
+        (Some(a), Some(b)) => format!("{} → {}", fmt_stamp(a.ts), fmt_stamp(b.ts)),
+        _ => "no traffic recorded in this window".to_string(),
+    };
+    let datasets = vec![
+        Dataset::default()
+            .name("↓ rx")
+            .marker(symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(Color::Cyan))
+            .data(&rx),
+        Dataset::default()
+            .name("↑ tx")
+            .marker(symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(Color::Magenta))
+            .data(&tx),
+    ];
+    f.render_widget(
+        Chart::new(datasets)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" traffic · {span} ")),
+            )
+            .x_axis(
+                Axis::default()
+                    .bounds([0.0, x_len.max(1.0)])
+                    .style(Style::default().fg(Color::DarkGray)),
+            )
+            .y_axis(
+                Axis::default()
+                    .bounds([0.0, max_y * 1.15])
+                    .labels(vec![
+                        Span::from("0"),
+                        Span::from(fmt_rate(max_y * 0.5)),
+                        Span::from(fmt_rate(max_y * 1.15)),
+                    ])
+                    .style(Style::default().fg(Color::DarkGray)),
+            ),
+        chunks[1],
+    );
+
+    // ── every connection, and every gap between them ───────────────────
+    let header_row = Row::new(vec![
+        Cell::from("started"),
+        Cell::from("ended"),
+        Cell::from("duration"),
+        Cell::from("away before"),
+        Cell::from("↓"),
+        Cell::from("↑"),
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD));
+
+    let rows: Vec<Row> = detail
+        .sessions
+        .iter()
+        .take(8)
+        .map(|s| {
+            Row::new(vec![
+                Cell::from(fmt_stamp_secs(s.started_at)),
+                Cell::from(match s.ended_at {
+                    Some(t) => fmt_stamp_secs(t),
+                    None => "— still connected".to_string(),
+                })
+                .style(if s.ended_at.is_none() {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default()
+                }),
+                Cell::from(fmt_duration(s.duration_secs.max(0) as u64)),
+                Cell::from(
+                    s.gap_before_secs
+                        .map(|g| fmt_duration(g.max(0) as u64))
+                        .unwrap_or_else(|| "—".into()),
+                )
+                .style(Style::default().fg(Color::Yellow)),
+                Cell::from(fmt_bytes(s.rx_bytes.max(0) as u64))
+                    .style(Style::default().fg(Color::Cyan)),
+                Cell::from(fmt_bytes(s.tx_bytes.max(0) as u64))
+                    .style(Style::default().fg(Color::Magenta)),
+            ])
+        })
+        .collect();
+    let rows = if rows.is_empty() {
+        vec![Row::new(vec![
+            Cell::from("(no connections recorded yet)").style(Style::default().fg(Color::DarkGray)),
+        ])]
+    } else {
+        rows
+    };
+
+    f.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Length(21),
+                Constraint::Length(21),
+                Constraint::Length(11),
+                Constraint::Length(13),
+                Constraint::Length(12),
+                Constraint::Min(10),
+            ],
+        )
+        .header(header_row)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" connections (newest first · \"away before\" is the gap) "),
+        ),
+        chunks[2],
+    );
+
+    let keys = Line::from(vec![
+        Span::styled("↑/↓", Style::default().fg(Color::Yellow)),
+        Span::raw(" next host  "),
+        Span::styled("Esc", Style::default().fg(Color::Yellow)),
+        Span::raw(" back to the list  "),
+        Span::styled("w", Style::default().fg(Color::Yellow)),
+        Span::raw(format!(" window ({})  ", app.window_label())),
+        Span::styled("r", Style::default().fg(Color::Yellow)),
+        Span::raw(" refresh  "),
+        Span::styled("q", Style::default().fg(Color::Yellow)),
+        Span::raw(" quit"),
+    ]);
+    let mut lines = vec![keys];
+    lines.extend(client_error_lines(app));
+    f.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL)),
+        chunks[3],
+    );
 }
 
 fn state_style(state: State) -> Style {
@@ -1198,6 +1974,8 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &App) {
         Span::raw(" force  "),
         Span::styled("a", Style::default().fg(Color::Yellow)),
         Span::raw(" auto  "),
+        Span::styled("c", Style::default().fg(Color::Yellow)),
+        Span::raw(" clients  "),
         Span::styled("r", Style::default().fg(Color::Yellow)),
         Span::raw(" refresh  "),
         Span::styled("u", Style::default().fg(Color::Yellow)),
@@ -1249,56 +2027,263 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
     Ok(())
 }
 
-fn fmt_bytes(n: u64) -> String {
-    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
-    let mut v = n as f64;
-    let mut u = 0usize;
-    while v >= 1024.0 && u < UNITS.len() - 1 {
-        v /= 1024.0;
-        u += 1;
-    }
-    if u == 0 {
-        format!("{n} {}", UNITS[u])
-    } else {
-        format!("{v:.2} {}", UNITS[u])
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::balancer::{ClientSessionInfo, ClientTrafficPoint};
+    use chrono::{Duration as ChronoDuration, Utc};
+    use ratatui::backend::TestBackend;
 
-fn fmt_rate(bps: f64) -> String {
-    const UNITS: &[&str] = &["bit/s", "Kbit/s", "Mbit/s", "Gbit/s", "Tbit/s"];
-    let mut v = bps;
-    let mut u = 0usize;
-    while v >= 1000.0 && u < UNITS.len() - 1 {
-        v /= 1000.0;
-        u += 1;
-    }
-    format!("{v:.1} {}", UNITS[u])
-}
+    /// Render a screen into an off-screen buffer and return it as plain text.
+    ///
+    /// This is what makes the screens testable at all: the assertions below
+    /// check what an operator actually sees, not what the code meant to
+    /// draw. Set `VLB_SHOTS=1` to print the frames — that is how the
+    /// screenshots in the README are produced, so they cannot drift from the
+    /// real thing.
+    fn render(app: &App, w: u16, h: u16, which: View) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal
+            .draw(|f| match which {
+                View::Clients => draw_clients(f, f.area(), app),
+                View::ClientDetail => draw_client_detail(f, f.area(), app),
+                View::Dashboard => draw_dashboard(f, app),
+            })
+            .unwrap();
 
-fn fmt_count(n: u64) -> String {
-    if n < 1_000 {
-        format!("{n}")
-    } else if n < 1_000_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else if n < 1_000_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else {
-        format!("{:.2}G", n as f64 / 1_000_000_000.0)
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let idx = y as usize * buf.area.width as usize + x as usize;
+                out.push_str(buf.content[idx].symbol());
+            }
+            out = out.trim_end_matches(' ').to_string();
+            out.push('\n');
+        }
+        if std::env::var("VLB_SHOTS").is_ok() {
+            println!("\n=== {which:?} {w}x{h} ===\n{out}");
+        }
+        out
     }
-}
 
-fn fmt_duration(secs: u64) -> String {
-    let days = secs / 86_400;
-    let hours = (secs % 86_400) / 3_600;
-    let minutes = (secs % 3_600) / 60;
-    let seconds = secs % 60;
-    if days > 0 {
-        format!("{days}d {hours}h{minutes:02}m")
-    } else if hours > 0 {
-        format!("{hours}h{minutes:02}m")
-    } else if minutes > 0 {
-        format!("{minutes}m{seconds:02}s")
-    } else {
-        format!("{seconds}s")
+    fn client(ip: &str, name: Option<&str>, online: bool, rx: i64, drops: i64) -> ClientInfo {
+        let now = Utc::now();
+        ClientInfo {
+            ip: ip.into(),
+            mac: Some("a4:5e:60:11:22:33".into()),
+            hostname: name.map(String::from),
+            label: None,
+            online,
+            first_seen: Some(now - ChronoDuration::days(3)),
+            last_seen: Some(if online {
+                now
+            } else {
+                now - ChronoDuration::minutes(37)
+            }),
+            rx_bps: if online { 1_540_000.0 } else { 0.0 },
+            tx_bps: if online { 210_000.0 } else { 0.0 },
+            rx_bytes: rx,
+            tx_bytes: rx / 8,
+            disconnects: drops,
+            online_secs: if online { 15_120 } else { 3_600 },
+            session_secs: online.then_some(15_120),
+        }
+    }
+
+    fn sample_app() -> App {
+        let cfg: Config = toml::from_str(
+            r#"
+[[providers]]
+name = "isp-main"
+gateway = "10.0.0.2"
+interface = "eth0"
+priority = 0
+"#,
+        )
+        .unwrap();
+        let snapshot = ControlSnapshot {
+            active: Some("isp-main".into()),
+            forced: None,
+            providers: Vec::new(),
+            version: update::current_version().to_string(),
+            started_at: Some(Utc::now() - ChronoDuration::hours(30)),
+            active_adopted: false,
+            kernel_route: Some("via 10.0.0.2 dev eth0 metric 0 proto static".into()),
+            failback_pending: None,
+        };
+        let mut app = App::new(cfg, std::path::PathBuf::from("/etc/vlb/vlb.toml"), snapshot);
+        app.clients = vec![
+            client("192.168.8.24", Some("denis-pc"), true, 3_650_722_201, 0),
+            client("192.168.8.31", Some("kitchen-tv"), true, 812_000_000, 2),
+            client("192.168.8.12", None, true, 41_000_000, 0),
+            client("192.168.8.57", Some("iphone-anna"), false, 220_500_000, 5),
+        ];
+        app.clients[2].mac = None;
+        app.clients[1].label = Some("TV (living room)".into());
+        app
+    }
+
+    fn sample_detail() -> ClientDetail {
+        let now = Utc::now();
+        let samples = (0..40)
+            .map(|i| ClientTrafficPoint {
+                ts: now - ChronoDuration::minutes(40 - i),
+                rx_bps: 400_000.0 + (i as f64 * 37.0 % 900_000.0),
+                tx_bps: 60_000.0 + (i as f64 * 91.0 % 120_000.0),
+            })
+            .collect();
+        ClientDetail {
+            client: client("192.168.8.24", Some("denis-pc"), true, 3_650_722_201, 2),
+            window_hours: 24,
+            samples,
+            sessions: vec![
+                ClientSessionInfo {
+                    started_at: now - ChronoDuration::hours(4) - ChronoDuration::minutes(12),
+                    ended_at: None,
+                    duration_secs: 15_120,
+                    gap_before_secs: Some(738),
+                    rx_bytes: 3_100_000_000,
+                    tx_bytes: 190_000_000,
+                },
+                ClientSessionInfo {
+                    started_at: now - ChronoDuration::hours(9),
+                    ended_at: Some(now - ChronoDuration::hours(4) - ChronoDuration::minutes(24)),
+                    duration_secs: 16_560,
+                    gap_before_secs: Some(120),
+                    rx_bytes: 480_000_000,
+                    tx_bytes: 18_000_000,
+                },
+            ],
+            peak_rx_bps: 5_200_000.0,
+            peak_tx_bps: 640_000.0,
+            avg_rx_bps: 241_450.0,
+            avg_tx_bps: 30_100.0,
+            longest_session_secs: 16_560,
+            availability_pct: 62.5,
+        }
+    }
+
+    /// The list has to answer "who is here, how much are they using, and did
+    /// they drop" without the operator reading a manual first.
+    #[test]
+    fn client_list_shows_identity_traffic_and_drops() {
+        let app = sample_app();
+        let out = render(&app, 132, 18, View::Clients);
+
+        assert!(out.contains("denis-pc"), "{out}");
+        assert!(out.contains("192.168.8.24"), "{out}");
+        assert!(
+            out.contains("a4:5e:60:11:22:33"),
+            "mac on a wide terminal\n{out}"
+        );
+        // The operator's own label wins over the DHCP hostname.
+        assert!(out.contains("TV (living room)"), "{out}");
+        // A host that never announced a name is not blank, it is "—".
+        assert!(out.contains('—'), "{out}");
+        assert!(out.contains("3 of 4 hosts connected"), "{out}");
+        assert!(out.contains("3.40 GiB"), "totals in binary units\n{out}");
+        assert!(out.contains("Mbit/s"), "live rates in bits\n{out}");
+        assert!(out.contains("window 24h"), "{out}");
+        assert!(out.contains("Enter"), "the keys are on screen\n{out}");
+    }
+
+    /// A narrow terminal must shed whole columns rather than squeeze every
+    /// one of them: half a MAC address and half a byte count are both
+    /// useless, and identity is what has to survive to the end.
+    #[test]
+    fn client_list_sheds_columns_as_the_terminal_narrows() {
+        let app = sample_app();
+
+        let medium = render(&app, 110, 16, View::Clients);
+        assert!(
+            !medium.contains("a4:5e:60:11:22:33"),
+            "no room for MACs\n{medium}"
+        );
+        assert!(medium.contains("Mbit/s"), "live rates still fit\n{medium}");
+        assert!(medium.contains("denis-pc"), "{medium}");
+        assert!(medium.contains("3.40 GiB"), "{medium}");
+
+        let narrow = render(&app, 90, 16, View::Clients);
+        // The per-host rate columns are gone (the summary still has a
+        // gateway-wide figure, which costs no table width).
+        assert!(
+            !narrow.contains("12.3 Mbit/s"),
+            "per-host rates go before totals do\n{narrow}"
+        );
+        assert!(narrow.contains("denis-pc"), "{narrow}");
+        assert!(narrow.contains("192.168.8.24"), "{narrow}");
+        assert!(narrow.contains("3.40 GiB"), "totals survive\n{narrow}");
+        assert!(narrow.contains("drops"), "and so do drops\n{narrow}");
+    }
+
+    /// Every column must be wide enough for its widest possible value: a
+    /// MAC is always 17 characters and an IPv4 address up to 15, and a
+    /// truncated one of either is worse than no column at all.
+    #[test]
+    fn wide_terminals_show_addresses_in_full() {
+        let app = sample_app();
+        let out = render(&app, 132, 16, View::Clients);
+        assert!(out.contains("a4:5e:60:11:22:33"), "{out}");
+        assert!(out.contains("192.168.8.24"), "{out}");
+        assert!(out.contains("435.20 MiB"), "{out}");
+    }
+
+    #[test]
+    fn client_detail_shows_sessions_gaps_and_averages() {
+        let mut app = sample_app();
+        app.client_detail = Some(Box::new(sample_detail()));
+        let out = render(&app, 130, 26, View::ClientDetail);
+
+        assert!(out.contains("denis-pc"), "{out}");
+        assert!(out.contains("connected for"), "{out}");
+        assert!(out.contains("average"), "{out}");
+        assert!(out.contains("peak"), "{out}");
+        assert!(out.contains("drops 2"), "{out}");
+        assert!(out.contains("62.5%"), "availability\n{out}");
+        // The gap between connections is the point of the table.
+        assert!(out.contains("away before"), "{out}");
+        assert!(out.contains("12m18s"), "a 738-second gap\n{out}");
+        assert!(out.contains("still connected"), "the open session\n{out}");
+    }
+
+    /// An empty LAN should explain itself rather than showing a blank frame.
+    #[test]
+    fn an_empty_client_list_says_why() {
+        let mut app = sample_app();
+        app.clients.clear();
+        let out = render(&app, 110, 12, View::Clients);
+        assert!(out.contains("no hosts seen yet"), "{out}");
+    }
+
+    /// Updating from a git checkout rebuilds the binary but leaves the
+    /// running daemon on the old one. An operator who then presses `c` and
+    /// sees nothing deserves to be told why.
+    #[test]
+    fn an_older_daemon_is_named_as_the_reason() {
+        let mut app = sample_app();
+        app.snapshot.version = "0.0.1".into();
+        assert!(app.daemon_is_older());
+        let out = render(&app, 124, 14, View::Clients);
+        assert!(
+            out.contains("v0.0.1"),
+            "the version it is actually running\n{out}"
+        );
+        assert!(out.contains("restart it"), "{out}");
+
+        // And when the daemon simply rejects the request, the same advice.
+        let mut app = sample_app();
+        app.client_error = Some("invalid request: unknown variant `clients`".into());
+        let out = render(&app, 124, 14, View::Clients);
+        assert!(out.contains("older than this dashboard"), "{out}");
+    }
+
+    /// Same build on both ends is the normal case and must stay quiet.
+    #[test]
+    fn a_matching_daemon_says_nothing() {
+        let app = sample_app();
+        assert!(!app.daemon_is_older());
+        let out = render(&app, 124, 14, View::Clients);
+        assert!(!out.contains("restart it"), "{out}");
     }
 }

@@ -31,7 +31,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, watch};
 use tracing::{debug, error, info, warn};
 
-use crate::balancer::{Balancer, ControlSnapshot};
+use crate::balancer::{Balancer, ClientDetail, ClientInfo, ControlSnapshot};
 use crate::sysmon::SysSample;
 
 /// Hard cap on simultaneous control-plane clients. The protocol is
@@ -75,6 +75,20 @@ pub enum Request {
         #[serde(default = "default_events_limit")]
         limit: u32,
     },
+    /// LAN clients: who is behind the gateway, how much they moved, and
+    /// whether they dropped.
+    Clients {
+        #[serde(default = "default_window_hours")]
+        hours: u32,
+    },
+    /// Everything about one client, keyed by its address.
+    ClientDetail {
+        ip: String,
+        #[serde(default = "default_window_hours")]
+        hours: u32,
+        #[serde(default = "default_limit")]
+        limit: u32,
+    },
 }
 
 fn default_limit() -> u32 {
@@ -85,15 +99,41 @@ fn default_events_limit() -> u32 {
     20
 }
 
+/// A day: long enough that "today's traffic" means something, short enough
+/// that the numbers still move while you watch them.
+fn default_window_hours() -> u32 {
+    24
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Response {
-    Status { snapshot: ControlSnapshot },
-    Ok { message: String },
-    Traffic { points: Vec<TrafficPointWire> },
-    System { points: Vec<SystemPointWire> },
-    Events { events: Vec<FailoverEventWire> },
-    Error { error: String },
+    Status {
+        snapshot: ControlSnapshot,
+    },
+    Ok {
+        message: String,
+    },
+    Traffic {
+        points: Vec<TrafficPointWire>,
+    },
+    System {
+        points: Vec<SystemPointWire>,
+    },
+    Events {
+        events: Vec<FailoverEventWire>,
+    },
+    Clients {
+        clients: Vec<ClientInfo>,
+    },
+    /// Boxed because it is far larger than every other variant, and an enum
+    /// is as big as its widest member wherever it is passed around.
+    ClientDetail {
+        detail: Box<ClientDetail>,
+    },
+    Error {
+        error: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -294,6 +334,22 @@ async fn dispatch(req: Request, balancer: &Arc<Balancer>) -> Response {
                 error: e.to_string(),
             },
         },
+        Request::Clients { hours } => match balancer.client_list(hours).await {
+            Ok(clients) => Response::Clients { clients },
+            Err(e) => Response::Error {
+                error: e.to_string(),
+            },
+        },
+        Request::ClientDetail { ip, hours, limit } => {
+            match balancer.client_detail(&ip, hours, limit).await {
+                Ok(detail) => Response::ClientDetail {
+                    detail: Box::new(detail),
+                },
+                Err(e) => Response::Error {
+                    error: e.to_string(),
+                },
+            }
+        }
         Request::Events { limit } => match balancer.recent_failovers(limit) {
             Ok(events) => Response::Events {
                 events: events
@@ -369,6 +425,16 @@ impl Serialize for Request {
             }
             Request::Events { limit } => {
                 m.serialize_entry("op", "events")?;
+                m.serialize_entry("limit", limit)?;
+            }
+            Request::Clients { hours } => {
+                m.serialize_entry("op", "clients")?;
+                m.serialize_entry("hours", hours)?;
+            }
+            Request::ClientDetail { ip, hours, limit } => {
+                m.serialize_entry("op", "clientdetail")?;
+                m.serialize_entry("ip", ip)?;
+                m.serialize_entry("hours", hours)?;
                 m.serialize_entry("limit", limit)?;
             }
         }

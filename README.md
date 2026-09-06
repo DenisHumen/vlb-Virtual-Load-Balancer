@@ -20,11 +20,55 @@ installs the highest-priority healthy one as the kernel default route,
 flushes conntrack on switch, and ships a TUI / control protocol / SQLite
 stats so you can actually see what's happening.
 
-> **Status:** `0.3.2`. Runs in production, and the failover behaviour is
-> covered by a docker lab that breaks the network eight different ways — and
+> **Status:** `0.4.0`. Runs in production, and the failover behaviour is
+> covered by a docker lab that breaks the network nine different ways — and
 > restarts the daemon under it three more — on every CI run. Still pre-1.0:
 > config keys can change between minor versions, and `vlb check` will tell
 > you when they do.
+
+```mermaid
+flowchart LR
+    subgraph LAN["your LAN"]
+        C1["laptop"]
+        C2["TV"]
+        C3["phone"]
+    end
+    GW["<b>vlb</b><br/>gateway"]
+    subgraph WAN["uplinks"]
+        P0["ISP A<br/>priority 0"]
+        P2["ISP B<br/>priority 2"]
+    end
+    NET(("internet"))
+
+    C1 --- GW
+    C2 --- GW
+    C3 --- GW
+    GW ==>|"active"| P0
+    GW -.->|"standby"| P2
+    P0 --> NET
+    P2 --> NET
+
+    style GW fill:#1f6feb,stroke:#1f6feb,color:#fff
+    style P0 stroke:#2ea043,stroke-width:3px
+    style P2 stroke-dasharray: 4 4
+```
+
+`vlb` watches both uplinks continuously, moves the default route to a
+healthy one the moment the active one stops actually working — not merely
+stops answering pings — and tells you who on the LAN was affected.
+
+---
+
+## Contents
+
+| | |
+|---|---|
+| [Why](#why) · [What it does](#what-it-actually-does) | the pitch |
+| [Install / update](#install-or-update-on-a-server) · [Update from a checkout](#update-from-a-git-checkout) | getting it running |
+| [Client statistics](#who-is-on-the-network--client-statistics) | who is using the link |
+| [Configuration](#configuration-reference) · [CLI](#cli) · [TUI](#tui-hotkeys) | day-to-day use |
+| [How it works](#how-it-works) · [Failure modes](#failure-modes-we-cover) | the design |
+| [Testing](#testing) · [Ubuntu 24.04](#ubuntu-2404) · [Troubleshooting](#troubleshooting) | when things go wrong |
 
 ---
 
@@ -107,10 +151,16 @@ fast, and gives you a real dashboard.
   pin a specific provider as long as you like; pin survives even when
   the pinned provider is briefly Down (we serve the best healthy one
   meanwhile and snap back when the pin recovers).
+* **Per-client statistics.** Every host behind the gateway, by address, MAC
+  and name: how much it moved, how long it has been connected, and how many
+  times its connection dropped — [with a screen of its own](#who-is-on-the-network--client-statistics).
+  Counted by the kernel, stored locally in the same SQLite database, and
+  never sent anywhere.
 * **SQLite stats** (WAL, indexed) for health checks, traffic, host
-  metrics, state changes and failover events. 72 h retention by default.
+  metrics, state changes, failover events and clients. Everything stays on
+  the box.
 * **TUI dashboard** (ratatui) — provider table, sparklines, traffic and
-  CPU/mem graphs, hotkeys for force / auto.
+  CPU/mem graphs, client statistics, hotkeys for force / auto.
 * **Dry-run** that validates and prints every system call without doing
   it. Use this before pointing it at production.
 * **Hardened config validator** — rejects reserved tables (253/254/255),
@@ -179,6 +229,188 @@ answer, and roll back if it does not.
 curl -fsSL .../install.sh | sudo VLB_VERSION=v0.2.1 bash
 ```
 </details>
+
+---
+
+## Update from a git checkout
+
+If you run `vlb` straight out of a clone rather than from a release, the
+whole update is:
+
+```bash
+cd ~/load_balancer && git pull && sudo bash scripts/vlb.sh restart
+```
+
+Any `scripts/vlb.sh` command that needs the binary rebuilds it when the
+sources are newer — and then **restarts the running daemon**, because a
+rebuild on its own leaves the old process in memory serving the old
+behaviour. That used to be the confusing half of updating this way: `git
+pull` plus a command that clearly rebuilt something, and none of the new
+features anywhere to be seen.
+
+The restart does not interrupt traffic (see [How it works](#how-it-works)):
+the new process adopts the default route the old one left in the kernel.
+
+```bash
+sudo bash scripts/vlb.sh status     # what is running now
+sudo bash scripts/vlb.sh tui        # dashboard (rebuilds + restarts if needed)
+VLB_NO_RESTART=1 bash scripts/vlb.sh build   # rebuild, leave the daemon alone
+```
+
+The dashboard says so plainly if it is newer than the daemon it is talking
+to, rather than showing an empty screen.
+
+---
+
+## Who is on the network — client statistics
+
+Press <kbd>c</kbd> in the dashboard, or run `vlb clients`. Every host behind
+the gateway, connected first:
+
+```text
+┌ clients · window 24h ────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│3 of 4 hosts connected   now ↓ 37.0 Mbit/s  ↑ 5.0 Mbit/s   total 24h ↓ 4.40 GiB  ↑ 563.17 MiB   7 drops                           │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ hosts (↑/↓ select · Enter for details) ──────────────────────────────────────────────────────────────────────────────────────────┐
+│   name             address         mac               ↓ now       ↑ now       ↓ total    ↑ total    online   drops last seen      │
+│●  denis-pc         192.168.8.24    a4:5e:60:11:22:33 12.3 Mbit/s 1.7 Mbit/s  3.40 GiB   435.20 MiB 4h12m    0     now            │
+│●  TV (living room) 192.168.8.31    a4:5e:60:11:22:33 12.3 Mbit/s 1.7 Mbit/s  774.38 MiB 96.80 MiB  4h12m    2     now            │
+│●  —                192.168.8.12    —                 12.3 Mbit/s 1.7 Mbit/s  39.10 MiB  4.89 MiB   4h12m    0     now            │
+│·  iphone-anna      192.168.8.57    a4:5e:60:11:22:33 0.0 bit/s   0.0 bit/s   210.29 MiB 26.29 MiB  1h00m    5     37m00s ago     │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│↑/↓ select  Enter details  w window (24h)  r refresh  c/Esc back to providers  q quit                                             │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+<kbd>Enter</kbd> opens one host. This is where "was it us or them" gets
+answered: every connection, how long each lasted, and **how long the host
+was away in between**.
+
+```text
+┌ client 192.168.8.24 ───────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│denis-pc   192.168.8.24   a4:5e:60:11:22:33                                                                                     │
+│● online  connected for 4h12m                                                                                                   │
+│traffic   ↓ 3.40 GiB   ↑ 435.20 MiB   over the last 24h                                                                         │
+│average   ↓ 1.9 Mbit/s   ↑ 240.8 kbit/s   while connected                                                                       │
+│peak      ↓ 41.6 Mbit/s   ↑ 5.1 Mbit/s                                                                                          │
+│connected 4h12m of 24h  (62.5%)   drops 2   longest 4h36m   first seen 09-03 15:29                                              │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ traffic · 09-06 14:49 → 09-06 15:28 ───────────────────────────────────────────────────────────────────────────────────────────┐
+│3.7 Mbit/s│                                                                                                                     │
+│          │⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉│
+│1.6 Mbit/s│                                                                                                                     │
+│          │⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤│
+│0         │                                                                                                                     │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ connections (newest first · "away before" is the gap) ─────────────────────────────────────────────────────────────────────────┐
+│started               ended                 duration    away before   ↓            ↑                                            │
+│2026-09-06 11:17:22   — still connected     4h12m       12m18s        2.89 GiB     181.20 MiB                                   │
+│2026-09-06 06:29:22   2026-09-06 11:05:22   4h36m       2m00s         457.76 MiB   17.17 MiB                                    │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+> Both screenshots are rendered by the test suite from the real widgets, so
+> they cannot drift from what the program draws (`VLB_SHOTS=1 cargo test tui`).
+
+### The same thing from the shell
+
+```bash
+sudo vlb clients                          # the list
+sudo vlb clients --hours 168              # a week instead of a day
+sudo vlb clients --ip 192.168.8.24        # one host's full history
+sudo vlb clients --json | jq '.clients[]' # for scripts
+```
+
+### Where the numbers come from
+
+```mermaid
+flowchart TD
+    K["kernel FORWARD chain"] -->|"2 counting rules per host"| CH["VLB_CLIENTS<br/>iptables chain"]
+    CH -->|"read every 5s"| S["sampler"]
+    ARP["ARP / neighbour table"] -->|"presence"| S
+    PING["occasional ping<br/>(refreshes stale entries)"] --> ARP
+    DHCP["DHCP leases · /etc/hosts · PTR<br/>· names you set in the config"] -->|"identity"| S
+    S -->|"accumulate in memory"| B["bucket"]
+    B -->|"flush once a minute"| DB[("SQLite<br/>clients · sessions · samples")]
+    S -->|"connect / disconnect"| DB
+    DB --> UI["TUI · vlb clients · control socket"]
+
+    style CH fill:#1f6feb,color:#fff
+    style DB fill:#2ea043,color:#fff
+```
+
+Three deliberate choices behind that picture:
+
+* **The kernel does the counting.** Two rules per host in a chain of our
+  own — `-s <ip>` and `-d <ip>`, with no `-j` target, so they count and fall
+  through. Nothing is sampled, nothing is estimated, and a flow that ends
+  does not take its bytes with it. NAT is not in the way: masquerading
+  happens later, in `POSTROUTING`, so the host's own address is visible in
+  both directions.
+* **Presence is ARP, nudged.** A host that has been quiet for half a minute
+  goes `STALE` in the neighbour table, which looks exactly like a host that
+  has left. So stale neighbours get an occasional ping — and even one that
+  drops ICMP has to answer the ARP request that precedes it, which is what
+  refreshes the entry. Without this every idle laptop would show a
+  disconnection every minute.
+* **Sample fast, write slowly.** Presence and rates are read every few
+  seconds; traffic is accumulated in memory and written once a minute, and
+  only when it is not zero. Presence costs two rows per connection rather
+  than one per tick. A gateway that runs for a year does not need a database
+  the size of its logs.
+
+One gap worth knowing about: a host is counted from the moment it is
+*discovered*, so a machine nobody has ever seen before can move up to one
+sampling interval of traffic before its rules exist. It applies once per
+host — the rules stay in place when a client goes quiet, and across daemon
+restarts, so a returning laptop is counted from its first packet. The
+alternative, pre-creating rules for every address on the segment, is how a
+ruleset grows without bound on a network with a guest wifi.
+
+### Names
+
+In priority order — the first one that knows wins:
+
+| Source | Set up |
+|---|---|
+| Your own label | `[[clients.names]]` in the config, keyed by MAC or IP |
+| DHCP lease | automatic, if dnsmasq / OpenWrt / Kea runs on this box |
+| `/etc/hosts` | automatic |
+| Reverse DNS | automatic, via the system resolver (`resolve_hostnames`) |
+
+A machine nobody can name shows as `—` and is still counted; it is
+identified by its address and MAC.
+
+```toml
+[[clients.names]]
+name = "Denis PC"
+mac  = "a4:5e:60:11:22:33"   # survives a changed lease
+
+[[clients.names]]
+name = "NAS"
+ip   = "192.168.8.9"
+```
+
+### What is *not* a client
+
+Provider gateways, this machine's own addresses, broadcast and multicast are
+excluded automatically — an ISP's router sharing the LAN segment is not one
+of your users. Anything else you do not want counted (a managed switch, an
+access point) goes in `clients.exclude`.
+
+### Turning it off
+
+Client accounting installs one iptables chain. If you told vlb not to manage
+your firewall (`firewall.manage = false`) it does not install anything unless
+you ask for it explicitly:
+
+```toml
+[clients]
+enabled = false     # or true, to account even with firewall.manage = false
+```
+
+`vlb check` prints which of the two you have.
 
 ---
 
@@ -473,6 +705,25 @@ If a link proves unstable — more than `flap_threshold` switches inside
 `flap_window_secs` — that wait doubles for each extra switch, capped at
 `max_failback_stable_secs`, and decays on its own once the link settles.
 
+### Client accounting
+
+Full walk-through in [Client statistics](#who-is-on-the-network--client-statistics).
+The knobs:
+
+| Key | Default | What it changes |
+|---|---|---|
+| `enabled` | follows `firewall.manage` | Whether the accounting chain is installed at all |
+| `interval_secs` | `5` | How often presence and counters are read |
+| `persist_every_secs` | `60` | How often accumulated traffic is written to SQLite |
+| `offline_after_secs` | `180` | Silence before a host counts as disconnected — must be ≥ 3× the interval, or one missed ARP reply becomes a "drop" in the history |
+| `retention_hours` | `168` | How long per-host history is kept (the roster of known hosts is never pruned) |
+| `presence_probe` | `true` | Ping stale neighbours so an idle host is not reported as gone |
+| `resolve_hostnames` | `true` | Reverse-lookup names through the system resolver |
+| `max_tracked` | `512` | Ceiling on hosts that get accounting rules |
+| `lease_files` | dnsmasq, OpenWrt, Kea | Where to read DHCP hostnames from |
+| `exclude` | — | Addresses that are never clients |
+| `[[clients.names]]` | — | Your own labels, keyed by `mac` or `ip` |
+
 ### Probe target rules
 
 * IPv4 literal (e.g. `1.1.1.1`) → ping it directly through the
@@ -499,6 +750,7 @@ vlb stats  [--config <path>] [--hours N] [--recent N]
 vlb system [--config <path>] [--recent N]
 vlb diag   [--config <path>]                # interfaces, DB, ports
 vlb probe  [--config <path>] [--provider <name>] [--repeat N]
+vlb clients [--config <path>] [--ip <addr>] [--hours N] [--json]
 vlb update [--config <path>] [--check] [--pre] [--yes] [--force] [--skip-probe]
 ```
 
@@ -563,9 +815,19 @@ while it runs.
 | `↑`/`↓` | Move selection                            |
 | `f`     | Force the selected provider               |
 | `a`     | Release force, return to auto             |
+| `c`     | **Client statistics** — who is on the LAN |
 | `r`     | Force redraw                              |
 | `u`     | Check for a new release and install it    |
 | `q`     | Quit                                      |
+
+On the client screens:
+
+| Key     | Action                                    |
+|---------|-------------------------------------------|
+| `↑`/`↓` | Move between hosts                        |
+| `Enter` | Open one host's full history              |
+| `w`     | Cycle the window: 1h → 24h → 7d → 30d     |
+| `Esc`   | Back (detail → list → dashboard)          |
 
 Top to bottom: the **gateway** panel (active provider and whether it is
 verified or still adopted from the routing table, the pin, the failback
@@ -578,7 +840,7 @@ so when the daemon is back.
 
 ---
 
-## How it works (one paragraph)
+## How it works
 
 For each provider we install one routing table (`ip route add default via
 <gw> dev <if> table <N>`), one fwmark policy rule (`ip rule add fwmark
@@ -589,6 +851,62 @@ counts consecutive successes/failures, picks the lowest-priority healthy
 provider as active, and writes the result via `ip route replace default
 via <chosen> metric 0 proto static`. On every change we `conntrack -F`
 so live flows reset and reconnect.
+
+### One health round, per provider
+
+Each layer only runs when the one before it passed — there is nothing to
+learn from a DNS query down a cable that is unplugged, and a 64 KiB transfer
+down a dead link costs a whole timeout for no information.
+
+```mermaid
+flowchart TD
+    G{"gateway<br/>ICMP to next hop"} -->|fails| D1["DOWN · gateway"]
+    G -->|ok| I{"internet<br/>3-packet burst, ≥2 replies"}
+    I -->|fails| D2["DOWN · internet"]
+    I -->|ok| N{"DNS<br/>UDP/53 round trip"}
+    N -->|fails| D3["DOWN · dns"]
+    N -->|ok| V{"DNS integrity<br/>.invalid must be NXDOMAIN"}
+    V -->|"an address!"| D4["DOWN · dns_hijack<br/><i>proof — no threshold</i>"]
+    V -->|ok| C{"content canary<br/>bytes we already know"}
+    C -->|"wrong bytes"| D5["DOWN · content_tampered<br/><i>proof — no threshold</i>"]
+    C -->|"unreachable"| D6["DOWN · content_unreachable"]
+    C -->|ok| T{"throughput floor<br/>64 KiB, timed"}
+    T -->|"too slow"| D7["DOWN · throttled"]
+    T -->|ok| UP["UP"]
+
+    style UP fill:#2ea043,color:#fff
+    style D4 fill:#da3633,color:#fff
+    style D5 fill:#da3633,color:#fff
+    style D7 fill:#bf8700,color:#fff
+```
+
+The two red boxes are *proof* rather than symptoms: no working link returns
+somebody else's bytes, so those bypass the failure threshold and switch on
+first observation. Everything else has to repeat before it counts.
+
+### A restart, or an update
+
+Nothing is torn down when the daemon stops, and the next one picks up where
+it left off rather than starting from an empty table:
+
+```mermaid
+sequenceDiagram
+    participant K as kernel
+    participant O as old daemon
+    participant N as new daemon
+    O->>K: default via ISP-A (metric 0, proto static)
+    Note over O: stopped — routes, rules and NAT left in place
+    Note over K: traffic keeps flowing through ISP-A
+    N->>K: read the installed default route
+    K-->>N: via ISP-A
+    Note over N: adopt ISP-A as the incumbent<br/>(status: "adopted, verifying")
+    N->>N: probe every layer for real
+    N->>K: re-assert the same route — nothing moves, nothing flushed
+    Note over N: pin and flap history restored from SQLite
+```
+
+No route change, no conntrack flush, no detour through the backup because
+its probes happened to finish first.
 
 ---
 
@@ -615,6 +933,8 @@ so live flows reset and reconnect.
 | **An uplink's interface absent at boot**              | **that provider is retried every health interval; the daemon starts and manages the rest** |
 | The watchdog ticking in the middle of a switchover    | serialised on the same lock, so it cannot re-install the route just left |
 | Crash loop at boot                                    | `StartLimitIntervalSec=0`, `Restart=always` — systemd never gives up on the gateway |
+| **"Was it the internet, or just my laptop?"**         | **per-client sessions: every drop is a row with a start, an end and the gap** |
+| **"Who used all the bandwidth at four o'clock?"**     | **per-client byte counters in the kernel, kept per host with history** |
 
 ---
 
@@ -679,7 +999,17 @@ failed over to the backup, and with an operator pin in place; the container
 is restarted outright for the reboot case; and it is brought up with a
 provider on an interface that does not exist. In every one the route must not
 move, no switchover may be logged, the pin must come back, and client traffic
-must keep flowing. 85 assertions in 22 scenarios, all on Ubuntu 24.04.
+must keep flowing.
+
+Client accounting is tested against the same LAN client: it moves a real
+256 KB transfer through the gateway, and the suite checks that the bytes are
+attributed to that host, that its MAC and its name are learned, that the
+provider gateways sharing the segment are *not* listed as users — and then
+stops the container outright, which is a genuine LAN disconnection, and
+checks that vlb notices, records the drop, and picks the host back up with
+its history intact when it returns.
+
+96 assertions in 23 scenarios, all on Ubuntu 24.04.
 
 `expired` and `portal-http` are the two that matter. `expired` is the full
 production symptom. `portal-http` is the stricter test: it leaves DNS entirely
@@ -900,6 +1230,7 @@ runs as root. If you're running by hand, prefix with `sudo`.
     │   └── update.rs         # self-update from GitHub Releases
     ├── net/
     │   ├── canary.rs         # content-authenticity probe
+    │   ├── clients.rs        # LAN client discovery + per-host accounting
     │   ├── health.rs         # ICMP / DNS probes (fwmark-bound)
     │   ├── http.rs           # minimal SO_MARK-bound HTTP/HTTPS client
     │   ├── router.rs         # writes to the kernel routing table
@@ -912,7 +1243,8 @@ runs as root. If you're running by hand, prefix with `sudo`.
     │   └── sysmon.rs         # host metric sampling
     └── ui/
         ├── control.rs        # tiny line-delimited JSON control protocol
-        └── tui.rs            # dashboard
+        ├── format.rs         # human-readable bytes / rates / durations
+        └── tui.rs            # dashboard + client screens
 ```
 
 ---

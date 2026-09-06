@@ -15,6 +15,11 @@ echo "[vlb-test] docker default route removed; vlb now owns the default route"
 
 ip -brief addr show
 
+# A name for the LAN client. Client accounting reads /etc/hosts the same way
+# it reads a DHCP lease file, so this exercises the naming path end to end
+# without needing a DHCP server in the lab.
+grep -q 'lab-client' /etc/hosts || echo '10.77.0.50 lab-client.lab lab-client' >> /etc/hosts
+
 CONFIG="${VLB_CONFIG:-/etc/vlb/vlb.toml}"
 
 # Supervise the daemon rather than exec into it. The restart scenarios kill

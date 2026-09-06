@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -11,6 +12,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::canary::{CanaryTarget, Quorum, check_canary_via};
+use crate::clients::{ClientCounters, ClientMonitor, NameResolver, SampleParams};
 use crate::config::{Config, Provider};
 use crate::control;
 use crate::health::{
@@ -19,7 +21,9 @@ use crate::health::{
 use crate::notify;
 use crate::router::Router;
 use crate::selection::{Decision, FlapTracker, ProviderView, SelectionInput, decide};
-use crate::stats::{FailoverEvent, FailoverRecord, HealthRecord, Stats, SystemPoint, TrafficPoint};
+use crate::stats::{
+    ClientRollup, FailoverEvent, FailoverRecord, HealthRecord, Stats, SystemPoint, TrafficPoint,
+};
 use crate::sysmon::SysMonitor;
 use crate::system::Prepared;
 use crate::traffic;
@@ -173,6 +177,10 @@ pub struct Balancer {
     /// provider that's DOWN falls back to the best available until it
     /// recovers.
     force_override: RwLock<Option<String>>,
+    /// Live state for every LAN client seen since this process started.
+    /// History lives in the database; this is what the rates and the current
+    /// connection are read from.
+    clients: RwLock<HashMap<Ipv4Addr, ClientState>>,
     /// Recent switch history, used to stretch the failback window when a
     /// link keeps bouncing.
     flap: StdMutex<FlapTracker>,
@@ -199,6 +207,108 @@ pub struct FailbackPending {
     pub candidate: String,
     pub stable_for_secs: u64,
     pub required_secs: u64,
+}
+
+/// What the daemon knows about one LAN client, live state and history
+/// combined. This is what the dashboard's client list shows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientInfo {
+    pub ip: String,
+    pub mac: Option<String>,
+    /// Discovered from a DHCP lease, `/etc/hosts` or reverse DNS.
+    pub hostname: Option<String>,
+    /// Assigned by the operator in the config. Wins over `hostname`.
+    pub label: Option<String>,
+    pub online: bool,
+    pub first_seen: Option<DateTime<Utc>>,
+    pub last_seen: Option<DateTime<Utc>>,
+    /// Rate over the most recent sampling interval, bytes per second.
+    pub rx_bps: f64,
+    pub tx_bps: f64,
+    /// Totals over the reporting window.
+    pub rx_bytes: i64,
+    pub tx_bytes: i64,
+    /// Connections that ended inside the window.
+    pub disconnects: i64,
+    /// Seconds present inside the window.
+    pub online_secs: i64,
+    /// How long the current connection has lasted; `None` when offline.
+    pub session_secs: Option<i64>,
+}
+
+impl ClientInfo {
+    /// What to call this machine: the operator's name, else the one it gave
+    /// itself, else its address.
+    pub fn display_name(&self) -> &str {
+        self.label
+            .as_deref()
+            .or(self.hostname.as_deref())
+            .unwrap_or(&self.ip)
+    }
+
+    /// Share of the window the client was actually connected.
+    pub fn availability_pct(&self, window_secs: i64) -> f64 {
+        if window_secs <= 0 {
+            return 0.0;
+        }
+        (self.online_secs as f64 / window_secs as f64 * 100.0).clamp(0.0, 100.0)
+    }
+}
+
+/// One connection, as shown in a client's history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientSessionInfo {
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub duration_secs: i64,
+    /// How long the client was away before this connection started. `None`
+    /// for the first one we ever saw.
+    pub gap_before_secs: Option<i64>,
+    pub rx_bytes: i64,
+    pub tx_bytes: i64,
+}
+
+/// One traffic bucket, as a rate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientTrafficPoint {
+    pub ts: DateTime<Utc>,
+    pub rx_bps: f64,
+    pub tx_bps: f64,
+}
+
+/// Everything about one client: the summary, its traffic over time, and the
+/// connections behind those numbers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientDetail {
+    pub client: ClientInfo,
+    pub window_hours: u32,
+    pub samples: Vec<ClientTrafficPoint>,
+    pub sessions: Vec<ClientSessionInfo>,
+    pub peak_rx_bps: f64,
+    pub peak_tx_bps: f64,
+    pub avg_rx_bps: f64,
+    pub avg_tx_bps: f64,
+    pub longest_session_secs: i64,
+    pub availability_pct: f64,
+}
+
+/// Live, in-memory state for one client between database writes.
+#[derive(Debug)]
+struct ClientState {
+    mac: Option<String>,
+    hostname: Option<String>,
+    label: Option<String>,
+    first_seen: DateTime<Utc>,
+    last_seen: DateTime<Utc>,
+    online: bool,
+    /// The row in `client_sessions` this connection is being recorded into.
+    session_id: Option<i64>,
+    session_started: Option<DateTime<Utc>>,
+    rx_bps: f64,
+    tx_bps: f64,
+    /// Traffic accumulated since the last database write.
+    pending: ClientCounters,
+    pending_since: DateTime<Utc>,
 }
 
 /// Read-only snapshot of the balancer state, serialized over the control
@@ -442,6 +552,7 @@ impl Balancer {
             providers: RwLock::new(providers),
             active: RwLock::new(active),
             force_override: RwLock::new(forced),
+            clients: RwLock::new(HashMap::new()),
             flap: StdMutex::new(flap),
             handles: StdMutex::new(Vec::new()),
             dry_run,
@@ -536,6 +647,13 @@ impl Balancer {
             self.handles.lock().unwrap().push(handle);
         }
 
+        if self.cfg.clients.is_enabled(self.cfg.firewall.manage) {
+            let me = Arc::clone(self);
+            let rx = shutdown.clone();
+            let handle = tokio::spawn(async move { me.clients_loop(rx).await });
+            self.handles.lock().unwrap().push(handle);
+        }
+
         if self.cfg.failover.route_watchdog_secs > 0 {
             let me = Arc::clone(self);
             let rx = shutdown.clone();
@@ -620,7 +738,7 @@ impl Balancer {
                         // Loud the first time and every so often after that,
                         // quiet in between: a permanently absent interface
                         // should not fill the journal.
-                        if policy_attempts == 1 || policy_attempts % 20 == 0 {
+                        if policy_attempts == 1 || policy_attempts.is_multiple_of(20) {
                             warn!(provider = %name, attempts = policy_attempts, error = %e,
                                   "routing table still cannot be set up; retrying");
                         } else {
@@ -1600,6 +1718,13 @@ impl Balancer {
 
     pub async fn shutdown(&self) {
         notify::stopping();
+        // Client traffic is accumulated in memory between writes, so hand
+        // the last partial bucket to the database before the loops stop —
+        // otherwise every update quietly loses a minute of everyone's
+        // history.
+        if self.cfg.clients.is_enabled(self.cfg.firewall.manage) {
+            self.flush_client_buckets().await;
+        }
         let handles = std::mem::take(&mut *self.handles.lock().unwrap());
         for h in &handles {
             h.abort();
@@ -1758,6 +1883,541 @@ impl Balancer {
     // Background loops.
     // ────────────────────────────────────────────────────────────────────
 
+    // ────────────────────────────────────────────────────────────────────
+    // LAN clients
+    // ────────────────────────────────────────────────────────────────────
+
+    /// Discover the hosts behind the gateway, account for their traffic, and
+    /// record when each of them was actually connected.
+    ///
+    /// Sampling is frequent (seconds) because that is what makes the live
+    /// rates and the presence detection responsive. Writing is not: traffic
+    /// is accumulated in memory and flushed once a minute, and presence is
+    /// two rows per connection rather than one per tick. A gateway that runs
+    /// for a year should not need a database the size of its logs.
+    async fn clients_loop(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
+        use std::collections::HashSet;
+        use std::time::Instant;
+
+        let cfg = self.cfg.clients.clone();
+        let lan_if = self.cfg.general.lan_interface.clone();
+        let interval = Duration::from_secs(cfg.interval_secs.max(1));
+        let offline_after = chrono::Duration::seconds(cfg.offline_after_secs as i64);
+        let persist_every = chrono::Duration::seconds(cfg.persist_every_secs.max(1) as i64);
+        // Once a client has been gone this long its accounting rules are
+        // reclaimed. The roster row stays, so its history is still readable
+        // and it is recognised rather than treated as new when it returns.
+        let forget_after = chrono::Duration::hours(24);
+
+        let mut monitor = ClientMonitor::new(self.dry_run);
+        let (by_mac, by_ip) = cfg.labels();
+        let mut resolver = NameResolver::new(
+            by_mac,
+            by_ip,
+            cfg.lease_files.clone(),
+            cfg.resolve_hostnames,
+        );
+
+        // A restart is not a disconnection — the routes stay up and the
+        // clients never notice — so sessions left open by the previous run
+        // are resumed rather than closed. If a client really did leave while
+        // we were down, the ordinary grace period below closes its session
+        // at the right moment anyway.
+        {
+            let roster: HashMap<String, crate::stats::ClientRow> = self
+                .stats
+                .clients()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| (r.ip.clone(), r))
+                .collect();
+            let open = self.stats.open_client_sessions().unwrap_or_default();
+            let now = Utc::now();
+            let mut live = self.clients.write().await;
+            for row in open {
+                let Ok(ip) = row.ip.parse::<Ipv4Addr>() else {
+                    continue;
+                };
+                let known = roster.get(&row.ip);
+                live.insert(
+                    ip,
+                    ClientState {
+                        mac: known.and_then(|r| r.mac.clone()),
+                        hostname: known.and_then(|r| r.hostname.clone()),
+                        label: known.and_then(|r| r.label.clone()),
+                        first_seen: known.map(|r| r.first_seen).unwrap_or(row.started_at),
+                        last_seen: now,
+                        online: true,
+                        session_id: Some(row.id),
+                        session_started: Some(row.started_at),
+                        rx_bps: 0.0,
+                        tx_bps: 0.0,
+                        pending: ClientCounters::default(),
+                        pending_since: now,
+                    },
+                );
+            }
+            if !live.is_empty() {
+                info!(
+                    clients = live.len(),
+                    "resumed client sessions left open by the previous run"
+                );
+            }
+        }
+
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last_tick: Option<Instant> = None;
+        let mut addrs_read: Option<Instant> = None;
+        let mut excluded: HashSet<Ipv4Addr> = HashSet::new();
+        let mut lan_networks = Vec::new();
+        let mut last_prune = Utc::now();
+        let mut warned_sample = false;
+
+        info!(
+            interval_s = interval.as_secs(),
+            lan_interface = lan_if.as_deref().unwrap_or("(all)"),
+            "client accounting started"
+        );
+
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        debug!("clients loop stopping");
+                        return;
+                    }
+                }
+            }
+
+            // What is *not* a client changes over time — a DHCP renewal can
+            // move our own address — so re-read it periodically rather than
+            // once at startup.
+            if addrs_read
+                .map(|t| t.elapsed() >= Duration::from_secs(60))
+                .unwrap_or(true)
+            {
+                addrs_read = Some(Instant::now());
+                let (own, nets) = crate::clients::local_addresses(lan_if.as_deref()).await;
+                excluded = own;
+                excluded.extend(self.cfg.providers.iter().map(|p| p.gateway));
+                excluded.extend(cfg.exclude.iter().copied());
+                // Only meaningful when we know which interface faces the LAN;
+                // otherwise every neighbour on every interface is fair game.
+                lan_networks = if lan_if.is_some() { nets } else { Vec::new() };
+            }
+
+            let elapsed = last_tick
+                .map(|t| t.elapsed().as_secs_f64())
+                .unwrap_or_else(|| interval.as_secs_f64())
+                .max(0.001);
+            last_tick = Some(Instant::now());
+
+            let params = SampleParams {
+                lan_interface: lan_if.clone(),
+                excluded: excluded.clone(),
+                lan_networks: lan_networks.clone(),
+                max_tracked: cfg.max_tracked,
+                presence_probe: cfg.presence_probe,
+            };
+            let observations = match monitor.sample(&params).await {
+                Ok(o) => o,
+                Err(e) => {
+                    if !warned_sample {
+                        warned_sample = true;
+                        warn!(error = %e, "client accounting could not sample; will keep trying");
+                    }
+                    continue;
+                }
+            };
+
+            let now = Utc::now();
+
+            // Name resolution can reach a resolver, so it happens before the
+            // lock is taken rather than while holding it.
+            let unnamed: HashSet<Ipv4Addr> = {
+                let live = self.clients.read().await;
+                observations
+                    .iter()
+                    .filter(|o| {
+                        live.get(&o.ip)
+                            .map(|c| c.hostname.is_none())
+                            .unwrap_or(true)
+                    })
+                    .map(|o| o.ip)
+                    .collect()
+            };
+            let mut budget = resolver.ptr_budget();
+            let mut discovered: HashMap<Ipv4Addr, (Option<String>, Option<String>)> =
+                HashMap::with_capacity(observations.len());
+            for obs in &observations {
+                let label = resolver.label(obs.ip, obs.mac.as_deref());
+                let hostname = if unnamed.contains(&obs.ip) {
+                    resolver.hostname(obs.ip, &mut budget).await
+                } else {
+                    None
+                };
+                discovered.insert(obs.ip, (hostname, label));
+            }
+
+            // Fold this tick into the live state, and collect the writes it
+            // implies. The database work happens after the lock is released.
+            struct Flush {
+                ip: Ipv4Addr,
+                session: Option<i64>,
+                counters: ClientCounters,
+                span_secs: f64,
+            }
+            /// What we know about a client, to be written to the roster.
+            struct Facts {
+                ip: String,
+                mac: Option<String>,
+                hostname: Option<String>,
+                label: Option<String>,
+            }
+            let mut opens: Vec<(Ipv4Addr, DateTime<Utc>)> = Vec::new();
+            let mut closes: Vec<(i64, DateTime<Utc>)> = Vec::new();
+            let mut flushes: Vec<Flush> = Vec::new();
+            let mut upserts: Vec<Facts> = Vec::new();
+            let mut forgets: Vec<Ipv4Addr> = Vec::new();
+
+            {
+                let mut live = self.clients.write().await;
+
+                for obs in &observations {
+                    let (hostname, label) = discovered.remove(&obs.ip).unwrap_or((None, None));
+                    let fresh = !live.contains_key(&obs.ip);
+                    let entry = live.entry(obs.ip).or_insert_with(|| ClientState {
+                        mac: None,
+                        hostname: None,
+                        label: None,
+                        first_seen: now,
+                        last_seen: now,
+                        online: false,
+                        session_id: None,
+                        session_started: None,
+                        rx_bps: 0.0,
+                        tx_bps: 0.0,
+                        pending: ClientCounters::default(),
+                        pending_since: now,
+                    });
+
+                    let mut changed = fresh;
+                    if obs.mac.is_some() && entry.mac != obs.mac {
+                        entry.mac = obs.mac.clone();
+                        changed = true;
+                    }
+                    if hostname.is_some() && entry.hostname != hostname {
+                        entry.hostname = hostname;
+                        changed = true;
+                    }
+                    if entry.label != label {
+                        entry.label = label;
+                        changed = true;
+                    }
+
+                    entry.rx_bps = obs.delta.rx_bytes as f64 / elapsed;
+                    entry.tx_bps = obs.delta.tx_bytes as f64 / elapsed;
+                    entry.pending.rx_bytes += obs.delta.rx_bytes;
+                    entry.pending.rx_packets += obs.delta.rx_packets;
+                    entry.pending.tx_bytes += obs.delta.tx_bytes;
+                    entry.pending.tx_packets += obs.delta.tx_packets;
+
+                    if obs.seen {
+                        entry.last_seen = now;
+                        if !entry.online {
+                            entry.online = true;
+                            entry.session_started = Some(now);
+                            opens.push((obs.ip, now));
+                        }
+                    }
+
+                    if changed {
+                        upserts.push(Facts {
+                            ip: obs.ip.to_string(),
+                            mac: entry.mac.clone(),
+                            hostname: entry.hostname.clone(),
+                            label: entry.label.clone(),
+                        });
+                    }
+                }
+
+                // Presence and persistence for everything we know about,
+                // including clients that did not show up in this sample at
+                // all — a host whose ARP entry has expired entirely.
+                for (ip, entry) in live.iter_mut() {
+                    if entry.online && now - entry.last_seen > offline_after {
+                        entry.online = false;
+                        entry.rx_bps = 0.0;
+                        entry.tx_bps = 0.0;
+                        if let Some(id) = entry.session_id.take() {
+                            // Ended when it was last seen, not when we
+                            // noticed: the grace period is our uncertainty,
+                            // not the client's downtime.
+                            closes.push((id, entry.last_seen));
+                        }
+                        entry.session_started = None;
+                    }
+
+                    let due = now - entry.pending_since >= persist_every;
+                    if due && !entry.pending.is_zero() {
+                        flushes.push(Flush {
+                            ip: *ip,
+                            session: entry.session_id,
+                            counters: entry.pending,
+                            span_secs: (now - entry.pending_since).num_milliseconds() as f64
+                                / 1000.0,
+                        });
+                    }
+                    if due {
+                        entry.pending = ClientCounters::default();
+                        entry.pending_since = now;
+                    }
+
+                    if !entry.online && now - entry.last_seen > forget_after {
+                        forgets.push(*ip);
+                    }
+                }
+                for ip in &forgets {
+                    live.remove(ip);
+                }
+            }
+
+            // ── database, outside the lock ──────────────────────────────
+            for f in upserts {
+                if let Err(e) = self.stats.upsert_client(
+                    &f.ip,
+                    f.mac.as_deref(),
+                    f.hostname.as_deref(),
+                    f.label.as_deref(),
+                    now,
+                ) {
+                    debug!(ip = %f.ip, error = %e, "could not record client");
+                }
+            }
+            for (id, at) in closes {
+                if let Err(e) = self.stats.close_client_session(id, at) {
+                    debug!(error = %e, "could not close a client session");
+                }
+            }
+            for (ip, at) in opens {
+                match self.stats.open_client_session(&ip.to_string(), at) {
+                    Ok(id) => {
+                        if let Some(entry) = self.clients.write().await.get_mut(&ip) {
+                            entry.session_id = Some(id);
+                        }
+                        debug!(%ip, "client connected");
+                    }
+                    Err(e) => warn!(%ip, error = %e, "could not open a client session"),
+                }
+            }
+            for f in flushes {
+                let c = f.counters;
+                if let Err(e) =
+                    self.stats
+                        .record_client_sample(&f.ip.to_string(), now, f.span_secs, &c)
+                {
+                    debug!(ip = %f.ip, error = %e, "could not record client traffic");
+                }
+                if let Some(id) = f.session {
+                    let _ = self.stats.add_session_bytes(id, c.rx_bytes, c.tx_bytes);
+                }
+                // Keep `last_seen` in the roster current so a listing made
+                // by another process is not stale.
+                let _ = self
+                    .stats
+                    .upsert_client(&f.ip.to_string(), None, None, None, now);
+            }
+            for ip in forgets {
+                monitor.forget(ip).await;
+            }
+
+            if cfg.retention_hours > 0 && (now - last_prune).num_seconds() > 3600 {
+                last_prune = now;
+                match self.stats.prune_clients(cfg.retention_hours) {
+                    Ok(n) if n > 0 => info!(deleted = n, "clients: pruned old history"),
+                    Ok(_) => {}
+                    Err(e) => warn!(error = %e, "clients: prune failed"),
+                }
+            }
+        }
+    }
+
+    /// Every client we know of, live state merged with the window's history.
+    ///
+    /// The roster comes from the database, so a machine that disconnected
+    /// yesterday is still listed — which is the whole point of asking "were
+    /// there any drops".
+    pub async fn client_list(&self, window_hours: u32) -> Result<Vec<ClientInfo>> {
+        let now = Utc::now();
+        let window_hours = window_hours.clamp(1, 24 * 365);
+        let roster = self.stats.clients()?;
+        let rollup = self.stats.client_rollup(window_hours, now)?;
+        let live = self.clients.read().await;
+
+        let mut out: Vec<ClientInfo> = Vec::with_capacity(roster.len().max(live.len()));
+        let mut listed: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for row in &roster {
+            let parsed = row.ip.parse::<Ipv4Addr>().ok();
+            let state = parsed.and_then(|ip| live.get(&ip));
+            out.push(build_client_info(
+                &row.ip,
+                row.mac.clone(),
+                row.hostname.clone(),
+                row.label.clone(),
+                Some(row.first_seen),
+                Some(row.last_seen),
+                state,
+                rollup.get(&row.ip),
+                now,
+            ));
+            listed.insert(row.ip.clone());
+        }
+        // Seen this tick but not yet written to the roster.
+        for (ip, state) in live.iter() {
+            let key = ip.to_string();
+            if listed.contains(&key) {
+                continue;
+            }
+            out.push(build_client_info(
+                &key,
+                state.mac.clone(),
+                state.hostname.clone(),
+                state.label.clone(),
+                Some(state.first_seen),
+                Some(state.last_seen),
+                Some(state),
+                rollup.get(&key),
+                now,
+            ));
+        }
+
+        // Connected first, then by how much they moved: the two questions an
+        // operator is actually asking, in that order.
+        out.sort_by(|a, b| {
+            b.online
+                .cmp(&a.online)
+                .then((b.rx_bytes + b.tx_bytes).cmp(&(a.rx_bytes + a.tx_bytes)))
+                .then_with(|| {
+                    let ka = a.ip.parse::<Ipv4Addr>().ok();
+                    let kb = b.ip.parse::<Ipv4Addr>().ok();
+                    ka.cmp(&kb)
+                })
+        });
+        Ok(out)
+    }
+
+    /// Everything about one client: totals, traffic over time, and every
+    /// connection behind those numbers.
+    pub async fn client_detail(
+        &self,
+        ip: &str,
+        window_hours: u32,
+        sample_limit: u32,
+    ) -> Result<ClientDetail> {
+        let now = Utc::now();
+        let window_hours = window_hours.clamp(1, 24 * 365);
+        let client = self
+            .client_list(window_hours)
+            .await?
+            .into_iter()
+            .find(|c| c.ip == ip)
+            .ok_or_else(|| anyhow!("no client with address '{ip}' has been seen"))?;
+
+        let raw = self
+            .stats
+            .client_samples(ip, window_hours, sample_limit.clamp(1, 5_000), now)?;
+        let samples: Vec<ClientTrafficPoint> = raw
+            .iter()
+            .map(|s| {
+                let span = if s.interval_s > 0.0 {
+                    s.interval_s
+                } else {
+                    1.0
+                };
+                ClientTrafficPoint {
+                    ts: s.ts,
+                    rx_bps: s.rx_bytes as f64 / span,
+                    tx_bps: s.tx_bytes as f64 / span,
+                }
+            })
+            .collect();
+
+        let rows = self.stats.client_sessions(ip, 50)?;
+        let mut sessions = Vec::with_capacity(rows.len());
+        for (i, s) in rows.iter().enumerate() {
+            // Rows are newest first, so the previous connection is the next
+            // one along; the gap is the time the client was away.
+            let gap = rows
+                .get(i + 1)
+                .and_then(|prev| prev.ended_at)
+                .map(|end| (s.started_at - end).num_seconds().max(0));
+            sessions.push(ClientSessionInfo {
+                started_at: s.started_at,
+                ended_at: s.ended_at,
+                duration_secs: s.duration_secs(now),
+                gap_before_secs: gap,
+                rx_bytes: s.rx_bytes,
+                tx_bytes: s.tx_bytes,
+            });
+        }
+
+        let peak_rx_bps = samples.iter().map(|s| s.rx_bps).fold(0.0, f64::max);
+        let peak_tx_bps = samples.iter().map(|s| s.tx_bps).fold(0.0, f64::max);
+        // Averaged over connected time rather than wall-clock: a laptop that
+        // was here for ten minutes of an eight-hour window did not average a
+        // trickle, and reporting it that way would be misleading.
+        let basis = if client.online_secs > 0 {
+            client.online_secs as f64
+        } else {
+            (window_hours as f64) * 3600.0
+        };
+        let longest_session_secs = sessions.iter().map(|s| s.duration_secs).max().unwrap_or(0);
+
+        Ok(ClientDetail {
+            availability_pct: client.availability_pct(window_hours as i64 * 3600),
+            avg_rx_bps: client.rx_bytes as f64 / basis,
+            avg_tx_bps: client.tx_bytes as f64 / basis,
+            peak_rx_bps,
+            peak_tx_bps,
+            longest_session_secs,
+            window_hours,
+            samples,
+            sessions,
+            client,
+        })
+    }
+
+    /// Write out whatever client traffic has accumulated but not yet been
+    /// persisted. Called on shutdown so an update does not lose the last
+    /// minute of everyone's history.
+    pub async fn flush_client_buckets(&self) {
+        let now = Utc::now();
+        let pending: Vec<(Ipv4Addr, Option<i64>, ClientCounters, f64)> = {
+            let mut live = self.clients.write().await;
+            live.iter_mut()
+                .filter(|(_, c)| !c.pending.is_zero())
+                .map(|(ip, c)| {
+                    let span = (now - c.pending_since).num_milliseconds() as f64 / 1000.0;
+                    let counters = c.pending;
+                    c.pending = ClientCounters::default();
+                    c.pending_since = now;
+                    (*ip, c.session_id, counters, span.max(0.001))
+                })
+                .collect()
+        };
+        for (ip, session, c, span) in pending {
+            let _ = self
+                .stats
+                .record_client_sample(&ip.to_string(), now, span, &c);
+            if let Some(id) = session {
+                let _ = self.stats.add_session_bytes(id, c.rx_bytes, c.tx_bytes);
+            }
+        }
+    }
+
     async fn traffic_loop(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
         let interval = Duration::from_secs(self.cfg.traffic.interval_secs.max(1));
         let retention = self.cfg.traffic.retention_hours;
@@ -1913,6 +2573,44 @@ impl Balancer {
                 last_prune = now;
             }
         }
+    }
+}
+
+/// Assemble the operator-facing view of one client from the three places
+/// its facts live: the roster, the window's history, and the live state.
+#[allow(clippy::too_many_arguments)]
+fn build_client_info(
+    ip: &str,
+    mac: Option<String>,
+    hostname: Option<String>,
+    label: Option<String>,
+    first_seen: Option<DateTime<Utc>>,
+    last_seen: Option<DateTime<Utc>>,
+    state: Option<&ClientState>,
+    rollup: Option<&ClientRollup>,
+    now: DateTime<Utc>,
+) -> ClientInfo {
+    let roll = rollup.cloned().unwrap_or_default();
+    ClientInfo {
+        ip: ip.to_string(),
+        // Live state is fresher than the roster, which is only written when
+        // something changes or a bucket is flushed.
+        mac: state.and_then(|s| s.mac.clone()).or(mac),
+        hostname: state.and_then(|s| s.hostname.clone()).or(hostname),
+        label: state.and_then(|s| s.label.clone()).or(label),
+        online: state.map(|s| s.online).unwrap_or(false),
+        first_seen: first_seen.or_else(|| state.map(|s| s.first_seen)),
+        last_seen: state.map(|s| s.last_seen).or(last_seen),
+        rx_bps: state.map(|s| s.rx_bps).unwrap_or(0.0),
+        tx_bps: state.map(|s| s.tx_bps).unwrap_or(0.0),
+        rx_bytes: roll.rx_bytes,
+        tx_bytes: roll.tx_bytes,
+        disconnects: roll.disconnects,
+        online_secs: roll.online_secs,
+        session_secs: state
+            .filter(|s| s.online)
+            .and_then(|s| s.session_started)
+            .map(|t| (now - t).num_seconds().max(0)),
     }
 }
 

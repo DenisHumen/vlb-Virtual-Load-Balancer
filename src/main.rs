@@ -22,6 +22,8 @@ mod update;
 
 #[path = "net/canary.rs"]
 mod canary;
+#[path = "net/clients.rs"]
+mod clients;
 #[path = "net/health.rs"]
 mod health;
 #[path = "net/http.rs"]
@@ -44,6 +46,8 @@ mod sysmon;
 
 #[path = "ui/control.rs"]
 mod control;
+#[path = "ui/format.rs"]
+mod format;
 #[path = "ui/tui.rs"]
 mod tui;
 
@@ -105,6 +109,24 @@ enum Command {
         /// How many recent samples to fetch (clamped to 10_000).
         #[arg(long, default_value_t = 60)]
         limit: u32,
+    },
+    /// Who is behind this gateway: connected hosts, what they moved, and
+    /// whether their connection dropped.
+    ///
+    /// Without arguments it lists every host seen in the window, connected
+    /// ones first. With `--ip` it prints one host's full history: every
+    /// connection, how long each lasted, how long it was away in between,
+    /// and its average and peak rates.
+    Clients {
+        /// Show one client's detail instead of the list.
+        #[arg(long)]
+        ip: Option<String>,
+        /// Reporting window, in hours.
+        #[arg(long, default_value_t = 24)]
+        hours: u32,
+        /// Print the daemon's raw JSON instead of a table.
+        #[arg(long)]
+        json: bool,
     },
     /// Diagnostic dump: configured interfaces vs /proc/net/dev, DB row
     /// counts per provider. Use this when the TUI shows "samples: 0" to
@@ -219,6 +241,11 @@ async fn main() -> Result<()> {
             let resp = control::send(&config.control.listen, &Request::System { limit }).await?;
             print_response(&resp);
             Ok(())
+        }
+        Command::Clients { ip, hours, json } => {
+            let config = Config::load(&cli.config)?;
+            config.validate()?;
+            clients_report(&config, ip.as_deref(), hours, json).await
         }
         Command::Diag => {
             let config = Config::load(&cli.config)?;
@@ -666,6 +693,197 @@ async fn do_update(
     println!();
     println!("{}", outcome.summary());
     Ok(())
+}
+
+/// `vlb clients` — who is behind the gateway, and what have they been doing.
+async fn clients_report(
+    config: &Config,
+    only: Option<&str>,
+    hours: u32,
+    as_json: bool,
+) -> Result<()> {
+    use crate::format as f;
+    let now = chrono::Utc::now();
+
+    let request = match only {
+        Some(ip) => Request::ClientDetail {
+            ip: ip.to_string(),
+            hours,
+            limit: 2_000,
+        },
+        None => Request::Clients { hours },
+    };
+    let resp = control::send(&config.control.listen, &request)
+        .await
+        .with_context(|| {
+            format!(
+                "could not reach the daemon at {} — is it running?",
+                config.control.listen
+            )
+        })?;
+
+    if as_json {
+        print_response(&resp);
+        return Ok(());
+    }
+
+    match resp {
+        Response::Error { error } => anyhow::bail!("{error}"),
+        Response::Clients { clients } => {
+            println!("== vlb clients — last {hours}h ==");
+            if !config.clients.is_enabled(config.firewall.manage) {
+                println!(
+                    "note: client accounting is disabled in the config, so this list stays \
+                     empty.\n      Enable it with  [clients] enabled = true"
+                );
+            }
+            if clients.is_empty() {
+                println!("(no clients seen yet)");
+                return Ok(());
+            }
+            println!(
+                "{:<3}{:<18}{:<16}{:<19}{:>12}{:>12}{:>11}{:>11}{:>9}{:>7}  last seen",
+                "",
+                "name",
+                "address",
+                "mac",
+                "↓ now",
+                "↑ now",
+                "↓ total",
+                "↑ total",
+                "online",
+                "drops"
+            );
+            println!("{}", "-".repeat(126));
+            for c in &clients {
+                let name = if c.label.is_some() || c.hostname.is_some() {
+                    c.display_name().to_string()
+                } else {
+                    "—".to_string()
+                };
+                println!(
+                    "{:<3}{:<18}{:<16}{:<19}{:>12}{:>12}{:>11}{:>11}{:>9}{:>7}  {}",
+                    if c.online { "●" } else { " " },
+                    truncate(&name, 17),
+                    c.ip,
+                    c.mac.as_deref().unwrap_or("—"),
+                    f::rate_from_bytes(c.rx_bps),
+                    f::rate_from_bytes(c.tx_bps),
+                    f::bytes(c.rx_bytes.max(0) as u64),
+                    f::bytes(c.tx_bytes.max(0) as u64),
+                    f::duration(c.online_secs.max(0) as u64),
+                    c.disconnects,
+                    c.last_seen
+                        .map(|t| f::ago(t, now))
+                        .unwrap_or_else(|| "—".into()),
+                );
+            }
+            let online = clients.iter().filter(|c| c.online).count();
+            println!();
+            println!(
+                "{online} of {} connected now.  Full history for one host:  vlb clients --ip <address>",
+                clients.len()
+            );
+        }
+        Response::ClientDetail { detail } => {
+            let d = *detail;
+            let c = &d.client;
+            println!(
+                "== {} {} — last {}h ==",
+                c.ip,
+                c.label
+                    .as_deref()
+                    .or(c.hostname.as_deref())
+                    .map(|n| format!("({n})"))
+                    .unwrap_or_default(),
+                d.window_hours
+            );
+            println!("  mac            {}", c.mac.as_deref().unwrap_or("—"));
+            match (c.online, c.session_secs) {
+                (true, Some(s)) => println!(
+                    "  state          online, connected for {}",
+                    f::duration(s as u64)
+                ),
+                (true, None) => println!("  state          online"),
+                (false, _) => println!(
+                    "  state          offline{}",
+                    c.last_seen
+                        .map(|t| format!(", last seen {}", f::ago(t, now)))
+                        .unwrap_or_default()
+                ),
+            }
+            if let Some(t) = c.first_seen {
+                println!("  first seen     {}", f::stamp_secs(t));
+            }
+            println!(
+                "  traffic        ↓ {}   ↑ {}",
+                f::bytes(c.rx_bytes.max(0) as u64),
+                f::bytes(c.tx_bytes.max(0) as u64)
+            );
+            println!(
+                "  average        ↓ {}   ↑ {}   (while connected)",
+                f::rate_from_bytes(d.avg_rx_bps),
+                f::rate_from_bytes(d.avg_tx_bps)
+            );
+            println!(
+                "  peak           ↓ {}   ↑ {}",
+                f::rate_from_bytes(d.peak_rx_bps),
+                f::rate_from_bytes(d.peak_tx_bps)
+            );
+            println!(
+                "  connected      {} of {}h ({:.1}%)   drops: {}   longest: {}",
+                f::duration(c.online_secs.max(0) as u64),
+                d.window_hours,
+                d.availability_pct,
+                c.disconnects,
+                f::duration(d.longest_session_secs.max(0) as u64)
+            );
+
+            println!();
+            println!("  connections (newest first)");
+            if d.sessions.is_empty() {
+                println!("    (none recorded)");
+            } else {
+                println!(
+                    "    {:<20}{:<20}{:>10}{:>14}{:>12}{:>12}",
+                    "started", "ended", "duration", "away before", "↓", "↑"
+                );
+                for s in d.sessions.iter().take(20) {
+                    println!(
+                        "    {:<20}{:<20}{:>10}{:>14}{:>12}{:>12}",
+                        f::stamp_secs(s.started_at),
+                        s.ended_at
+                            .map(f::stamp_secs)
+                            .unwrap_or_else(|| "— (open)".into()),
+                        f::duration(s.duration_secs.max(0) as u64),
+                        s.gap_before_secs
+                            .map(|g| f::duration(g.max(0) as u64))
+                            .unwrap_or_else(|| "—".into()),
+                        f::bytes(s.rx_bytes.max(0) as u64),
+                        f::bytes(s.tx_bytes.max(0) as u64),
+                    );
+                }
+            }
+            println!();
+            println!(
+                "  {} traffic buckets recorded in this window",
+                d.samples.len()
+            );
+        }
+        other => anyhow::bail!("unexpected response from the daemon: {other:?}"),
+    }
+    Ok(())
+}
+
+/// Cut a string to `max` characters. Operates on characters, not bytes, so a
+/// hostname with an accent in it is never split down the middle.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 /// `vlb diag` — inspect the live sampling chain without touching the daemon.

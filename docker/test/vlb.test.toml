@@ -91,6 +91,23 @@ enabled = true
 interval_secs = 2
 retention_hours = 1
 
+# Per-client accounting, on a compressed cadence so a scenario resolves in
+# seconds. `offline_after_secs` is the shortest the validator allows relative
+# to the interval (3x), which is what makes the disconnect assertions quick
+# without making them flaky.
+[clients]
+enabled = true
+interval_secs = 2
+persist_every_secs = 4
+offline_after_secs = 12
+retention_hours = 1
+presence_probe = true
+# No resolver in the lab; names come from /etc/hosts, which the vlb
+# container's entrypoint writes — the same path a real deployment takes from
+# a DHCP lease file.
+resolve_hostnames = false
+max_tracked = 64
+
 [system]
 enabled = false
 interval_secs = 5

@@ -95,6 +95,44 @@ for p in d.get('snapshot', {}).get('providers', []):
 "
 }
 
+# One field of one client's entry in `vlb clients --json`.
+client_field() {
+    vlb_exec vlb --config /etc/vlb/vlb.toml clients --json 2>/dev/null | "$PY" -c "
+import json,sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(0)
+for c in d.get('clients', []):
+    if c.get('ip') == '$1':
+        v = c.get('$2')
+        # Booleans and numbers print as JSON so 'false' and 0 are matchable
+        # rather than collapsing to an empty string.
+        print(v if isinstance(v, str) else json.dumps(v))
+"
+}
+
+# Addresses currently listed as clients, one per line.
+client_ips() {
+    vlb_exec vlb --config /etc/vlb/vlb.toml clients --json 2>/dev/null | "$PY" -c "
+import json,sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(0)
+for c in d.get('clients', []):
+    print(c.get('ip',''))
+"
+}
+
+# One field out of a client's detail view.
+client_detail_field() {
+    vlb_exec vlb --config /etc/vlb/vlb.toml clients --ip "$1" --json 2>/dev/null | "$PY" -c "
+import json,sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(0)
+det = d.get('detail', {})
+v = det.get('$2', det.get('client', {}).get('$2'))
+print(v if isinstance(v, str) else json.dumps(v))
+"
+}
+
 # One top-level field of the snapshot (`active_adopted`, `forced`, …).
 # Non-strings are printed as JSON so booleans read `true`/`false` and an
 # absent value reads `null`, which is what the assertions below match on.
@@ -817,6 +855,127 @@ scenario_missing_interface() {
         || bad "missing-iface: the lab did not recover after restoring the standard config"
 }
 
+# Per-client accounting, end to end: the LAN client moves real bytes through
+# the gateway, and vlb must attribute them to that host, name it, notice when
+# it goes away, and notice when it comes back.
+#
+# The client container is a genuine LAN host — no policy routing, no marks,
+# its only way out is the gateway — so this measures what the feature will
+# measure in production rather than a simulation of it.
+scenario_clients() {
+    info "clients — per-host traffic, names, presence and drops"
+    reset_lab
+    local ip=10.77.0.50
+
+    # A host is counted from the moment it is discovered, not retroactively:
+    # its accounting rules are installed when it first appears in the
+    # neighbour table, so the very first packets of a never-before-seen host
+    # predate its own counters by up to one sampling interval. Warm up and
+    # wait for it to be listed before measuring — which is also the real
+    # sequence, where a host is discovered long before anyone asks what it
+    # has been downloading.
+    "${COMPOSE[@]}" exec -T client sh -c \
+        'curl -s --max-time 10 -o /dev/null http://192.0.2.10/canary.txt' >/dev/null 2>&1 || true
+
+    local online
+    if online=$(eventually 40 'true' client_field "$ip" online); then
+        ok "the LAN client is listed and online"
+    else
+        bad "clients: $ip never appeared as online (got '$online')"
+        note "listed: $(client_ips | tr '\n' ' ')"
+        return
+    fi
+
+    # Now that it is tracked, move a known amount and check the count. The
+    # bytes have to be the client's own, counted by the kernel.
+    "${COMPOSE[@]}" exec -T client sh -c \
+        'curl -s --max-time 25 -o /dev/null http://192.0.2.10/big.bin' >/dev/null 2>&1 || true
+    local rx=0 waited=0
+    while [ "$waited" -lt 40 ]; do
+        rx=$(client_field "$ip" rx_bytes); rx=${rx:-0}
+        [ "$rx" -gt 200000 ] && break
+        sleep 2; waited=$((waited+2))
+    done
+    if [ "$rx" -gt 200000 ]; then
+        ok "counted the client's 256 KB download ($rx bytes)"
+    else
+        bad "clients: rx_bytes = $rx after ${waited}s, expected the 256 KB transfer"
+        note "kernel counters: $(vlb_exec iptables-save -c -t filter | grep -F 'vlb:' | tr '\n' ' ')"
+    fi
+    local mac; mac=$(client_field "$ip" mac)
+    case "$mac" in
+        ??:??:??:??:??:??) ok "learned its hardware address ($mac)" ;;
+        *) bad "clients: no MAC for $ip (got '$mac')" ;;
+    esac
+    local name; name=$(client_field "$ip" hostname)
+    [ "$name" = "lab-client" ] \
+        && ok "named it from /etc/hosts, shortened to '$name'" \
+        || bad "clients: hostname was '$name', expected lab-client"
+
+    # The uplinks share this LAN segment. They are routers, not users, and
+    # listing them as "connected clients" would be a lie an operator acts on.
+    local listed; listed=$(client_ips)
+    if grep -q '10.77.0.2' <<<"$listed" || grep -q '10.77.0.3' <<<"$listed"; then
+        bad "clients: a provider gateway is listed as a client"
+        note "listed: $(tr '\n' ' ' <<<"$listed")"
+    else
+        ok "provider gateways are not mistaken for clients"
+    fi
+    if grep -q '10.77.0.100' <<<"$listed"; then
+        bad "clients: the gateway lists itself as a client"
+    else
+        ok "the gateway does not list itself"
+    fi
+
+    # The detail view is where an operator answers "was it us or them".
+    local sessions; sessions=$(client_detail_field "$ip" sessions)
+    case "$sessions" in
+        *started_at*) ok "detail view records the connection" ;;
+        *) bad "clients: no session in the detail view (got: ${sessions:0:80})" ;;
+    esac
+
+    # ── a real disconnection ────────────────────────────────────────────
+    note "stopping the client container — that is a genuine LAN disconnection"
+    "${COMPOSE[@]}" stop client >/dev/null 2>&1
+    local off
+    if off=$(eventually 60 'false' client_field "$ip" online); then
+        ok "noticed the client had gone"
+    else
+        bad "clients: still shown as online 60s after it left (got '$off')"
+    fi
+    local drops; drops=$(client_field "$ip" disconnects)
+    [ "${drops:-0}" -ge 1 ] \
+        && ok "recorded the drop (disconnects = $drops)" \
+        || bad "clients: disconnects = ${drops:-unset}, expected at least 1"
+
+    # ── and its return ──────────────────────────────────────────────────
+    "${COMPOSE[@]}" start client >/dev/null 2>&1
+    sleep 2
+    "${COMPOSE[@]}" exec -T client sh -c \
+        'curl -s --max-time 10 -o /dev/null http://192.0.2.10/canary.txt' >/dev/null 2>&1 || true
+    if eventually 45 'true' client_field "$ip" online >/dev/null; then
+        ok "saw it come back"
+    else
+        bad "clients: never came back online after restarting the container"
+    fi
+
+    # A returning host keeps its accounting rules, so it is counted from its
+    # first packet rather than being rediscovered from zero — and its earlier
+    # traffic is still attributed to it.
+    "${COMPOSE[@]}" exec -T client sh -c \
+        'curl -s --max-time 25 -o /dev/null http://192.0.2.10/big.bin' >/dev/null 2>&1 || true
+    local rx2=0
+    waited=0
+    while [ "$waited" -lt 40 ]; do
+        rx2=$(client_field "$ip" rx_bytes); rx2=${rx2:-0}
+        [ "$rx2" -gt "$rx" ] && break
+        sleep 2; waited=$((waited+2))
+    done
+    [ "$rx2" -gt "$rx" ] \
+        && ok "kept counting after the drop, history intact (rx $rx → $rx2)" \
+        || bad "clients: traffic after the reconnection was not counted ($rx → $rx2)"
+}
+
 scenario_watchdog() {
     info "route watchdog — an external tool overwrites our default route"
     reset_lab
@@ -1089,7 +1248,7 @@ scenario_probe_cli() {
 
 # ─────────────────────────────────────────────────────────────────────────
 
-SCENARIOS=(baseline priority_gap dead blackhole lossy dns_blocked expired canary_only throttled failback both_down restart restart_slow_primary restart_on_backup pin_survives_restart missing_interface watchdog netplan_fight missing_conntrack concurrent_force soak force probe_cli)
+SCENARIOS=(baseline priority_gap dead blackhole lossy dns_blocked expired canary_only throttled failback both_down restart restart_slow_primary restart_on_backup pin_survives_restart missing_interface clients watchdog netplan_fight missing_conntrack concurrent_force soak force probe_cli)
 
 cleanup() {
     if [ "$KEEP" -eq 1 ]; then

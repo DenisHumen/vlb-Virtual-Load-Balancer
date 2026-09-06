@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
+use crate::clients::ClientCounters;
 use crate::config::Provider;
 use crate::sysmon::SysSample;
 use crate::traffic::IfCounters;
@@ -65,6 +67,59 @@ pub struct TrafficTotals {
 pub struct SystemPoint {
     pub ts: DateTime<Utc>,
     pub sample: SysSample,
+}
+
+/// A LAN client as the database remembers it, independent of whether it is
+/// connected right now.
+#[derive(Debug, Clone)]
+pub struct ClientRow {
+    pub ip: String,
+    pub mac: Option<String>,
+    pub hostname: Option<String>,
+    pub label: Option<String>,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+}
+
+/// One persisted traffic bucket for a client.
+#[derive(Debug, Clone)]
+pub struct ClientSamplePoint {
+    pub ts: DateTime<Utc>,
+    pub interval_s: f64,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+}
+
+/// A period during which a client was continuously present.
+#[derive(Debug, Clone)]
+pub struct ClientSessionRow {
+    pub id: i64,
+    pub ip: String,
+    pub started_at: DateTime<Utc>,
+    /// `None` while the session is still open.
+    pub ended_at: Option<DateTime<Utc>>,
+    pub rx_bytes: i64,
+    pub tx_bytes: i64,
+}
+
+impl ClientSessionRow {
+    /// How long the session lasted, measured to `now` while it is open.
+    pub fn duration_secs(&self, now: DateTime<Utc>) -> i64 {
+        let end = self.ended_at.unwrap_or(now);
+        (end - self.started_at).num_seconds().max(0)
+    }
+}
+
+/// Per-client aggregates over a time window.
+#[derive(Debug, Clone, Default)]
+pub struct ClientRollup {
+    pub rx_bytes: i64,
+    pub tx_bytes: i64,
+    /// Sessions that ended inside the window — every one of them is a moment
+    /// this client dropped off the LAN.
+    pub disconnects: i64,
+    /// Seconds the client was present inside the window.
+    pub online_secs: i64,
 }
 
 impl Stats {
@@ -251,6 +306,270 @@ impl Stats {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    // ── LAN clients ─────────────────────────────────────────────────────
+    //
+    // Three tables, each answering a different question: `clients` is the
+    // roster (who has ever been here, and what do we call them),
+    // `client_sessions` is presence (when were they connected, and when did
+    // they drop), `client_samples` is volume (how much did they move, and
+    // when). Keeping them apart is what lets an idle client cost nothing:
+    // presence is two rows per connection, not one per tick.
+
+    /// Record a client, or update what we know about it.
+    ///
+    /// Discovered facts never overwrite themselves with nothing: a client
+    /// whose DHCP lease has expired keeps the hostname it had, because
+    /// "we no longer know" is less useful to an operator than "it was this".
+    pub fn upsert_client(
+        &self,
+        ip: &str,
+        mac: Option<&str>,
+        hostname: Option<&str>,
+        label: Option<&str>,
+        seen_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO clients(ip, mac, hostname, label, first_seen, last_seen)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?5)
+             ON CONFLICT(ip) DO UPDATE SET
+                 mac       = COALESCE(excluded.mac, clients.mac),
+                 hostname  = COALESCE(excluded.hostname, clients.hostname),
+                 label     = excluded.label,
+                 last_seen = excluded.last_seen",
+            params![ip, mac, hostname, label, seen_at.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Persist one accumulated traffic bucket for a client.
+    pub fn record_client_sample(
+        &self,
+        ip: &str,
+        ts: DateTime<Utc>,
+        interval_s: f64,
+        c: &ClientCounters,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO client_samples(ts, ip, interval_s, rx_bytes, rx_packets, tx_bytes, tx_packets)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                ts.to_rfc3339(),
+                ip,
+                interval_s,
+                c.rx_bytes as i64,
+                c.rx_packets as i64,
+                c.tx_bytes as i64,
+                c.tx_packets as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Open a presence session and return its id.
+    pub fn open_client_session(&self, ip: &str, at: DateTime<Utc>) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO client_sessions(ip, started_at) VALUES(?1, ?2)",
+            params![ip, at.to_rfc3339()],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Close a presence session at the moment the client was last seen.
+    pub fn close_client_session(&self, id: i64, at: DateTime<Utc>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE client_sessions SET ended_at = ?2 WHERE id = ?1 AND ended_at IS NULL",
+            params![id, at.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Add traffic to a session's running totals.
+    pub fn add_session_bytes(&self, id: i64, rx: u64, tx: u64) -> Result<()> {
+        if rx == 0 && tx == 0 {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE client_sessions
+                SET rx_bytes = rx_bytes + ?2, tx_bytes = tx_bytes + ?3
+              WHERE id = ?1",
+            params![id, rx as i64, tx as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Sessions left open by a previous run.
+    ///
+    /// A restart is not a disconnection — the routes stay up and the clients
+    /// never notice — so these are handed back to the new process to either
+    /// continue or close honestly.
+    pub fn open_client_sessions(&self) -> Result<Vec<ClientSessionRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, ip, started_at, ended_at, rx_bytes, tx_bytes
+               FROM client_sessions WHERE ended_at IS NULL",
+        )?;
+        let rows = stmt.query_map([], map_session)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Everything in the roster, most recently seen first.
+    pub fn clients(&self) -> Result<Vec<ClientRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT ip, mac, hostname, label, first_seen, last_seen
+               FROM clients ORDER BY last_seen DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ClientRow {
+                ip: row.get(0)?,
+                mac: row.get(1)?,
+                hostname: row.get(2)?,
+                label: row.get(3)?,
+                first_seen: parse_ts(row.get::<_, String>(4)?),
+                last_seen: parse_ts(row.get::<_, String>(5)?),
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Traffic, disconnections and connected time per client over a window.
+    ///
+    /// One query for the bytes and one for the sessions, rather than one per
+    /// client: the dashboard refreshes this every couple of seconds, and a
+    /// query per row would turn a twenty-host LAN into forty round trips.
+    pub fn client_rollup(
+        &self,
+        hours: u32,
+        now: DateTime<Utc>,
+    ) -> Result<HashMap<String, ClientRollup>> {
+        let cutoff = now - chrono::Duration::hours(hours.max(1) as i64);
+        let cutoff_s = cutoff.to_rfc3339();
+        let mut out: HashMap<String, ClientRollup> = HashMap::new();
+
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT ip, COALESCE(SUM(rx_bytes),0), COALESCE(SUM(tx_bytes),0)
+               FROM client_samples WHERE ts >= ?1 GROUP BY ip",
+        )?;
+        let mut rows = stmt.query(params![cutoff_s])?;
+        while let Some(row) = rows.next()? {
+            let e = out.entry(row.get::<_, String>(0)?).or_default();
+            e.rx_bytes = row.get(1)?;
+            e.tx_bytes = row.get(2)?;
+        }
+        drop(rows);
+        drop(stmt);
+
+        // Sessions that touch the window at all: still open, or ended inside
+        // it. Overlap is computed here rather than in SQL because clamping
+        // two timestamps to a window is far clearer in Rust than in
+        // julianday arithmetic.
+        let mut stmt = conn.prepare(
+            "SELECT ip, started_at, ended_at
+               FROM client_sessions
+              WHERE ended_at IS NULL OR ended_at >= ?1",
+        )?;
+        let mut rows = stmt.query(params![cutoff_s])?;
+        while let Some(row) = rows.next()? {
+            let ip: String = row.get(0)?;
+            let started = parse_ts(row.get::<_, String>(1)?);
+            let ended: Option<String> = row.get(2)?;
+            let ended = ended.map(parse_ts);
+            let e = out.entry(ip).or_default();
+            let from = started.max(cutoff);
+            let to = ended.unwrap_or(now).min(now);
+            if to > from {
+                e.online_secs += (to - from).num_seconds();
+            }
+            if ended.is_some() {
+                e.disconnects += 1;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Traffic buckets for one client, oldest first — the detail chart.
+    pub fn client_samples(
+        &self,
+        ip: &str,
+        hours: u32,
+        limit: u32,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<ClientSamplePoint>> {
+        let cutoff = now - chrono::Duration::hours(hours.max(1) as i64);
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT ts, interval_s, rx_bytes, tx_bytes
+               FROM client_samples
+              WHERE ip = ?1 AND ts >= ?2
+              ORDER BY id DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![ip, cutoff.to_rfc3339(), limit.min(5_000)], |row| {
+            Ok(ClientSamplePoint {
+                ts: parse_ts(row.get::<_, String>(0)?),
+                interval_s: row.get(1)?,
+                rx_bytes: row.get::<_, i64>(2)? as u64,
+                tx_bytes: row.get::<_, i64>(3)? as u64,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        out.reverse();
+        Ok(out)
+    }
+
+    /// Recent presence sessions for one client, newest first.
+    pub fn client_sessions(&self, ip: &str, limit: u32) -> Result<Vec<ClientSessionRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, ip, started_at, ended_at, rx_bytes, tx_bytes
+               FROM client_sessions WHERE ip = ?1
+              ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![ip, limit.min(1_000)], map_session)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Drop client history older than the retention window.
+    ///
+    /// Sessions and samples go; the roster row stays, so a machine that
+    /// reappears after a holiday is still recognised rather than looking new.
+    pub fn prune_clients(&self, retention_hours: u32) -> Result<usize> {
+        if retention_hours == 0 {
+            return Ok(0);
+        }
+        let cutoff = (Utc::now() - chrono::Duration::hours(retention_hours as i64)).to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        let mut n = conn.execute(
+            "DELETE FROM client_samples WHERE ts < ?1",
+            params![cutoff.clone()],
+        )?;
+        n += conn.execute(
+            "DELETE FROM client_sessions WHERE ended_at IS NOT NULL AND ended_at < ?1",
+            params![cutoff],
+        )?;
+        Ok(n)
     }
 
     pub fn record_traffic(
@@ -632,12 +951,12 @@ impl Stats {
             let _ = writeln!(
                 s,
                 "mem   avg {avg_mem_pct:>6.2}%  max {max_mem_pct:>6.2}%  (total {})",
-                fmt_bytes_inline(mem_total as u64),
+                crate::format::bytes(mem_total as u64),
             );
             let _ = writeln!(
                 s,
                 "load  avg {avg_load:>6.2}   max {max_load:>6.2}   swap_peak {}",
-                fmt_bytes_inline(max_swap as u64),
+                crate::format::bytes(max_swap as u64),
             );
         } else {
             let _ = writeln!(s, "(no system samples in window)");
@@ -673,19 +992,26 @@ impl Stats {
     }
 }
 
-fn fmt_bytes_inline(n: u64) -> String {
-    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
-    let mut v = n as f64;
-    let mut u = 0usize;
-    while v >= 1024.0 && u < UNITS.len() - 1 {
-        v /= 1024.0;
-        u += 1;
-    }
-    if u == 0 {
-        format!("{n} {}", UNITS[u])
-    } else {
-        format!("{v:.2} {}", UNITS[u])
-    }
+/// Timestamps are stored as RFC 3339 text. A row that somehow holds
+/// something else is not worth failing a whole query over — the alternative
+/// is a dashboard that goes blank because of one bad row — so it reads as
+/// "now" and the caller sees a point out of place rather than an error.
+fn parse_ts(raw: String) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(&raw)
+        .map(|t| t.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now())
+}
+
+fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClientSessionRow> {
+    let ended: Option<String> = row.get(3)?;
+    Ok(ClientSessionRow {
+        id: row.get(0)?,
+        ip: row.get(1)?,
+        started_at: parse_ts(row.get::<_, String>(2)?),
+        ended_at: ended.map(parse_ts),
+        rx_bytes: row.get(4)?,
+        tx_bytes: row.get(5)?,
+    })
 }
 
 const SCHEMA: &str = r#"
@@ -761,6 +1087,45 @@ CREATE TABLE IF NOT EXISTS system_samples (
 );
 CREATE INDEX IF NOT EXISTS idx_system_ts ON system_samples(ts);
 
+-- ── LAN clients ───────────────────────────────────────────────────────
+-- The roster: every host ever seen behind this gateway.
+CREATE TABLE IF NOT EXISTS clients (
+    ip         TEXT PRIMARY KEY,
+    mac        TEXT,
+    hostname   TEXT,          -- discovered (DHCP lease, /etc/hosts, PTR)
+    label      TEXT,          -- assigned by the operator in the config
+    first_seen TEXT NOT NULL,
+    last_seen  TEXT NOT NULL
+);
+
+-- Presence: one row per continuous connection, so a gap between rows is
+-- exactly a disconnection and needs no inference.
+CREATE TABLE IF NOT EXISTS client_sessions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ip         TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    ended_at   TEXT,          -- NULL while the client is still connected
+    rx_bytes   INTEGER NOT NULL DEFAULT 0,
+    tx_bytes   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_client_sessions_ip  ON client_sessions(ip, started_at);
+CREATE INDEX IF NOT EXISTS idx_client_sessions_end ON client_sessions(ended_at);
+
+-- Volume: accumulated traffic buckets. Only non-empty buckets are written,
+-- so an idle client costs nothing to keep.
+CREATE TABLE IF NOT EXISTS client_samples (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         TEXT NOT NULL,
+    ip         TEXT NOT NULL,
+    interval_s REAL NOT NULL,
+    rx_bytes   INTEGER NOT NULL,
+    rx_packets INTEGER NOT NULL,
+    tx_bytes   INTEGER NOT NULL,
+    tx_packets INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_client_samples_ip_ts ON client_samples(ip, ts);
+CREATE INDEX IF NOT EXISTS idx_client_samples_ts    ON client_samples(ts);
+
 -- Durable odds and ends that must survive a restart (the operator pin).
 CREATE TABLE IF NOT EXISTS kv (
     key        TEXT PRIMARY KEY,
@@ -786,6 +1151,15 @@ mod tests {
     use super::*;
     use crate::config::{Provider, ProviderRole};
     use std::net::Ipv4Addr;
+
+    fn counters(rx: u64, rxp: u64, tx: u64, txp: u64) -> ClientCounters {
+        ClientCounters {
+            rx_bytes: rx,
+            rx_packets: rxp,
+            tx_bytes: tx,
+            tx_packets: txp,
+        }
+    }
 
     fn mk_providers() -> Vec<Provider> {
         vec![Provider {
@@ -956,6 +1330,124 @@ mod tests {
             // Deleting a missing key is not an error.
             stats.del_kv("forced_provider").unwrap();
         }
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp.with_extension("db-wal"));
+        let _ = std::fs::remove_file(tmp.with_extension("db-shm"));
+    }
+
+    /// The client tables answer three separate questions and must keep doing
+    /// so: who is known, when were they connected, and how much did they
+    /// move. This walks one client through a connection, a drop and a
+    /// reconnection, and checks the rollup an operator reads off the
+    /// dashboard.
+    #[test]
+    fn client_roster_sessions_and_rollup() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vlb-clients-{}-{}.db",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let stats = Stats::open(&tmp, &mk_providers()).unwrap();
+        let now = Utc::now();
+        let ago = |m: i64| now - chrono::Duration::minutes(m);
+
+        // First connection: 60 min ago, dropped 40 min ago.
+        stats
+            .upsert_client("10.0.0.50", Some("aa:bb:cc:dd:ee:ff"), None, None, ago(60))
+            .unwrap();
+        let s1 = stats.open_client_session("10.0.0.50", ago(60)).unwrap();
+        stats.add_session_bytes(s1, 1_000, 200).unwrap();
+        stats
+            .record_client_sample("10.0.0.50", ago(50), 60.0, &counters(1_000, 10, 200, 5))
+            .unwrap();
+        stats.close_client_session(s1, ago(40)).unwrap();
+
+        // A hostname turns up later; the MAC is not re-sent. Neither fact
+        // may erase the other.
+        stats
+            .upsert_client("10.0.0.50", None, Some("denis-pc"), None, ago(20))
+            .unwrap();
+        let s2 = stats.open_client_session("10.0.0.50", ago(20)).unwrap();
+        stats.add_session_bytes(s2, 3_000, 400).unwrap();
+        stats
+            .record_client_sample("10.0.0.50", ago(10), 60.0, &counters(3_000, 30, 400, 8))
+            .unwrap();
+
+        let roster = stats.clients().unwrap();
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0].hostname.as_deref(), Some("denis-pc"));
+        assert_eq!(roster[0].mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
+        assert!(roster[0].first_seen < roster[0].last_seen);
+
+        let roll = stats.client_rollup(24, now).unwrap();
+        let c = &roll["10.0.0.50"];
+        assert_eq!(c.rx_bytes, 4_000);
+        assert_eq!(c.tx_bytes, 600);
+        assert_eq!(c.disconnects, 1, "one session ended inside the window");
+        // 20 minutes of the first session plus 20 of the open one.
+        assert!(
+            (c.online_secs - 40 * 60).abs() < 90,
+            "online_secs = {}",
+            c.online_secs
+        );
+
+        // A one-hour window still sees both sessions; the still-open one is
+        // measured to `now`.
+        let sessions = stats.client_sessions("10.0.0.50", 10).unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions[0].ended_at.is_none(), "newest first, still open");
+        assert!(sessions[0].duration_secs(now) >= 20 * 60 - 2);
+        assert_eq!(sessions[1].duration_secs(now), 20 * 60);
+
+        // Restart continuity: the open session is handed back, not lost.
+        let open = stats.open_client_sessions().unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].id, s2);
+
+        let samples = stats.client_samples("10.0.0.50", 24, 100, now).unwrap();
+        assert_eq!(samples.len(), 2);
+        assert!(samples[0].ts < samples[1].ts, "oldest first for charting");
+
+        // Retention drops history but keeps the roster: a machine that
+        // reappears after a holiday is not a stranger.
+        //
+        // Something genuinely old to prune, alongside the recent rows that
+        // must survive it.
+        stats
+            .record_client_sample("10.0.0.50", ago(600), 60.0, &counters(9, 1, 9, 1))
+            .unwrap();
+        let old = stats.open_client_session("10.0.0.50", ago(700)).unwrap();
+        stats.close_client_session(old, ago(600)).unwrap();
+
+        assert_eq!(
+            stats.prune_clients(0).unwrap(),
+            0,
+            "0 means keep everything"
+        );
+        let removed = stats.prune_clients(1).unwrap();
+        assert_eq!(
+            removed, 2,
+            "the ten-hour-old sample and session, and only those"
+        );
+        assert_eq!(
+            stats
+                .client_samples("10.0.0.50", 24, 100, now)
+                .unwrap()
+                .len(),
+            2,
+            "rows inside the retention window stay"
+        );
+        assert_eq!(
+            stats.client_sessions("10.0.0.50", 10).unwrap().len(),
+            2,
+            "and so do their sessions"
+        );
+        // An open session is never pruned, however long it has been running.
+        assert_eq!(stats.open_client_sessions().unwrap().len(), 1);
+        // The roster itself is untouched.
+        assert_eq!(stats.clients().unwrap().len(), 1);
+
+        drop(stats);
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(tmp.with_extension("db-wal"));
         let _ = std::fs::remove_file(tmp.with_extension("db-shm"));
