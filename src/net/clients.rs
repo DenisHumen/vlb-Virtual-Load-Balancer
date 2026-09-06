@@ -80,6 +80,14 @@ const PRESENCE_PROBE_EVERY: Duration = Duration::from_secs(30);
 /// a sampling tick into a burst of a hundred pings.
 const MAX_PROBES_PER_TICK: usize = 8;
 
+/// How many newly-discovered clients get their accounting rules per tick.
+///
+/// Each one is two `iptables` invocations, each taking the xtables lock. A
+/// gateway that meets its whole LAN at once — the first tick after a start —
+/// would otherwise spend seconds in that loop, and everything asking the
+/// daemon a question during it waits.
+const MAX_NEW_RULES_PER_TICK: usize = 8;
+
 /// Cumulative counters for one client, as the kernel reports them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ClientCounters {
@@ -163,6 +171,12 @@ pub struct ClientMonitor {
     /// Clients that currently have rules installed.
     tracked: HashSet<Ipv4Addr>,
     chain_ready: bool,
+    /// Whether the counter read at startup actually worked. When it did,
+    /// `tracked` is a complete picture of which rules exist and the
+    /// existence check before adding one can be skipped — halving the
+    /// iptables invocations. When it did not, that check is the only thing
+    /// standing between us and a duplicate rule counting everything twice.
+    counters_known: bool,
     /// When each stale neighbour was last nudged.
     last_probe: HashMap<Ipv4Addr, Instant>,
     /// Said once rather than every tick.
@@ -220,6 +234,7 @@ impl ClientMonitor {
             prev: HashMap::new(),
             tracked: HashSet::new(),
             chain_ready: false,
+            counters_known: false,
             last_probe: HashMap::new(),
             warned_capacity: false,
             warned_unavailable: false,
@@ -242,13 +257,21 @@ impl ClientMonitor {
             self.ensure_chain().await?;
             self.chain_ready = true;
             // Adopt whatever the previous run left behind.
-            self.prev = self.read_counters().await.unwrap_or_default();
-            self.tracked = self.prev.keys().copied().collect();
-            if !self.tracked.is_empty() {
-                debug!(
-                    clients = self.tracked.len(),
-                    "adopted existing per-client accounting rules"
-                );
+            match self.read_counters().await {
+                Ok(counters) => {
+                    self.tracked = counters.keys().copied().collect();
+                    self.prev = counters;
+                    self.counters_known = true;
+                    if !self.tracked.is_empty() {
+                        debug!(
+                            clients = self.tracked.len(),
+                            "adopted existing per-client accounting rules"
+                        );
+                    }
+                }
+                Err(e) => {
+                    debug!(error = %e, "could not read existing accounting rules");
+                }
             }
         }
 
@@ -258,10 +281,24 @@ impl ClientMonitor {
         let candidates: Vec<&Neighbour> =
             neighbours.iter().filter(|n| params.accepts(n.ip)).collect();
 
-        // Install rules for anything new, within the cap.
+        // Install rules for anything new, within the cap — and only a few
+        // per tick. Discovering a whole LAN at once is a burst of serial
+        // iptables invocations, each of which takes the xtables lock; on a
+        // modest box that burst is long enough to make the daemon look
+        // unresponsive to anything asking it a question at the time.
+        // Spreading it over a few seconds costs a host nothing and keeps
+        // the control socket answering.
+        let mut installed_this_tick = 0usize;
         for n in &candidates {
             if self.tracked.contains(&n.ip) {
                 continue;
+            }
+            if installed_this_tick >= MAX_NEW_RULES_PER_TICK {
+                debug!(
+                    "more new clients than one tick installs rules for; the rest follow \
+                     on the next tick"
+                );
+                break;
             }
             if self.tracked.len() >= params.max_tracked {
                 if !self.warned_capacity {
@@ -280,6 +317,7 @@ impl ClientMonitor {
                 continue;
             }
             self.tracked.insert(n.ip);
+            installed_this_tick += 1;
         }
 
         let counters = self.read_counters().await?;
@@ -405,7 +443,13 @@ impl ClientMonitor {
                 "--comment",
                 &comment,
             ];
-            if run_ok("iptables", &args).await.unwrap_or(false) {
+            // Skip the existence check when the startup read told us exactly
+            // which rules are there: this runs once per client per direction,
+            // and on a LAN of any size the saved invocations are the
+            // difference between a brief pause and a visible stall. Without
+            // that knowledge the check stays — adding a rule that already
+            // exists would count every packet twice.
+            if !self.counters_known && run_ok("iptables", &args).await.unwrap_or(false) {
                 continue;
             }
             let mut add = args;
