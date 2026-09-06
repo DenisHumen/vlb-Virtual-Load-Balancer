@@ -76,23 +76,58 @@ const WINDOWS: [(u32, &str); 4] = [(1, "1h"), (24, "24h"), (168, "7d"), (720, "3
 
 pub async fn run(config: Config, config_path: PathBuf) -> Result<()> {
     let listen = config.control.listen.clone();
-    let initial = match control::send(&listen, &Request::Status).await {
-        Ok(Response::Status { snapshot }) => snapshot,
-        Ok(Response::Error { error }) => {
-            return Err(anyhow::anyhow!("control error: {error}"));
-        }
-        Ok(_) => return Err(anyhow::anyhow!("unexpected response to status")),
-        Err(e) => {
-            return Err(e).context(format!(
-                "could not connect to vlb at {listen} — is it running?"
-            ));
-        }
-    };
+    let initial = first_snapshot(&listen).await?;
 
     let mut terminal = setup_terminal()?;
     let result = run_app(&mut terminal, config, config_path, initial).await;
     restore_terminal(&mut terminal)?;
     result
+}
+
+/// Fetch the first snapshot, giving the daemon a moment if it is busy.
+///
+/// A daemon that has just started is doing a burst of work — bringing up
+/// policy routing, meeting every host on the LAN — and a single attempt that
+/// lands inside that window fails for a reason that is nobody's problem.
+/// So retry, and separate the two outcomes that mean genuinely different
+/// things: nothing listening (it is not running) versus listening but slow
+/// to answer (it is running and busy). Reporting the second as the first is
+/// what sends an operator looking in the wrong place.
+async fn first_snapshot(listen: &str) -> Result<ControlSnapshot> {
+    const ATTEMPTS: usize = 4;
+    let mut last = String::new();
+
+    for attempt in 1..=ATTEMPTS {
+        match control::send(listen, &Request::Status).await {
+            Ok(Response::Status { snapshot }) => return Ok(snapshot),
+            Ok(Response::Error { error }) => {
+                anyhow::bail!("the daemon at {listen} refused the request: {error}")
+            }
+            Ok(other) => anyhow::bail!("unexpected response to status: {other:?}"),
+            Err(e) => {
+                last = format!("{e}");
+                if last.contains("refused") {
+                    anyhow::bail!(
+                        "nothing is listening on {listen} — the daemon is not running.\n\
+                         Start it with:  sudo bash scripts/vlb.sh start"
+                    );
+                }
+                if attempt < ATTEMPTS {
+                    eprintln!(
+                        "vlb has not answered yet ({attempt}/{ATTEMPTS}) — it may still be \
+                         starting up; retrying…"
+                    );
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "vlb is listening on {listen} but did not answer after {ATTEMPTS} attempts \
+         ({last}).\nIt is running, so look at what it is doing:\n    \
+         sudo journalctl -u vlb -n 50\n    sudo tail -50 /var/log/vlb.log"
+    )
 }
 
 /// Modal state for the self-update flow. The dashboard keeps running
