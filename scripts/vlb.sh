@@ -8,6 +8,7 @@
 #   scripts/vlb.sh <command> [args...]
 #
 # Commands:
+#   install            Guided setup, and a menu for a gateway already running
 #   (no args)          Alias of `up`: build (if needed) + start daemon + show status
 #   up                 Same as above — the one-shot "just start it" entry point
 #   build              Release build (cargo build --release)
@@ -53,7 +54,19 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_DIR=$(cd -- "${SCRIPT_DIR}/.." && pwd)
 cd "${REPO_DIR}"
 
-VLB_CONFIG=${VLB_CONFIG:-"${REPO_DIR}/examples/vlb.example.toml"}
+# The installed config wins over the shipped example when it exists.
+#
+# The example is tracked by git: running a gateway straight out of it means
+# the next `git pull` either refuses to update or quietly rewrites the live
+# configuration. /etc/vlb/vlb.toml is where a real deployment keeps it, and
+# picking it up automatically is what makes `git pull` safe again.
+if [[ -z "${VLB_CONFIG:-}" ]]; then
+    if [[ -r /etc/vlb/vlb.toml ]]; then
+        VLB_CONFIG=/etc/vlb/vlb.toml
+    else
+        VLB_CONFIG="${REPO_DIR}/examples/vlb.example.toml"
+    fi
+fi
 VLB_BIN=${VLB_BIN:-"${REPO_DIR}/target/release/vlb"}
 VLB_SERVICE=${VLB_SERVICE:-vlb}
 
@@ -314,11 +327,23 @@ cmd_install_service() {
     require_bin
     install -m 0755 -D "$VLB_BIN" /usr/local/bin/vlb
     install -m 0644 -D "$unit_src" /etc/systemd/system/vlb.service
-    install -m 0644 -D "$VLB_CONFIG" /etc/vlb/vlb.toml
+    # Copying a file onto itself is an error, and it is the normal case once
+    # VLB_CONFIG already points at the installed configuration.
+    if [[ "$(readlink -f "$VLB_CONFIG" 2>/dev/null)" != "$(readlink -f /etc/vlb/vlb.toml 2>/dev/null)" ]]; then
+        install -m 0644 -D "$VLB_CONFIG" /etc/vlb/vlb.toml
+    fi
     systemctl daemon-reload
     systemctl enable --now vlb.service
     ok "service installed, enabled and started"
     systemctl --no-pager status vlb.service || true
+}
+
+# The guided setup lives in its own script: it is a wizard and a menu, not a
+# launcher, and keeping it separate keeps this file readable.
+cmd_install() {
+    local setup="${SCRIPT_DIR}/vlb-setup.sh"
+    [[ -f "$setup" ]] || die "missing $setup"
+    exec bash "$setup" "$@"
 }
 
 cmd_uninstall_service() {
@@ -422,6 +447,7 @@ main() {
         update)             cmd_update "$@" ;;
         test)               cmd_test "$@" ;;
         logs)               cmd_logs ;;
+        install)            cmd_install "$@" ;;
         install-service)    cmd_install_service ;;
         uninstall-service)  cmd_uninstall_service ;;
         -h|--help|help)     cmd_help ;;
