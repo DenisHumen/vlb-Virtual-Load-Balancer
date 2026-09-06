@@ -237,8 +237,17 @@ cmd_start() {
     fi
     # Guard against a stale second daemon — systemd unit or a previous run
     # with a different pid file could still be holding the control port.
+    #
+    # `listen` is optional in the config; the daemon defaults to
+    # 127.0.0.1:7650 when it is absent. A grep that matches nothing exits 1,
+    # and under `set -euo pipefail` that used to abort this whole function —
+    # silently, with status 0: no daemon started, nothing printed, nothing to
+    # go on. Tolerate the miss and fall back to the same default the daemon
+    # uses, so the duplicate check still works.
     local listen port
-    listen=$(grep -E '^\s*listen\s*=' "$VLB_CONFIG" | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+    listen=$(grep -E '^[[:space:]]*listen[[:space:]]*=' "$VLB_CONFIG" 2>/dev/null \
+               | head -n1 | sed -E 's/.*"([^"]+)".*/\1/') || true
+    [[ -n "$listen" ]] || listen="127.0.0.1:7650"
     port=${listen##*:}
     if [[ -n "$port" ]] && command -v ss >/dev/null && ss -ltn "sport = :$port" 2>/dev/null | grep -q LISTEN; then
         warn "port $port already in use — another vlb instance (maybe systemd) is running"
