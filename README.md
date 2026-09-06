@@ -26,6 +26,17 @@ stats so you can actually see what's happening.
 > config keys can change between minor versions, and `vlb check` will tell
 > you when they do.
 
+<p align="center">
+  <img src="docs/assets/failover.svg" alt="The dashboard during a failover: the primary is caught serving a payment page, traffic moves to the second uplink, the primary recovers, and after its stability window the route comes back" width="100%" />
+</p>
+
+<p align="center"><sub>
+  A real failover, frame by frame: the primary is caught serving somebody
+  else's bytes, traffic moves to the next uplink, the primary recovers, and
+  the route returns only after it has proven itself. Every frame here is
+  rendered by the test suite from the same widgets the program draws with.
+</sub></p>
+
 ```mermaid
 flowchart LR
     subgraph LAN["your LAN"]
@@ -53,9 +64,28 @@ flowchart LR
     style P2 stroke-dasharray: 4 4
 ```
 
-`vlb` watches both uplinks continuously, moves the default route to a
-healthy one the moment the active one stops actually working — not merely
-stops answering pings — and tells you who on the LAN was affected.
+`vlb` watches every uplink continuously, moves the default route to a healthy
+one the moment the active one stops actually working — not merely stops
+answering pings — and tells you who on the LAN was affected.
+
+---
+
+## Get it running
+
+```bash
+git clone https://github.com/DenisHumen/vlb-Virtual-Load-Balancer.git
+cd vlb-Virtual-Load-Balancer
+sudo bash scripts/vlb.sh install
+```
+
+That last command is a guided setup: it installs what is missing, works out
+which interface faces your network, asks for each uplink's gateway address,
+writes the configuration, starts the service and waits until traffic is
+actually flowing through a verified uplink. Run it again later and it opens a
+menu instead — add an uplink, change one, restart, diagnose.
+[More on it below](#guided-setup-and-the-menu).
+
+Prefer a release binary and no build? [One command for that too](#install-or-update-on-a-server).
 
 ---
 
@@ -64,7 +94,7 @@ stops answering pings — and tells you who on the LAN was affected.
 | | |
 |---|---|
 | [Why](#why) · [What it does](#what-it-actually-does) | the pitch |
-| [Install / update](#install-or-update-on-a-server) · [Update from a checkout](#update-from-a-git-checkout) | getting it running |
+| [Guided setup](#guided-setup-and-the-menu) · [Install / update](#install-or-update-on-a-server) · [From a checkout](#update-from-a-git-checkout) | getting it running |
 | [Client statistics](#who-is-on-the-network--client-statistics) | who is using the link |
 | [Configuration](#configuration-reference) · [CLI](#cli) · [TUI](#tui-hotkeys) | day-to-day use |
 | [How it works](#how-it-works) · [Failure modes](#failure-modes-we-cover) | the design |
@@ -166,6 +196,10 @@ fast, and gives you a real dashboard.
 * **Hardened config validator** — rejects reserved tables (253/254/255),
   overlong interface names, fwmark of 0, timeouts >= interval, control
   ports listening on non-loopback, and a few dozen more footguns.
+* **A guided setup** that installs dependencies, finds the interface, asks
+  for each uplink and verifies the result — and, on a machine already
+  running, a menu for changing uplinks, restarting and diagnosing.
+  [See it](#guided-setup-and-the-menu).
 
 ---
 
@@ -232,6 +266,85 @@ curl -fsSL .../install.sh | sudo VLB_VERSION=v0.2.1 bash
 
 ---
 
+## Guided setup and the menu
+
+```bash
+sudo bash scripts/vlb.sh install
+```
+
+On a machine with no configuration it walks the whole way through:
+
+```text
+Dependencies
+────────────
+[ ok] ip, ping, iptables and conntrack are all present
+
+Which interface faces your LAN and the uplinks?
+───────────────────────────────────────────────
+  1) ens18      10.0.0.100/10
+The default route currently leaves through: ens18
+Interface [ens18]:
+
+Uplinks
+───────
+Add them best first. The first one you enter is the primary; the others are
+tried in the order you give them if it fails.
+
+Uplink 1
+  Name (no spaces) [isp-main]:
+  Gateway (the ISP router's address): 10.0.0.2
+[ ok]   10.0.0.2 answers ping
+  Interface it is reached on [ens18]:
+  Priority (lower wins) [0]:
+  Role (primary/backup) [primary]:
+
+Add a backup uplink? (strongly recommended — with one uplink there is
+nothing to fail over to) (y/n) [y]:
+```
+
+…and finishes by writing `/etc/vlb/vlb.toml`, installing the service, and
+waiting until it can say **`carrying traffic through isp-main, verified by
+its own checks`**.
+
+Three things it will not do, all learned the hard way:
+
+* **It never leaves a configuration the daemon would reject.** Every change is
+  written to a temporary file, validated with the real binary, and only then
+  moved over the live one — with the previous version kept beside it. A
+  gateway whose config is rejected does not come back.
+* **It never leaves root-owned files in your checkout.** Building under `sudo`
+  makes `target/` unwritable for your ordinary user afterwards; the build is
+  handed back to whoever owns the source tree, and an already-root-owned
+  `target/` is given back too.
+* **It never answers its own questions.** Reached through a pipe, or run with
+  nothing on standard input, it stops and says so rather than accepting every
+  default in turn and configuring a gateway nobody asked for.
+
+Run it again on a configured machine and it opens a menu:
+
+```text
+  config   /etc/vlb/vlb.toml
+  daemon   running (systemd)
+  active   isp-main
+
+  1) Status
+  2) Dashboard (TUI)
+  3) Who is connected (clients)
+  4) Uplinks — add, change, remove
+  5) Restart
+  6) Diagnose a problem
+  7) Update from git
+  0) Quit
+```
+
+Adding an uplink asks the same four questions and checks the answer before
+accepting it — an address that is not directly connected cannot be a next
+hop, and it says so at the moment you type it rather than leaving you to
+find out from the daemon later. **Diagnose** runs the timed per-layer probe,
+prints the kernel's own routes and policy rules, and tails the log.
+
+---
+
 ## Update from a git checkout
 
 If you run `vlb` straight out of a clone rather than from a release, the
@@ -254,8 +367,16 @@ the new process adopts the default route the old one left in the kernel.
 ```bash
 sudo bash scripts/vlb.sh status     # what is running now
 sudo bash scripts/vlb.sh tui        # dashboard (rebuilds + restarts if needed)
+sudo bash scripts/vlb.sh clients    # who is on the network
+sudo bash scripts/vlb.sh install    # the setup menu: uplinks, restart, diagnose
 VLB_NO_RESTART=1 bash scripts/vlb.sh build   # rebuild, leave the daemon alone
 ```
+
+`scripts/vlb.sh` uses `/etc/vlb/vlb.toml` whenever that file exists, and falls
+back to the bundled example only when it does not. Keeping the live
+configuration out of the tracked example file is what makes `git pull` safe:
+edit the example and the next pull either refuses to update or overwrites your
+gateway's settings.
 
 The dashboard says so plainly if it is newer than the daemon it is talking
 to, rather than showing an empty screen.
@@ -265,7 +386,21 @@ to, rather than showing an empty screen.
 ## Who is on the network — client statistics
 
 Press <kbd>c</kbd> in the dashboard, or run `vlb clients`. Every host behind
-the gateway, connected first:
+the gateway, connected first — and <kbd>Enter</kbd> opens one of them:
+
+<p align="center">
+  <img src="docs/assets/clients.svg" alt="The client list, then one client's detail: its connections, the gaps between them, and its average and peak rates" width="100%" />
+  <br />
+  <sub>Still frames, easier to read closely:
+  <a href="docs/assets/tui-clients.svg">the list</a> ·
+  <a href="docs/assets/tui-client-detail.svg">one client</a></sub>
+</p>
+
+The detail view is where "was it us or them" gets answered: every connection,
+how long each lasted, and **how long the host was away in between**.
+
+<details>
+<summary>The same two screens as text, if you prefer to copy from them</summary>
 
 ```text
 ┌ clients · window 24h ────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
@@ -278,14 +413,7 @@ the gateway, connected first:
 │●  —                192.168.8.12    —                 12.3 Mbit/s 1.7 Mbit/s  39.10 MiB  4.89 MiB   4h12m    0     now            │
 │·  iphone-anna      192.168.8.57    a4:5e:60:11:22:33 0.0 bit/s   0.0 bit/s   210.29 MiB 26.29 MiB  1h00m    5     37m00s ago     │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│↑/↓ select  Enter details  w window (24h)  r refresh  c/Esc back to providers  q quit                                             │
-└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
-
-<kbd>Enter</kbd> opens one host. This is where "was it us or them" gets
-answered: every connection, how long each lasted, and **how long the host
-was away in between**.
 
 ```text
 ┌ client 192.168.8.24 ───────────────────────────────────────────────────────────────────────────────────────────────────────────┐
@@ -296,13 +424,6 @@ was away in between**.
 │peak      ↓ 41.6 Mbit/s   ↑ 5.1 Mbit/s                                                                                          │
 │connected 4h12m of 24h  (62.5%)   drops 2   longest 4h36m   first seen 09-03 15:29                                              │
 └────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ traffic · 09-06 14:49 → 09-06 15:28 ───────────────────────────────────────────────────────────────────────────────────────────┐
-│3.7 Mbit/s│                                                                                                                     │
-│          │⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉│
-│1.6 Mbit/s│                                                                                                                     │
-│          │⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤│
-│0         │                                                                                                                     │
-└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ connections (newest first · "away before" is the gap) ─────────────────────────────────────────────────────────────────────────┐
 │started               ended                 duration    away before   ↓            ↑                                            │
 │2026-09-06 11:17:22   — still connected     4h12m       12m18s        2.89 GiB     181.20 MiB                                   │
@@ -310,8 +431,12 @@ was away in between**.
 └────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-> Both screenshots are rendered by the test suite from the real widgets, so
-> they cannot drift from what the program draws (`VLB_SHOTS=1 cargo test tui`).
+</details>
+
+> Every picture in this file is rendered by the test suite from the real
+> widgets (`VLB_SHOTS=1 cargo test --bin vlb tui::tests::render_readme_assets`),
+> so none of them can drift from what the program actually draws.
+
 
 ### The same thing from the shell
 
@@ -739,6 +864,22 @@ The knobs:
 
 ## CLI
 
+Everything below assumes the config is at `/etc/vlb/vlb.toml`, which is where
+the guided setup puts it and what `scripts/vlb.sh` picks up automatically.
+
+| I want to… | Command |
+|---|---|
+| Set it up, or change it | `sudo bash scripts/vlb.sh install` |
+| See what is happening | `sudo vlb tui` |
+| Check it from a script | `sudo vlb status` |
+| See who is on the network | `sudo vlb clients` |
+| See one host's history | `sudo vlb clients --ip 192.168.8.24` |
+| Find out why an uplink is down | `sudo vlb probe --provider isp-main` |
+| Pin one uplink by hand | `sudo vlb force isp-backup` … `sudo vlb auto` |
+| Restart without dropping traffic | `sudo systemctl restart vlb` |
+| Update | `sudo vlb update` — or `git pull && sudo bash scripts/vlb.sh restart` |
+| Read the logs | `sudo journalctl -u vlb -f` |
+
 ```
 vlb run    [--config <path>] [--dry-run]    # foreground daemon
 vlb check  [--config <path>]                # validate + summary
@@ -808,7 +949,9 @@ while it runs.
 
 ## TUI hotkeys
 
-![vlb TUI dashboard](docs/assets/tui.png)
+<p align="center">
+  <img src="docs/assets/tui-dashboard.svg" alt="The dashboard: gateway panel, host metrics, the provider table with per-layer health, recent switchovers, and the traffic chart" width="100%" />
+</p>
 
 | Key     | Action                                    |
 |---------|-------------------------------------------|
@@ -1120,6 +1263,13 @@ reclaimed within one `route_watchdog_secs` period.
 
 ## Troubleshooting
 
+**The dashboard says "vlb has not answered yet".**  
+Normal for a few seconds after a start: the daemon is bringing up policy
+routing and meeting every host on the LAN, and it answers when that settles.
+The dashboard retries by itself and then tells you which of the two things
+went wrong — nothing listening (it is not running) or listening but slow.
+If it says the second and never clears, look at `sudo journalctl -u vlb -n 50`.
+
 **`vlb status` says `"active_adopted": true` / the TUI says "adopted — verifying".**  
 Normal for a few seconds after a restart: the daemon took over the route it
 found in the kernel and is confirming that provider with its own probes
@@ -1213,11 +1363,14 @@ runs as root. If you're running by hand, prefix with `sudo`.
 │   ├── docker-compose.yml
 │   └── test/                 # hermetic two-ISP failover lab (see Testing)
 ├── docs/
-│   └── assets/               # logo, screenshots used by README
+│   └── assets/               # logo, plus the screens rendered from the real
+│                             #   widgets by tui::tests::render_readme_assets
 ├── examples/
 │   └── vlb.example.toml      # annotated reference config
 ├── scripts/
-│   ├── vlb.sh                # unified launcher (build / start / tui / logs / install-service / …)
+│   ├── install.sh            # one-command install/update from a release
+│   ├── vlb.sh                # launcher (build / start / tui / clients / install / …)
+│   ├── vlb-setup.sh          # the guided setup and the menu behind `vlb.sh install`
 │   └── vlb.ps1               # Windows helper (limited; Linux only feature set)
 ├── systemd/
 │   └── vlb.service

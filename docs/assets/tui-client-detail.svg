@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1056 442" width="1056" height="442" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="14">
+<rect width="100%" height="100%" rx="8" fill="#0d1117"/>
+<g class="f0">
+<text x="0.0" y="12.6" textLength="1056.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">┌ client 192.168.8.24 ─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐</text>
+<text x="0.0" y="29.6" textLength="8.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">│</text>
+<text x="8.0" y="29.6" textLength="64.0" lengthAdjust="spacingAndGlyphs" fill="#f0f6fc" font-weight="bold">denis-pc</text>
+<text x="72.0" y="29.6" textLength="120.0" lengthAdjust="spacingAndGlyphs" fill="#39c5cf">   192.168.8.24</text>
+<text x="192.0" y="29.6" textLength="160.0" lengthAdjust="spacingAndGlyphs" fill="#6e7681">   a4:5e:60:11:22:33</text>
+<text x="352.0" y="29.6" textLength="704.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">                                                                                       │</text>
+<text x="0.0" y="46.6" textLength="8.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">│</text>
+<text x="8.0" y="46.6" textLength="64.0" lengthAdjust="spacingAndGlyphs" fill="#3fb950" font-weight="bold">● online</text>
+<text x="72.0" y="46.6" textLength="168.0" lengthAdjust="spacingAndGlyphs" fill="#8b949e">  connected for 4h12m</text>
+<text x="240.0" y="46.6" textLength="816.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">                                                                                                     │</text>
+<text x="0.0" y="63.6" textLength="8.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">│</text>
+<text x="8.0" y="63.6" textLength="80.0" lengthAdjust="spacingAndGlyphs" fill="#8b949e">traffic   </text>
+<text x="88.0" y="63.6" textLength="80.0" lengthAdjust="spacingAndGlyphs" fill="#39c5cf">↓ 3.40 GiB</text>
+<text x="192.0" y="63.6" textLength="96.0" lengthAdjust="spacingAndGlyphs" fill="#bc8cff">↑ 435.20 MiB</text>
+<text x="288.0" y="63.6" textLength="160.0" lengthAdjust="spacingAndGlyphs" fill="#6e7681">   over the last 24h</text>
+<text x="448.0" y="63.6" textLength="608.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">                                                                           │</text>
+<text x="0.0" y="80.6" textLength="8.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">│</text>
+<text x="8.0" y="80.6" textLength="80.0" lengthAdjust="spacingAndGlyphs" fill="#8b949e">average   </text>
+<text x="88.0" y="80.6" textLength="96.0" lengthAdjust="spacingAndGlyphs" fill="#39c5cf">↓ 1.9 Mbit/s</text>
+<text x="208.0" y="80.6" textLength="112.0" lengthAdjust="spacingAndGlyphs" fill="#bc8cff">↑ 240.8 kbit/s</text>
+<text x="320.0" y="80.6" textLength="144.0" lengthAdjust="spacingAndGlyphs" fill="#6e7681">   while connected</text>
+<text x="464.0" y="80.6" textLength="592.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">                                                                         │</text>
+<text x="0.0" y="97.6" textLength="8.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">│</text>
+<text x="8.0" y="97.6" textLength="80.0" lengthAdjust="spacingAndGlyphs" fill="#8b949e">peak      </text>
+<text x="88.0" y="97.6" textLength="104.0" lengthAdjust="spacingAndGlyphs" fill="#39c5cf">↓ 41.6 Mbit/s</text>
+<text x="216.0" y="97.6" textLength="96.0" lengthAdjust="spacingAndGlyphs" fill="#bc8cff">↑ 5.1 Mbit/s</text>
+<text x="312.0" y="97.6" textLength="744.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">                                                                                            │</text>
+<text x="0.0" y="114.6" textLength="8.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">│</text>
+<text x="8.0" y="114.6" textLength="80.0" lengthAdjust="spacingAndGlyphs" fill="#8b949e">connected </text>
+<text x="88.0" y="114.6" textLength="192.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">4h12m of 24h  (62.5%)   </text>
+<text x="280.0" y="114.6" textLength="56.0" lengthAdjust="spacingAndGlyphs" fill="#d29922">drops 2</text>
+<text x="360.0" y="114.6" textLength="304.0" lengthAdjust="spacingAndGlyphs" fill="#6e7681">longest 4h36m   first seen 09-03 18:08</text>
+<text x="664.0" y="114.6" textLength="392.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">                                                │</text>
+<text x="0.0" y="131.6" textLength="1056.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘</text>
+<text x="0.0" y="148.6" textLength="1056.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">┌ traffic · 09-06 17:28 → 09-06 18:07 ─────────────────────────────────────────────────────────────────────────────────────────────┐</text>
+<text x="0.0" y="165.6" textLength="88.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">│3.7 Mbit/s</text>
+<text x="88.0" y="165.6" textLength="8.0" lengthAdjust="spacingAndGlyphs" fill="#6e7681">│</text>
+<text x="96.0" y="165.6" textLength="960.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">                                                                                                                       │</text>
+<text x="0.0" y="182.6" textLength="88.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">│          </text>
+<text x="88.0" y="182.6" textLength="8.0" lengthAdjust="spacingAndGlyphs" fill="#6e7681">│</text>
+<text x="96.0" y="182.6" textLength="952.0" lengthAdjust="spacingAndGlyphs" fill="#39c5cf">⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉</text>
+<text x="1048.0" y="182.6" textLength="8.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">│</text>
+<text x="0.0" y="199.6" textLength="88.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">│          </text>
+<text x="88.0" y="199.6" textLength="8.0" lengthAdjust="spacingAndGlyphs" fill="#6e7681">│</text>
+<text x="96.0" y="199.6" textLength="960.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">                                                                                                                       │</text>
+<text x="0.0" y="216.6" textLength="88.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">│          </text>
+<text x="88.0" y="216.6" textLength="8.0" lengthAdjust="spacingAndGlyphs" fill="#6e7681">│</text>
+<text x="96.0" y="216.6" textLength="960.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">                                                                                                                       │</text>
+<text x="0.0" y="233.6" textLength="88.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">│1.6 Mbit/s</text>
+<text x="88.0" y="233.6" textLength="8.0" lengthAdjust="spacingAndGlyphs" fill="#6e7681">│</text>
+<text x="96.0" y="233.6" textLength="960.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">                                                                                                                       │</text>
+<text x="0.0" y="250.6" textLength="88.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">│          </text>
+<text x="88.0" y="250.6" textLength="8.0" lengthAdjust="spacingAndGlyphs" fill="#6e7681">│</text>
+<text x="96.0" y="250.6" textLength="960.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">                                                                                                                       │</text>
+<text x="0.0" y="267.6" textLength="88.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">│          </text>
+<text x="88.0" y="267.6" textLength="8.0" lengthAdjust="spacingAndGlyphs" fill="#6e7681">│</text>
+<text x="96.0" y="267.6" textLength="952.0" lengthAdjust="spacingAndGlyphs" fill="#bc8cff">⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤</text>
+<text x="1048.0" y="267.6" textLength="8.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">│</text>
+<text x="0.0" y="284.6" textLength="88.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">│0         </text>
+<text x="88.0" y="284.6" textLength="8.0" lengthAdjust="spacingAndGlyphs" fill="#6e7681">│</text>
+<text x="96.0" y="284.6" textLength="960.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">                                                                                                                       │</text>
+<text x="0.0" y="301.6" textLength="1056.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘</text>
+<text x="0.0" y="318.6" textLength="1056.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">┌ connections (newest first · "away before" is the gap) ───────────────────────────────────────────────────────────────────────────┐</text>
+<text x="0.0" y="335.6" textLength="8.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">│</text>
+<text x="8.0" y="335.6" textLength="1040.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9" font-weight="bold">started               ended                 duration    away before   ↓            ↑                                              </text>
+<text x="1048.0" y="335.6" textLength="8.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">│</text>
+<text x="0.0" y="352.6" textLength="184.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">│2026-09-06 13:56:20   </text>
+<text x="184.0" y="352.6" textLength="168.0" lengthAdjust="spacingAndGlyphs" fill="#3fb950">— still connected    </text>
+<text x="352.0" y="352.6" textLength="104.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9"> 4h12m       </text>
+<text x="456.0" y="352.6" textLength="104.0" lengthAdjust="spacingAndGlyphs" fill="#d29922">12m18s       </text>
+<text x="568.0" y="352.6" textLength="96.0" lengthAdjust="spacingAndGlyphs" fill="#39c5cf">2.89 GiB    </text>
+<text x="672.0" y="352.6" textLength="376.0" lengthAdjust="spacingAndGlyphs" fill="#bc8cff">181.20 MiB                                     </text>
+<text x="1048.0" y="352.6" textLength="8.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">│</text>
+<text x="0.0" y="369.6" textLength="456.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">│2026-09-06 09:08:20   2026-09-06 13:44:20   4h36m       </text>
+<text x="456.0" y="369.6" textLength="104.0" lengthAdjust="spacingAndGlyphs" fill="#d29922">2m00s        </text>
+<text x="568.0" y="369.6" textLength="96.0" lengthAdjust="spacingAndGlyphs" fill="#39c5cf">457.76 MiB  </text>
+<text x="672.0" y="369.6" textLength="376.0" lengthAdjust="spacingAndGlyphs" fill="#bc8cff">17.17 MiB                                      </text>
+<text x="1048.0" y="369.6" textLength="8.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">│</text>
+<text x="0.0" y="386.6" textLength="1056.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘</text>
+<text x="0.0" y="403.6" textLength="1056.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐</text>
+<text x="0.0" y="420.6" textLength="8.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">│</text>
+<text x="8.0" y="420.6" textLength="24.0" lengthAdjust="spacingAndGlyphs" fill="#d29922">↑/↓</text>
+<text x="32.0" y="420.6" textLength="96.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9"> next host  </text>
+<text x="128.0" y="420.6" textLength="24.0" lengthAdjust="spacingAndGlyphs" fill="#d29922">Esc</text>
+<text x="152.0" y="420.6" textLength="152.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9"> back to the list  </text>
+<text x="304.0" y="420.6" textLength="8.0" lengthAdjust="spacingAndGlyphs" fill="#d29922">w</text>
+<text x="312.0" y="420.6" textLength="120.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9"> window (24h)  </text>
+<text x="432.0" y="420.6" textLength="8.0" lengthAdjust="spacingAndGlyphs" fill="#d29922">r</text>
+<text x="440.0" y="420.6" textLength="80.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9"> refresh  </text>
+<text x="520.0" y="420.6" textLength="8.0" lengthAdjust="spacingAndGlyphs" fill="#d29922">q</text>
+<text x="528.0" y="420.6" textLength="528.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9"> quit                                                            │</text>
+<text x="0.0" y="437.6" textLength="1056.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘</text>
+</g>
+</svg>

@@ -2065,7 +2065,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::balancer::{ClientSessionInfo, ClientTrafficPoint};
+    use crate::balancer::{ClientSessionInfo, ClientTrafficPoint, FailbackPending};
     use chrono::{Duration as ChronoDuration, Utc};
     use ratatui::backend::TestBackend;
 
@@ -2100,6 +2100,205 @@ mod tests {
             println!("\n=== {which:?} {w}x{h} ===\n{out}");
         }
         out
+    }
+
+    // ── documentation assets ───────────────────────────────────────────
+    //
+    // The pictures in the README are rendered here, from the same widgets
+    // the program draws with. A hand-drawn mock-up of a terminal is a
+    // promise nobody checks; this one cannot drift, because it *is* the
+    // output. `VLB_SHOTS=1 cargo test --bin vlb tui::` writes them.
+
+    /// Character cell size, in the SVG's coordinate space.
+    const CW: f64 = 8.0;
+    const CH: f64 = 17.0;
+
+    /// The colours a terminal would use. `default` is what an unset colour
+    /// becomes, which differs by role and again when a cell is reversed —
+    /// gauges and selected rows are drawn that way, and ignoring it turns
+    /// every progress bar into a grey slab.
+    fn svg_colour(c: Color, default: &'static str) -> &'static str {
+        match c {
+            Color::Reset => default,
+            Color::Black => "#161b22",
+            Color::Red | Color::LightRed => "#ff7b72",
+            Color::Green | Color::LightGreen => "#3fb950",
+            Color::Yellow | Color::LightYellow => "#d29922",
+            Color::Blue | Color::LightBlue => "#58a6ff",
+            Color::Magenta | Color::LightMagenta => "#bc8cff",
+            Color::Cyan | Color::LightCyan => "#39c5cf",
+            Color::Gray => "#8b949e",
+            Color::DarkGray => "#6e7681",
+            Color::White => "#f0f6fc",
+            _ => "#c9d1d9",
+        }
+    }
+
+    fn xml_escape(s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    }
+
+    /// Render one screen and return it as an SVG group.
+    ///
+    /// Runs of identically-styled cells become one `<text>` with an explicit
+    /// `textLength`, so the columns line up whatever monospace font the
+    /// reader's browser happens to pick.
+    fn svg_group(app: &App, w: u16, h: u16, which: View, class: &str) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal
+            .draw(|f| match which {
+                View::Clients => draw_clients(f, f.area(), app),
+                View::ClientDetail => draw_client_detail(f, f.area(), app),
+                View::Dashboard => draw_dashboard(f, app),
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        // Resolve one cell to the pair of colours it is actually painted
+        // with, honouring reverse video the way a terminal does.
+        let paint = |c: &ratatui::buffer::Cell| -> (&'static str, &'static str, bool) {
+            let bold = c.modifier.contains(Modifier::BOLD);
+            if c.modifier.contains(Modifier::REVERSED) {
+                (
+                    svg_colour(c.bg, "#0d1117"),
+                    svg_colour(c.fg, "#c9d1d9"),
+                    bold,
+                )
+            } else {
+                (svg_colour(c.fg, "#c9d1d9"), svg_colour(c.bg, "none"), bold)
+            }
+        };
+
+        let mut out = format!("<g class=\"{class}\">\n");
+        for y in 0..h {
+            let mut x = 0u16;
+            while x < w {
+                let key = paint(&buf.content[y as usize * w as usize + x as usize]);
+                let mut run = String::new();
+                let start = x;
+                while x < w {
+                    let c = &buf.content[y as usize * w as usize + x as usize];
+                    if paint(c) != key {
+                        break;
+                    }
+                    run.push_str(c.symbol());
+                    x += 1;
+                }
+                let (fg, bg, bold) = key;
+                let blank = run.trim().is_empty();
+                if blank && bg == "none" {
+                    continue;
+                }
+                let cols = (x - start) as f64;
+                if bg != "none" {
+                    out.push_str(&format!(
+                        "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" fill=\"{bg}\"/>\n",
+                        start as f64 * CW,
+                        y as f64 * CH,
+                        cols * CW,
+                        CH,
+                    ));
+                }
+                if !blank {
+                    // Pin every run to an exact width. Monospace fonts do
+                    // not agree on their advance — Consolas is narrower than
+                    // DejaVu Sans Mono — and letting the browser choose
+                    // spreads the letters of one row and cramps the next.
+                    // Stretching a glyph by a few per cent is invisible; a
+                    // table whose columns do not line up is not.
+                    out.push_str(&format!(
+                        "<text x=\"{:.1}\" y=\"{:.1}\" textLength=\"{:.1}\" \
+                         lengthAdjust=\"spacingAndGlyphs\" fill=\"{fg}\"{}>{}</text>\n",
+                        start as f64 * CW,
+                        y as f64 * CH + CH * 0.74,
+                        cols * CW,
+                        if bold { " font-weight=\"bold\"" } else { "" },
+                        xml_escape(&run)
+                    ));
+                }
+            }
+        }
+        out.push_str("</g>\n");
+        out
+    }
+
+    /// Wrap groups into a finished SVG. More than one group turns into an
+    /// animation: each is shown in turn, on a loop.
+    fn svg_document(groups: &[String], w: u16, h: u16, hold_secs: f64) -> String {
+        let width = w as f64 * CW;
+        let height = h as f64 * CH;
+        let mut s = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {width:.0} {height:.0}\" \
+             width=\"{width:.0}\" height=\"{height:.0}\" font-family=\"ui-monospace, \
+             SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace\" font-size=\"14\">\n"
+        );
+        s.push_str("<rect width=\"100%\" height=\"100%\" rx=\"8\" fill=\"#0d1117\"/>\n");
+
+        if groups.len() > 1 {
+            let total = hold_secs * groups.len() as f64;
+            s.push_str("<style>\n");
+            s.push_str("g[class^=\"f\"] { visibility: hidden }\n");
+            for i in 0..groups.len() {
+                let from = 100.0 * i as f64 / groups.len() as f64;
+                let to = 100.0 * (i + 1) as f64 / groups.len() as f64;
+                s.push_str(&format!(
+                    ".f{i} {{ animation: k{i} {total:.1}s step-end infinite }}\n\
+                     @keyframes k{i} {{ {from:.3}% {{ visibility: visible }} \
+                     {to:.3}% {{ visibility: hidden }} }}\n"
+                ));
+            }
+            s.push_str("</style>\n");
+        }
+        for g in groups {
+            s.push_str(g);
+        }
+        s.push_str("</svg>\n");
+        s
+    }
+
+    fn write_asset(name: &str, groups: &[String], w: u16, h: u16, hold_secs: f64) {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/assets");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, svg_document(groups, w, h, hold_secs)).unwrap();
+        println!("wrote {}", path.display());
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn provider(
+        name: &str,
+        gw: &str,
+        priority: u32,
+        state: State,
+        latency: f64,
+        up_for_secs: i64,
+        layer: Option<crate::balancer::FailureLayer>,
+        detail: Option<&str>,
+    ) -> ProviderSnapshot {
+        let now = Utc::now();
+        ProviderSnapshot {
+            name: name.into(),
+            gateway: gw.into(),
+            interface: "ens18".into(),
+            priority,
+            role: if priority == 0 { "primary" } else { "backup" }.into(),
+            state,
+            last_latency_ms: (state != State::Down).then_some(latency),
+            last_check: Some(now),
+            consecutive_failures: if state == State::Down { 3 } else { 0 },
+            consecutive_successes: if state == State::Up { 240 } else { 0 },
+            up_since: (state == State::Up).then(|| now - ChronoDuration::seconds(up_for_secs)),
+            failure_layer: layer,
+            failure_detail: detail.map(String::from),
+            canary_ok: state == State::Up,
+            last_canary_at: Some(now),
+            last_canary_summary: Some("3/3 canary targets verified".into()),
+            throughput_ok: state == State::Up,
+            last_throughput_at: Some(now),
+            last_throughput_summary: Some("94210 kbit/s".into()),
+        }
     }
 
     fn client(ip: &str, name: Option<&str>, online: bool, rx: i64, drops: i64) -> ClientInfo {
@@ -2197,6 +2396,279 @@ priority = 0
             longest_session_secs: 16_560,
             availability_pct: 62.5,
         }
+    }
+
+    fn dashboard_app(
+        providers: Vec<ProviderSnapshot>,
+        active: &str,
+        events: Vec<FailoverEventWire>,
+        failback: Option<FailbackPending>,
+    ) -> App {
+        let mut app = sample_app();
+        app.snapshot.active = Some(active.into());
+        app.snapshot.providers = providers;
+        app.snapshot.failback_pending = failback;
+        app.snapshot.kernel_route = Some(format!(
+            "via {} dev ens18 metric 0 proto static",
+            if active == "isp-main" {
+                "10.0.0.2"
+            } else {
+                "10.0.1.1"
+            }
+        ));
+        app.events = events;
+        app.selected = 0;
+
+        let now = Utc::now();
+        app.system = (0..60)
+            .map(|i| SystemPointWire {
+                ts: (now - ChronoDuration::seconds(60 - i)).to_rfc3339(),
+                sample: crate::sysmon::SysSample {
+                    cpu_total: 6.0 + ((i * 7) % 23) as f32,
+                    cpu_per_core: (0..4)
+                        .map(|c| 4.0 + ((i * 3 + c * 11) % 31) as f32)
+                        .collect(),
+                    mem_total: 2 * 1024 * 1024 * 1024,
+                    mem_used: 412 * 1024 * 1024,
+                    mem_available: 1_600 * 1024 * 1024,
+                    swap_total: 1024 * 1024 * 1024,
+                    swap_used: 0,
+                    load1: 0.18,
+                    load5: 0.22,
+                    load15: 0.20,
+                    net_rx_bytes: 4_812_000_000,
+                    net_tx_bytes: 812_000_000,
+                    disk_total: 40 * 1024 * 1024 * 1024,
+                    disk_used: 9 * 1024 * 1024 * 1024,
+                    uptime_s: 1_209_600,
+                    procs: 128,
+                },
+            })
+            .collect();
+
+        for p in app.snapshot.providers.clone() {
+            let carrying = Some(&p.name) == app.snapshot.active.as_ref();
+            let points = (0..90)
+                .map(|i| TrafficPointWire {
+                    ts: (now - ChronoDuration::seconds(90 - i)).to_rfc3339(),
+                    interval_s: 2.0,
+                    rx_bytes: if carrying {
+                        900_000 + ((i * 137) % 700_000) as u64
+                    } else {
+                        1_200 + ((i * 7) % 900) as u64
+                    },
+                    rx_packets: 900,
+                    tx_bytes: if carrying {
+                        120_000 + ((i * 31) % 60_000) as u64
+                    } else {
+                        400
+                    },
+                    tx_packets: 300,
+                })
+                .collect();
+            app.traffic.insert(p.name.clone(), points);
+        }
+        app
+    }
+
+    /// Render the pictures the README uses.
+    ///
+    /// Normally a no-op: it only writes when asked, so an ordinary test run
+    /// never touches the working tree. Run it with
+    /// `VLB_SHOTS=1 cargo test --bin vlb tui::tests::render_readme_assets`.
+    #[test]
+    fn render_readme_assets() {
+        if std::env::var("VLB_SHOTS").is_err() {
+            return;
+        }
+        use crate::balancer::FailureLayer;
+        let now = Utc::now();
+        let ev = |secs: i64, from: Option<&str>, to: &str, reason: &str| FailoverEventWire {
+            ts: (now - ChronoDuration::seconds(secs)).to_rfc3339(),
+            from: from.map(String::from),
+            to: to.into(),
+            reason: reason.into(),
+        };
+
+        // ── the failover, as it happens ────────────────────────────────
+        let healthy = || {
+            vec![
+                provider(
+                    "isp-main",
+                    "10.0.0.2",
+                    0,
+                    State::Up,
+                    10.7,
+                    91_000,
+                    None,
+                    None,
+                ),
+                provider(
+                    "isp-second",
+                    "10.0.1.1",
+                    1,
+                    State::Up,
+                    14.2,
+                    91_000,
+                    None,
+                    None,
+                ),
+                provider(
+                    "isp-backup",
+                    "10.0.0.1",
+                    2,
+                    State::Up,
+                    21.9,
+                    91_000,
+                    None,
+                    None,
+                ),
+            ]
+        };
+        let intercepted = {
+            let mut v = healthy();
+            v[0] = provider(
+                "isp-main",
+                "10.0.0.2",
+                0,
+                State::Down,
+                10.7,
+                0,
+                Some(FailureLayer::ContentTampered),
+                Some("canary.txt came back as a payment page (302 to portal.isp.example)"),
+            );
+            v
+        };
+        let recovering = {
+            let mut v = healthy();
+            v[0] = provider("isp-main", "10.0.0.2", 0, State::Up, 11.1, 8, None, None);
+            v
+        };
+
+        let settled = ev(
+            3_600,
+            Some("isp-backup"),
+            "isp-main",
+            "failback to higher-priority 'isp-main'",
+        );
+        let frames = vec![
+            svg_group(
+                &dashboard_app(healthy(), "isp-main", vec![settled.clone()], None),
+                120,
+                34,
+                View::Dashboard,
+                "f0",
+            ),
+            svg_group(
+                &dashboard_app(intercepted.clone(), "isp-main", vec![settled.clone()], None),
+                120,
+                34,
+                View::Dashboard,
+                "f1",
+            ),
+            svg_group(
+                &dashboard_app(
+                    intercepted,
+                    "isp-second",
+                    vec![
+                        ev(
+                            1,
+                            Some("isp-main"),
+                            "isp-second",
+                            "'isp-main' is down — switching to healthy 'isp-second' (priority 1)",
+                        ),
+                        settled.clone(),
+                    ],
+                    None,
+                ),
+                120,
+                34,
+                View::Dashboard,
+                "f2",
+            ),
+            svg_group(
+                &dashboard_app(
+                    recovering,
+                    "isp-second",
+                    vec![
+                        ev(
+                            22,
+                            Some("isp-main"),
+                            "isp-second",
+                            "'isp-main' is down — switching to healthy 'isp-second' (priority 1)",
+                        ),
+                        settled.clone(),
+                    ],
+                    Some(FailbackPending {
+                        candidate: "isp-main".into(),
+                        stable_for_secs: 8,
+                        required_secs: 30,
+                    }),
+                ),
+                120,
+                34,
+                View::Dashboard,
+                "f3",
+            ),
+            svg_group(
+                &dashboard_app(
+                    healthy(),
+                    "isp-main",
+                    vec![
+                        ev(
+                            1,
+                            Some("isp-second"),
+                            "isp-main",
+                            "failback to higher-priority 'isp-main' (priority 0 < 1), healthy for 30s",
+                        ),
+                        ev(
+                            52,
+                            Some("isp-main"),
+                            "isp-second",
+                            "'isp-main' is down — switching to healthy 'isp-second' (priority 1)",
+                        ),
+                        settled,
+                    ],
+                    None,
+                ),
+                120,
+                34,
+                View::Dashboard,
+                "f4",
+            ),
+        ];
+        write_asset("failover.svg", &frames, 120, 34, 2.2);
+        write_asset("tui-dashboard.svg", &frames[0..1], 120, 34, 1.0);
+
+        // ── the client screens ─────────────────────────────────────────
+        let app = sample_app();
+        write_asset(
+            "tui-clients.svg",
+            &[svg_group(&app, 132, 16, View::Clients, "f0")],
+            132,
+            16,
+            1.0,
+        );
+
+        let mut detail_app = sample_app();
+        detail_app.client_detail = Some(Box::new(sample_detail()));
+        write_asset(
+            "tui-client-detail.svg",
+            &[svg_group(&detail_app, 132, 26, View::ClientDetail, "f0")],
+            132,
+            26,
+            1.0,
+        );
+        write_asset(
+            "clients.svg",
+            &[
+                svg_group(&app, 132, 26, View::Clients, "f0"),
+                svg_group(&detail_app, 132, 26, View::ClientDetail, "f1"),
+            ],
+            132,
+            26,
+            3.5,
+        );
     }
 
     /// The list has to answer "who is here, how much are they using, and did
