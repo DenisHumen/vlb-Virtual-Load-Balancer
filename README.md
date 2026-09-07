@@ -402,40 +402,68 @@ how long each lasted, and **how long the host was away in between**.
 <details>
 <summary>The same two screens as text, if you prefer to copy from them</summary>
 
+Both are the still frames linked above, at the width they are drawn:
+the list at 132x19, one client at 132x26.
+
 ```text
 ┌ clients · window 24h ────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│3 of 4 hosts connected   now ↓ 37.0 Mbit/s  ↑ 5.0 Mbit/s   total 24h ↓ 4.40 GiB  ↑ 563.17 MiB   7 drops                           │
+│5 of 7 hosts connected   now ↓ 53.9 Mbit/s  ↑ 6.2 Mbit/s   total 24h ↓ 5.69 GiB  ↑ 738.68 MiB   11 drops                          │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ hosts (↑/↓ select · Enter for details) ──────────────────────────────────────────────────────────────────────────────────────────┐
-│   name             address         mac               ↓ now       ↑ now       ↓ total    ↑ total    online   drops last seen      │
-│●  denis-pc         192.168.8.24    a4:5e:60:11:22:33 12.3 Mbit/s 1.7 Mbit/s  3.40 GiB   435.20 MiB 4h12m    0     now            │
-│●  TV (living room) 192.168.8.31    a4:5e:60:11:22:33 12.3 Mbit/s 1.7 Mbit/s  774.38 MiB 96.80 MiB  4h12m    2     now            │
-│●  —                192.168.8.12    —                 12.3 Mbit/s 1.7 Mbit/s  39.10 MiB  4.89 MiB   4h12m    0     now            │
-│·  iphone-anna      192.168.8.57    a4:5e:60:11:22:33 0.0 bit/s   0.0 bit/s   210.29 MiB 26.29 MiB  1h00m    5     37m00s ago     │
+│   name             address         mac               ↓ now       ↑ now       ↓ total    ↑ total    online     drops last seen    │
+│●  denis-pc         192.168.8.24    a4:5e:60:11:2c:9e 23.6 Mbit/s 2.3 Mbit/s  3.40 GiB   497.37 MiB 4h12m      0     now          │
+│●  TV (living room) 192.168.8.31    a4:5e:60:12:2c:97 12.4 Mbit/s 1.5 Mbit/s  774.38 MiB 96.80 MiB  3h28m      2     now          │
+│●  —                192.168.8.12    —                 8.4 Mbit/s  1.1 Mbit/s  39.10 MiB  4.34 MiB   2h44m      0     now          │
+│·  iphone-anna      192.168.8.57    a4:5e:60:14:2c:89 0.0 bit/s   0.0 bit/s   210.29 MiB 21.03 MiB  1h00m      5     37m00s ago   │
+│●  nas              192.168.8.9     a4:5e:60:15:2c:82 5.1 Mbit/s  720.0 kbit/ 1.20 GiB   111.32 MiB 1h16m      0     now          │
+│●  work-laptop      192.168.8.44    a4:5e:60:16:2c:7b 4.3 Mbit/s  614.4 kbit/ 91.93 MiB  7.66 MiB   32m00s     1     now          │
+│·  printer          192.168.8.71    a4:5e:60:17:2c:74 0.0 bit/s   0.0 bit/s   2.00 MiB   157.75 KiB 1h00m      3     37m00s ago   │
+│                                                                                                                                  │
+│                                                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│↑/↓ select  Enter details  w window (24h)  r refresh  c/Esc back to providers  q quit                                             │
+│traffic is counted in the kernel per host; "online" comes from the ARP table, refreshed by an occasional ping                     │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ```text
-┌ client 192.168.8.24 ───────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│denis-pc   192.168.8.24   a4:5e:60:11:22:33                                                                                     │
-│● online  connected for 4h12m                                                                                                   │
-│traffic   ↓ 3.40 GiB   ↑ 435.20 MiB   over the last 24h                                                                         │
-│average   ↓ 1.9 Mbit/s   ↑ 240.8 kbit/s   while connected                                                                       │
-│peak      ↓ 41.6 Mbit/s   ↑ 5.1 Mbit/s                                                                                          │
-│connected 4h12m of 24h  (62.5%)   drops 2   longest 4h36m   first seen 09-03 15:29                                              │
-└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ connections (newest first · "away before" is the gap) ─────────────────────────────────────────────────────────────────────────┐
-│started               ended                 duration    away before   ↓            ↑                                            │
-│2026-09-06 11:17:22   — still connected     4h12m       12m18s        2.89 GiB     181.20 MiB                                   │
-│2026-09-06 06:29:22   2026-09-06 11:05:22   4h36m       2m00s         457.76 MiB   17.17 MiB                                    │
-└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ client 192.168.8.24 ─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│denis-pc   192.168.8.24   a4:5e:60:11:2c:9e                                                                                       │
+│● online  connected for 4h12m                                                                                                     │
+│traffic   ↓ 3.40 GiB   ↑ 497.37 MiB   over the last 24h                                                                           │
+│average   ↓ 921.9 kbit/s   ↑ 131.7 kbit/s   while connected                                                                       │
+│peak      ↓ 39.8 Mbit/s   ↑ 4.3 Mbit/s                                                                                            │
+│connected 8h48m of 24h  (36.7%)   drops 2   longest 4h36m   first seen 01-12 09:41                                                │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ traffic · 01-14 09:56 → 01-15 09:41 ─────────────────────────────────────────────────────────────────────────────────────────────┐
+│45.7 Mbit/s│                                                                                                                   ⣀  │
+│           │                                                                        ⢰⠢⠤⣀                ⡔⠊⠉⡆                 ⡠⠊ ⠑⢄│
+│           │                                                                        ⡸   ⠉⠢⡀           ⡠⠊   ⢇ ⢰⠢⣀           ⢀⠔⠁    │
+│22.9 Mbit/s│                                                                        ⡇     ⠈⢢        ⣀⠜     ⢸ ⡎  ⠱⡀      ⢀⠤⠒⠁      │
+│           │                                                                        ⡇       ⠑⢄⡀ ⢀⠤⠒⠊       ⢸⢀⠇   ⠈⠢⡀  ⡠⠊⠁         │
+│           │                                                                       ⢠⠃         ⠈⠑⠊          ⠘⣼      ⠑⠢⠜            │
+│0          │⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⠔⠒⠒⠒⠒⠢⠤⠤⠤⠤⠤⠤⠤⠒⠒⠒⠒⠒⠒⠒⠊⠉⠉⠱⡠⠊⠉⠑⠒⠒⠒⠒⠒⠒⠒⠤⠤⠤⠤⠤⠤⠔⠒⠒⠒⠒│
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ connections (newest first · "away before" is the gap) ───────────────────────────────────────────────────────────────────────────┐
+│started               ended                 duration    away before   ↓            ↑                                              │
+│2026-01-15 05:29:07   — still connected     4h12m       12m18s        1.62 GiB     237.38 MiB                                     │
+│2026-01-15 00:40:49   2026-01-15 05:16:49   4h36m       2m00s         1.78 GiB     259.99 MiB                                     │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│↑/↓ next host  Esc back to the list  w window (24h)  r refresh  q quit                                                            │
+│                                                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 </details>
 
 > Every picture in this file is rendered by the test suite from the real
-> widgets (`VLB_SHOTS=1 cargo test --bin vlb tui::tests::render_readme_assets`),
-> so none of them can drift from what the program actually draws.
+> widgets, and that is checked rather than asserted: an ordinary `cargo test`
+> rebuilds all five and fails if what is committed differs by a byte. It also
+> reads each one back and compares it, row by row, with the terminal buffer it
+> came from. Regenerate them with
+> `VLB_SHOTS=1 cargo test --bin vlb tui::tests::render_readme_assets`.
 
 
 ### The same thing from the shell

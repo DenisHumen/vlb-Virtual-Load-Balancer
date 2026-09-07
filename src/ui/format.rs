@@ -86,13 +86,6 @@ pub fn ago(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
     format!("{} ago", duration(secs as u64))
 }
 
-/// A local wall-clock stamp for a table: `09-05 14:22`.
-pub fn stamp(t: DateTime<Utc>) -> String {
-    t.with_timezone(&chrono::Local)
-        .format("%m-%d %H:%M")
-        .to_string()
-}
-
 /// A local wall-clock stamp including seconds.
 pub fn stamp_secs(t: DateTime<Utc>) -> String {
     t.with_timezone(&chrono::Local)

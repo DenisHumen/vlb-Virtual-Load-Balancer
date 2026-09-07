@@ -54,8 +54,7 @@ use crate::control::{
 // stats summary cannot drift apart on what a megabyte is.
 use crate::format::{
     ago as fmt_ago, bytes as fmt_bytes, count as fmt_count, duration as fmt_duration,
-    rate as fmt_rate, rate_from_bytes as fmt_rate_bytes, stamp as fmt_stamp,
-    stamp_secs as fmt_stamp_secs,
+    rate as fmt_rate, rate_from_bytes as fmt_rate_bytes,
 };
 use crate::update;
 
@@ -158,6 +157,22 @@ enum UpdateState {
 }
 
 struct App {
+    /// The clock the screen is drawn against.
+    ///
+    /// `None` means the real one. The fixtures that render the README
+    /// pictures set it, because "up for 1d 1h16m" and "37m00s ago" are
+    /// computed at draw time: without a seam here the same fixture produced
+    /// slightly different bytes on every run, every asset was rewritten by
+    /// every regeneration, and no diff could show whether a change had
+    /// altered a picture.
+    clock: Option<chrono::DateTime<chrono::Utc>>,
+    /// The zone wall-clock times are shown in. `None` means this machine's.
+    ///
+    /// Fixed for the README pictures: the provider table prints the time of
+    /// the last check in local time, so without this the same fixture
+    /// rendered a different picture on a laptop in Kyiv and in a UTC
+    /// container, and the committed asset could never match both.
+    zone: Option<chrono::FixedOffset>,
     listen: String,
     config: Config,
     config_path: PathBuf,
@@ -187,8 +202,36 @@ struct App {
 }
 
 impl App {
+    /// The clock this screen is drawn against.
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        self.clock.unwrap_or_else(chrono::Utc::now)
+    }
+
+    /// A date and time, in the zone this screen shows times in.
+    fn stamp(&self, t: chrono::DateTime<chrono::Utc>) -> String {
+        self.local(t).format("%m-%d %H:%M").to_string()
+    }
+
+    /// The same, to the second.
+    fn stamp_secs(&self, t: chrono::DateTime<chrono::Utc>) -> String {
+        self.local(t).format("%Y-%m-%d %H:%M:%S").to_string()
+    }
+
+    /// One instant, in the zone this screen shows times in.
+    fn local<Tz: chrono::TimeZone>(
+        &self,
+        t: chrono::DateTime<Tz>,
+    ) -> chrono::DateTime<chrono::FixedOffset> {
+        match self.zone {
+            Some(off) => t.with_timezone(&off),
+            None => t.with_timezone(&chrono::Local).fixed_offset(),
+        }
+    }
+
     fn new(config: Config, config_path: PathBuf, snapshot: ControlSnapshot) -> Self {
         Self {
+            clock: None,
+            zone: None,
             listen: config.control.listen.clone(),
             config,
             config_path,
@@ -676,7 +719,13 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &App) {
             Constraint::Length(3 + app.snapshot.providers.len() as u16),
             Constraint::Length(events_h),
             Constraint::Min(6),
-            Constraint::Length(3),
+            // Four rows, not three. The footer draws two lines — the keys
+            // and, under them, whatever went wrong — and a bordered block
+            // three rows tall has exactly one row inside it, so the second
+            // line was never drawn at all. A fixed height rather than one
+            // that follows the message: a footer that grows and shrinks
+            // every few seconds drags the chart above it up and down.
+            Constraint::Length(4),
         ])
         .split(f.area());
 
@@ -701,7 +750,7 @@ fn draw_gateway(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let uptime = s
         .started_at
         .map(|t| {
-            let secs = (chrono::Utc::now() - t).num_seconds().max(0) as u64;
+            let secs = (app.now() - t).num_seconds().max(0) as u64;
             fmt_duration(secs)
         })
         .unwrap_or_else(|| "?".into());
@@ -788,11 +837,7 @@ fn draw_events(f: &mut ratatui::Frame, area: Rect, app: &App) {
             .take(5)
             .map(|e| {
                 let when = chrono::DateTime::parse_from_rfc3339(&e.ts)
-                    .map(|t| {
-                        t.with_timezone(&chrono::Local)
-                            .format("%m-%d %H:%M:%S")
-                            .to_string()
-                    })
+                    .map(|t| app.local(t).format("%m-%d %H:%M:%S").to_string())
                     .unwrap_or_else(|_| e.ts.clone());
                 let from = e.from.as_deref().unwrap_or("—");
                 let head = format!("{when}  {from} → {}  ", e.to);
@@ -1076,7 +1121,7 @@ fn draw_clients(f: &mut ratatui::Frame, area: Rect, app: &App) {
         .constraints([
             Constraint::Length(header.len() as u16 + 2),
             Constraint::Min(4),
-            Constraint::Length(3),
+            Constraint::Length(4),
         ])
         .split(area);
 
@@ -1096,8 +1141,12 @@ fn draw_clients(f: &mut ratatui::Frame, area: Rect, app: &App) {
     // totals, drops and last-seen are what survive to the end.
     let width = chunks[1].width;
     let show_mac = width >= 126;
-    let show_rates = width >= 106;
-    let now = chrono::Utc::now();
+    // 106 was two short: at 106 and 107 the table asks for more columns
+    // than it has and ratatui takes the difference out of whichever column
+    // it likes. Both thresholds are the sum of the widths below plus the
+    // spacing between them.
+    let show_rates = width >= 108;
+    let now = app.now();
 
     let mut head = vec!["", "name", "address"];
     if show_mac {
@@ -1131,11 +1180,24 @@ fn draw_clients(f: &mut ratatui::Frame, area: Rect, app: &App) {
                 Style::default()
             });
 
+            // De-emphasis has to survive the selection bar.
+            //
+            // The bar is drawn with a DarkGray background, and three cells in
+            // the row set DarkGray as their foreground — so on the selected
+            // row the MAC address, the drop count and the last-seen time were
+            // painted in the background colour. Contrast 1.00: three columns
+            // simply gone, for the one host the operator was looking at.
+            let dim = if i == app.client_selected {
+                Color::Gray
+            } else {
+                Color::DarkGray
+            };
+
             let mut cells = vec![online_cell(c.online), name_cell, Cell::from(c.ip.clone())];
             if show_mac {
                 cells.push(
                     Cell::from(c.mac.clone().unwrap_or_else(|| "—".into()))
-                        .style(Style::default().fg(Color::DarkGray)),
+                        .style(Style::default().fg(dim)),
                 );
             }
             if show_rates {
@@ -1154,14 +1216,14 @@ fn draw_clients(f: &mut ratatui::Frame, area: Rect, app: &App) {
                 Cell::from(c.disconnects.to_string()).style(if c.disconnects > 0 {
                     Style::default().fg(Color::Yellow)
                 } else {
-                    Style::default().fg(Color::DarkGray)
+                    Style::default().fg(dim)
                 }),
                 Cell::from(
                     c.last_seen
                         .map(|t| fmt_ago(t, now))
                         .unwrap_or_else(|| "—".into()),
                 )
-                .style(Style::default().fg(Color::DarkGray)),
+                .style(Style::default().fg(dim)),
             ]);
 
             let row = Row::new(cells);
@@ -1192,9 +1254,11 @@ fn draw_clients(f: &mut ratatui::Frame, area: Rect, app: &App) {
     widths.extend([
         Constraint::Length(10),
         Constraint::Length(10),
-        Constraint::Length(8),
+        // fmt_duration reaches "365d 23h59m"; ago() reaches "37m00s ago" and
+        // longer. Both columns used to be narrower than their own output.
+        Constraint::Length(10),
         Constraint::Length(5),
-        Constraint::Min(9),
+        Constraint::Min(12),
     ]);
 
     f.render_widget(
@@ -1258,12 +1322,12 @@ fn draw_client_detail(f: &mut ratatui::Frame, area: Rect, app: &App) {
             Constraint::Length(8),
             Constraint::Min(7),
             Constraint::Length(sessions_h),
-            Constraint::Length(3),
+            Constraint::Length(4),
         ])
         .split(area);
 
     let c = &detail.client;
-    let now = chrono::Utc::now();
+    let now = app.now();
 
     // ── who, and how it is doing ───────────────────────────────────────
     let state_line = match (c.online, c.session_secs) {
@@ -1357,9 +1421,20 @@ fn draw_client_detail(f: &mut ratatui::Frame, area: Rect, app: &App) {
         ]),
         Line::from(vec![
             Span::styled("connected ", Style::default().fg(Color::Gray)),
+            // The time and the percentage have to be the same measurement.
+            // This printed the *current session* next to the share of the
+            // whole window, so a host connected for four hours out of nine
+            // read "4h12m of 24h (36.7%)" — two true numbers that cannot both
+            // describe one thing.
             Span::raw(format!(
                 "{} of {}  ({:.1}%)",
-                fmt_duration(c.online_secs.max(0) as u64),
+                fmt_duration(
+                    detail
+                        .sessions
+                        .iter()
+                        .map(|s| s.duration_secs.max(0) as u64)
+                        .sum::<u64>()
+                ),
                 app.window_label(),
                 detail.availability_pct
             )),
@@ -1382,7 +1457,7 @@ fn draw_client_detail(f: &mut ratatui::Frame, area: Rect, app: &App) {
             ),
             Span::styled(
                 c.first_seen
-                    .map(|t| format!("   first seen {}", fmt_stamp(t)))
+                    .map(|t| format!("   first seen {}", app.stamp(t)))
                     .unwrap_or_default(),
                 Style::default().fg(Color::DarkGray),
             ),
@@ -1417,7 +1492,7 @@ fn draw_client_detail(f: &mut ratatui::Frame, area: Rect, app: &App) {
         .fold(1.0_f64, f64::max);
     let x_len = detail.samples.len().max(1) as f64 - 1.0;
     let span = match (detail.samples.first(), detail.samples.last()) {
-        (Some(a), Some(b)) => format!("{} → {}", fmt_stamp(a.ts), fmt_stamp(b.ts)),
+        (Some(a), Some(b)) => format!("{} → {}", app.stamp(a.ts), app.stamp(b.ts)),
         _ => "no traffic recorded in this window".to_string(),
     };
     let datasets = vec![
@@ -1451,7 +1526,7 @@ fn draw_client_detail(f: &mut ratatui::Frame, area: Rect, app: &App) {
                     .bounds([0.0, max_y * 1.15])
                     .labels(vec![
                         Span::from("0"),
-                        Span::from(fmt_rate(max_y * 0.5)),
+                        Span::from(fmt_rate(max_y * 1.15 * 0.5)),
                         Span::from(fmt_rate(max_y * 1.15)),
                     ])
                     .style(Style::default().fg(Color::DarkGray)),
@@ -1476,9 +1551,9 @@ fn draw_client_detail(f: &mut ratatui::Frame, area: Rect, app: &App) {
         .take(8)
         .map(|s| {
             Row::new(vec![
-                Cell::from(fmt_stamp_secs(s.started_at)),
+                Cell::from(app.stamp_secs(s.started_at)),
                 Cell::from(match s.ended_at {
-                    Some(t) => fmt_stamp_secs(t),
+                    Some(t) => app.stamp_secs(t),
                     None => "— still connected".to_string(),
                 })
                 .style(if s.ended_at.is_none() {
@@ -1581,10 +1656,19 @@ fn draw_system(f: &mut ratatui::Frame, area: Rect, app: &App) {
 
     let latest = app.system.last().map(|p| &p.sample);
 
+    // The load line runs the width of the panel, not the width of the left
+    // column. Inside the left half it is cut at 59 columns, which lands in
+    // the middle of the network counters: "net down 4.4" and nothing after
+    // it, which reads as a number rather than a truncation.
+    let body = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(4), Constraint::Length(1)])
+        .split(inner);
+
     let halves = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(inner);
+        .split(body[0]);
 
     let gauges_area = halves[0];
     let rows = Layout::default()
@@ -1594,7 +1678,9 @@ fn draw_system(f: &mut ratatui::Frame, area: Rect, app: &App) {
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
-            Constraint::Min(1),
+            // Slack, so a gauge given the remainder does not stretch into a
+            // three-row slab.
+            Constraint::Min(0),
         ])
         .split(gauges_area);
 
@@ -1700,7 +1786,7 @@ fn draw_system(f: &mut ratatui::Frame, area: Rect, app: &App) {
             Style::default().fg(Color::Magenta),
         ),
     ]));
-    f.render_widget(footer_line, rows[4]);
+    f.render_widget(footer_line, body[1]);
 
     let right = halves[1];
     let split = Layout::default()
@@ -1722,10 +1808,20 @@ fn draw_per_core_grid(f: &mut ratatui::Frame, area: Rect, cores: &[f32]) {
         return;
     }
 
-    let cell_w: u16 = 14;
-    let cols = (area.width / cell_w).max(1) as usize;
-    let rows_needed = cores.len().div_ceil(cols);
-    let rows_n = rows_needed.min(area.height as usize).max(1);
+    // Fit the cores that exist rather than the cores that happen to fit.
+    // With a fixed cell width, a machine with more cores than rows_n * cols
+    // simply lost the rest — no ellipsis, no count, nothing to notice. Narrow
+    // the cells until they all fit, and only then give up and say how many
+    // are not shown.
+    let cols_max = (area.width / 8).max(1) as usize;
+    let rows_avail = (area.height as usize).max(1);
+    let mut cols = (area.width / 14).max(1) as usize;
+    while cols < cols_max && cores.len().div_ceil(cols) > rows_avail {
+        cols += 1;
+    }
+    let cell_w: u16 = (area.width / cols as u16).max(6);
+    let rows_n = cores.len().div_ceil(cols).min(rows_avail).max(1);
+    let shown = (rows_n * cols).min(cores.len());
 
     let row_constraints: Vec<Constraint> = (0..rows_n).map(|_| Constraint::Length(1)).collect();
     let row_rects = Layout::default()
@@ -1743,6 +1839,16 @@ fn draw_per_core_grid(f: &mut ratatui::Frame, area: Rect, cores: &[f32]) {
         for (col_idx, cell_rect) in cells.iter().enumerate() {
             let idx = row_idx * cols + col_idx;
             if idx >= cores.len() {
+                break;
+            }
+            // If some cores still will not fit, say so in the last cell
+            // rather than ending the list without comment.
+            if idx == shown - 1 && shown < cores.len() {
+                let p = Paragraph::new(Line::from(Span::styled(
+                    format!("+{} more", cores.len() - shown + 1),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                f.render_widget(p, *cell_rect);
                 break;
             }
             let pct = cores[idx].clamp(0.0, 100.0);
@@ -1778,21 +1884,38 @@ fn draw_cpu_history(f: &mut ratatui::Frame, area: Rect, app: &App) {
 }
 
 fn draw_providers(f: &mut ratatui::Frame, area: Rect, app: &App) {
-    let header = Row::new(vec![
+    // What the table asks for has to fit what it is given.
+    //
+    // Every column here is a fixed Length, and when they add up to more than
+    // the panel has, ratatui shrinks them — silently, and not evenly. At the
+    // 120 columns this dashboard is drawn at, the old widths came to 128 and
+    // the whole 10-column deficit landed on one column: provider names were
+    // served back as "isp-ma". The two least load-bearing columns now drop
+    // out on a narrow terminal instead, and the rest are sized to what their
+    // own values actually need.
+    let wide = area.width >= 120;
+
+    let mut header_cells = vec![
         Cell::from(""),
         Cell::from("name"),
         Cell::from("prio"),
         Cell::from("state"),
         Cell::from("gateway"),
-        Cell::from("iface"),
+    ];
+    if wide {
+        header_cells.push(Cell::from("iface"));
+    }
+    header_cells.extend([
         Cell::from("latency"),
         Cell::from("canary"),
         Cell::from("speed"),
         Cell::from("up for"),
-        Cell::from("last check"),
-        Cell::from("why"),
-    ])
-    .style(Style::default().add_modifier(Modifier::BOLD));
+    ]);
+    if wide {
+        header_cells.push(Cell::from("checked"));
+    }
+    header_cells.push(Cell::from("why"));
+    let header = Row::new(header_cells).style(Style::default().add_modifier(Modifier::BOLD));
 
     let active = app.snapshot.active.clone();
     let forced = app.snapshot.forced.clone();
@@ -1816,9 +1939,12 @@ fn draw_providers(f: &mut ratatui::Frame, area: Rect, app: &App) {
                 .last_latency_ms
                 .map(|l| format!("{l:.2} ms"))
                 .unwrap_or_else(|| "--".into());
+            // Local time. Every other clock on this screen is local, and a
+            // column of timestamps in a second timezone is worse than no
+            // column at all.
             let last = p
                 .last_check
-                .map(|t| t.format("%H:%M:%S").to_string())
+                .map(|t| app.local(t).format("%H:%M:%S").to_string())
                 .unwrap_or_else(|| "--:--:--".into());
             // The canary column is what answers "is this uplink actually
             // carrying my traffic", as opposed to merely answering pings —
@@ -1846,9 +1972,7 @@ fn draw_providers(f: &mut ratatui::Frame, area: Rect, app: &App) {
                     .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
             };
             let up_for = match (p.state, p.up_since) {
-                (State::Up, Some(t)) => {
-                    fmt_duration((chrono::Utc::now() - t).num_seconds().max(0) as u64)
-                }
+                (State::Up, Some(t)) => fmt_duration((app.now() - t).num_seconds().max(0) as u64),
                 _ => "-".into(),
             };
             let why = p
@@ -1863,20 +1987,27 @@ fn draw_providers(f: &mut ratatui::Frame, area: Rect, app: &App) {
                 None => Style::default(),
             });
 
-            let mut row = Row::new(vec![
+            let mut cells = vec![
                 Cell::from(marker),
-                Cell::from(p.name.clone()),
+                Cell::from(truncate(&p.name, 14)),
                 Cell::from(p.priority.to_string()),
                 state_cell,
                 Cell::from(p.gateway.clone()),
-                Cell::from(p.interface.clone()),
+            ];
+            if wide {
+                cells.push(Cell::from(truncate(&p.interface, 8)));
+            }
+            cells.extend([
                 Cell::from(latency),
                 canary_cell,
                 speed_cell,
                 Cell::from(up_for),
-                Cell::from(last),
-                why_cell,
             ]);
+            if wide {
+                cells.push(Cell::from(last));
+            }
+            cells.push(why_cell);
+            let mut row = Row::new(cells);
             if i == app.selected {
                 row = row.style(
                     Style::default()
@@ -1888,20 +2019,32 @@ fn draw_providers(f: &mut ratatui::Frame, area: Rect, app: &App) {
         })
         .collect();
 
-    let widths = [
-        Constraint::Length(3),
-        Constraint::Length(16),
-        Constraint::Length(5),
-        Constraint::Length(8),
-        Constraint::Length(16),
-        Constraint::Length(10),
-        Constraint::Length(11),
-        Constraint::Length(7),
-        Constraint::Length(10),
-        Constraint::Length(9),
-        Constraint::Length(10),
-        Constraint::Min(12),
+    // Sized to the longest value each column can hold: an IPv4 address is
+    // 15 characters, "content-unreachable" — the longest failure layer — is
+    // 19, and a timestamp is 8. With one column of spacing between them this
+    // comes to 116 of the 118 the panel has at 120 columns, so nothing is
+    // squeezed and the slack goes to "why".
+    let mut widths = vec![
+        Constraint::Length(2),
+        Constraint::Length(14),
+        Constraint::Length(4),
+        Constraint::Length(6),
+        Constraint::Length(15),
     ];
+    if wide {
+        widths.push(Constraint::Length(8));
+    }
+    widths.extend([
+        Constraint::Length(8),
+        Constraint::Length(6),
+        Constraint::Length(6),
+        // fmt_duration reaches "16d 12h00m" — ten characters.
+        Constraint::Length(10),
+    ]);
+    if wide {
+        widths.push(Constraint::Length(8));
+    }
+    widths.push(Constraint::Min(19));
     let title = match &app.snapshot.active {
         Some(a) if app.snapshot.active_adopted => format!(" providers — active: {a} (verifying) "),
         Some(a) => format!(" providers — active: {a} "),
@@ -1993,7 +2136,7 @@ fn draw_traffic(f: &mut ratatui::Frame, area: Rect, app: &App) {
                 .bounds([0.0, max_y * 1.15])
                 .labels(vec![
                     Span::from("0".to_string()),
-                    Span::from(fmt_rate(max_y * 0.5)),
+                    Span::from(fmt_rate(max_y * 1.15 * 0.5)),
                     Span::from(fmt_rate(max_y * 1.15)),
                 ])
                 .style(Style::default().fg(Color::DarkGray)),
@@ -2117,6 +2260,24 @@ mod tests {
     /// becomes, which differs by role and again when a cell is reversed —
     /// gauges and selected rows are drawn that way, and ignoring it turns
     /// every progress bar into a grey slab.
+    /// A background needs its own table.
+    ///
+    /// The terminal's two structural backgrounds are ANSI black (a gauge
+    /// trough) and ANSI bright black (a selection bar). Rendered with the
+    /// foreground palette they come out at 1.09:1 and 1.00:1 against the
+    /// page — an invisible trough, and a selection bar that swallows any
+    /// text the row happened to dim. Both get a panel grey here instead,
+    /// which is what a terminal theme actually shows and what leaves the
+    /// text on top of it readable.
+    fn svg_bg(c: Color, default: &'static str) -> &'static str {
+        match c {
+            Color::Reset => default,
+            Color::Black => "#21262d",
+            Color::DarkGray => "#30363d",
+            other => svg_colour(other, default),
+        }
+    }
+
     fn svg_colour(c: Color, default: &'static str) -> &'static str {
         match c {
             Color::Reset => default,
@@ -2140,6 +2301,95 @@ mod tests {
             .replace('>', "&gt;")
     }
 
+    fn xml_unescape(s: &str) -> String {
+        s.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&")
+    }
+
+    /// Pull one attribute out of a line this module wrote itself.
+    fn svg_attr(line: &str, name: &str) -> Option<String> {
+        let key = format!("{name}=\"");
+        let start = line.find(&key)? + key.len();
+        let rest = &line[start..];
+        let end = rest.find('"')?;
+        Some(rest[..end].to_string())
+    }
+
+    /// Read a rendered group back and check it against the buffer it came
+    /// from.
+    ///
+    /// This renderer fails silently. A run that drops characters, or lands a
+    /// column to the left of where it belongs, still produces a well-formed
+    /// SVG that no XML check will complain about — the only place it showed
+    /// up was in the published README, as words run together and rows
+    /// letter-spaced. So put the picture back together from what was written
+    /// and compare it with what the terminal drew.
+    fn verify_group(svg: &str, buf: &ratatui::buffer::Buffer, w: u16, h: u16) {
+        // Spaces inside a run are content, and XML only knows that if the
+        // element says so. Without this the parser strips the ones at each
+        // end of a run and collapses the rest, and `textLength` then
+        // stretches whatever survived across the whole span.
+        for line in svg.lines().filter(|l| l.starts_with("<text")) {
+            assert!(
+                line.contains("xml:space=\"preserve\""),
+                "a text run may not leave its spaces to the parser's discretion: {line}"
+            );
+        }
+
+        // (start column, cells, what is drawn there)
+        let mut items: Vec<(usize, usize, String)> = Vec::new();
+        for line in svg.lines() {
+            let (x, row) = match (svg_attr(line, "x"), svg_attr(line, "y")) {
+                (Some(x), Some(y)) => (
+                    x.parse::<f64>().unwrap(),
+                    (y.parse::<f64>().unwrap() / CH).floor() as usize,
+                ),
+                _ => continue,
+            };
+            let col = (x / CW).round() as usize;
+            if line.starts_with("<text") {
+                let body = line
+                    .split_once('>')
+                    .and_then(|(_, rest)| rest.strip_suffix("</text>"))
+                    .unwrap_or_default();
+                let cells = (svg_attr(line, "textLength")
+                    .unwrap()
+                    .parse::<f64>()
+                    .unwrap()
+                    / CW)
+                    .round() as usize;
+                items.push((row * 1000 + col, cells, xml_unescape(body)));
+            } else if line.contains("shape-rendering") {
+                // A solid bar: the same cells, drawn as one rectangle.
+                let cells = (svg_attr(line, "width").unwrap().parse::<f64>().unwrap() / CW).round()
+                    as usize;
+                items.push((row * 1000 + col, cells, "\u{2588}".repeat(cells)));
+            }
+        }
+        items.sort_by_key(|i| i.0);
+
+        for y in 0..h as usize {
+            let mut got = String::new();
+            let mut col = 0usize;
+            for (key, cells, text) in items.iter().filter(|i| i.0 / 1000 == y) {
+                let start = key % 1000;
+                assert!(start >= col, "row {y}: runs overlap at column {start}");
+                got.push_str(&" ".repeat(start - col));
+                got.push_str(text);
+                col = start + cells;
+            }
+            let want: String = (0..w)
+                .map(|x| buf.content[y * w as usize + x as usize].symbol())
+                .collect();
+            assert_eq!(
+                got.trim_end(),
+                want.trim_end(),
+                "row {y} of the picture does not say what the terminal drew"
+            );
+        }
+    }
+
     /// Render one screen and return it as an SVG group.
     ///
     /// Runs of identically-styled cells become one `<text>` with an explicit
@@ -2157,17 +2407,16 @@ mod tests {
         let buf = terminal.backend().buffer().clone();
 
         // Resolve one cell to the pair of colours it is actually painted
-        // with, honouring reverse video the way a terminal does.
+        // with. Reverse video swaps them, the way a terminal does; nothing
+        // in the dashboard sets it today, but a cell that arrived reversed
+        // and was drawn un-reversed would be silently unreadable, and that
+        // is not a thing to find out from a screenshot.
         let paint = |c: &ratatui::buffer::Cell| -> (&'static str, &'static str, bool) {
             let bold = c.modifier.contains(Modifier::BOLD);
             if c.modifier.contains(Modifier::REVERSED) {
-                (
-                    svg_colour(c.bg, "#0d1117"),
-                    svg_colour(c.fg, "#c9d1d9"),
-                    bold,
-                )
+                (svg_bg(c.bg, "#0d1117"), svg_colour(c.fg, "#c9d1d9"), bold)
             } else {
-                (svg_colour(c.fg, "#c9d1d9"), svg_colour(c.bg, "none"), bold)
+                (svg_colour(c.fg, "#c9d1d9"), svg_bg(c.bg, "none"), bold)
             }
         };
 
@@ -2176,70 +2425,108 @@ mod tests {
             let mut x = 0u16;
             while x < w {
                 let key = paint(&buf.content[y as usize * w as usize + x as usize]);
-                let mut run = String::new();
                 let start = x;
+                // Cell symbols, not characters. One cell can hold a
+                // multi-character grapheme, and the second half of a
+                // double-width glyph is an empty symbol that still owns a
+                // column — so widths have to be counted in cells.
+                let mut cells: Vec<&str> = Vec::new();
                 while x < w {
                     let c = &buf.content[y as usize * w as usize + x as usize];
                     if paint(c) != key {
                         break;
                     }
-                    run.push_str(c.symbol());
+                    cells.push(c.symbol());
                     x += 1;
                 }
                 let (fg, bg, bold) = key;
-                let blank = run.trim().is_empty();
+                let blank = cells.iter().all(|s| s.trim().is_empty());
                 if blank && bg == "none" {
                     continue;
                 }
-                let cols = (x - start) as f64;
                 if bg != "none" {
                     out.push_str(&format!(
                         "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" fill=\"{bg}\"/>\n",
                         start as f64 * CW,
                         y as f64 * CH,
-                        cols * CW,
+                        cells.len() as f64 * CW,
                         CH,
                     ));
                 }
                 if !blank {
-                    // Pin every run to an exact width. Monospace fonts do
-                    // not agree on their advance — Consolas is narrower than
-                    // DejaVu Sans Mono — and letting the browser choose
-                    // spreads the letters of one row and cramps the next.
-                    // Stretching a glyph by a few per cent is invisible; a
-                    // table whose columns do not line up is not.
+                    // Leading and trailing blanks carry no ink, and a run
+                    // that ends a line is mostly them. Dropping them shrinks
+                    // the file, and it is what keeps `textLength` honest: the
+                    // attribute pins the drawn glyphs to the columns they
+                    // actually occupy, so it can only nudge, never stretch.
+                    let lead = cells.iter().take_while(|s| s.trim().is_empty()).count();
+                    let trail = cells
+                        .iter()
+                        .rev()
+                        .take_while(|s| s.trim().is_empty())
+                        .count();
+                    let inked = &cells[lead..cells.len() - trail];
+                    // A run of full blocks is a bar, not writing. Drawn as
+                    // glyphs it comes out with a hairline seam between every
+                    // pair of cells; one rectangle is what the eye expects.
+                    if inked.iter().all(|s| *s == "\u{2588}") {
+                        out.push_str(&format!(
+                            "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" \
+                             fill=\"{fg}\" shape-rendering=\"crispEdges\"/>\n",
+                            (start as usize + lead) as f64 * CW,
+                            y as f64 * CH,
+                            inked.len() as f64 * CW,
+                            CH,
+                        ));
+                        continue;
+                    }
+                    // `xml:space="preserve"` is not optional. Without it the
+                    // parser strips the spaces at each end of a run and
+                    // collapses the ones inside, and `textLength` then
+                    // stretches the survivors across the whole span: words
+                    // ran into each other, rows came out letter-spaced, and a
+                    // lone border character became a grey slab the width of a
+                    // panel.
                     out.push_str(&format!(
-                        "<text x=\"{:.1}\" y=\"{:.1}\" textLength=\"{:.1}\" \
+                        "<text xml:space=\"preserve\" x=\"{:.1}\" y=\"{:.1}\" textLength=\"{:.1}\" \
                          lengthAdjust=\"spacingAndGlyphs\" fill=\"{fg}\"{}>{}</text>\n",
-                        start as f64 * CW,
+                        (start as usize + lead) as f64 * CW,
                         y as f64 * CH + CH * 0.74,
-                        cols * CW,
+                        inked.len() as f64 * CW,
                         if bold { " font-weight=\"bold\"" } else { "" },
-                        xml_escape(&run)
+                        xml_escape(&inked.concat())
                     ));
                 }
             }
         }
         out.push_str("</g>\n");
+        verify_group(&out, &buf, w, h);
         out
     }
 
     /// Wrap groups into a finished SVG. More than one group turns into an
     /// animation: each is shown in turn, on a loop.
-    fn svg_document(groups: &[String], w: u16, h: u16, hold_secs: f64) -> String {
+    fn svg_document(groups: &[String], w: u16, h: u16, hold_secs: f64, caption: &str) -> String {
         let width = w as f64 * CW;
         let height = h as f64 * CH;
         let mut s = format!(
             "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {width:.0} {height:.0}\" \
-             width=\"{width:.0}\" height=\"{height:.0}\" font-family=\"ui-monospace, \
+             width=\"{width:.0}\" height=\"{height:.0}\" role=\"img\" \
+             aria-labelledby=\"vlb-title\" font-family=\"ui-monospace, \
              SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace\" font-size=\"14\">\n"
         );
+        // The description travels with the file. These are linked as
+        // documents as well as embedded, and an `alt` attribute in the
+        // README does not follow a saved copy anywhere.
+        s.push_str(&format!(
+            "<title id=\"vlb-title\">{}</title>\n",
+            xml_escape(caption)
+        ));
         s.push_str("<rect width=\"100%\" height=\"100%\" rx=\"8\" fill=\"#0d1117\"/>\n");
 
         if groups.len() > 1 {
             let total = hold_secs * groups.len() as f64;
-            s.push_str("<style>\n");
-            s.push_str("g[class^=\"f\"] { visibility: hidden }\n");
+            s.push_str("<style type=\"text/css\">\n");
             for i in 0..groups.len() {
                 let from = 100.0 * i as f64 / groups.len() as f64;
                 let to = 100.0 * (i + 1) as f64 / groups.len() as f64;
@@ -2251,19 +2538,85 @@ mod tests {
             }
             s.push_str("</style>\n");
         }
-        for g in groups {
-            s.push_str(g);
+        for (i, g) in groups.iter().enumerate() {
+            // Fail to a still, not to nothing.
+            //
+            // Hiding every frame in CSS and revealing one from a keyframe
+            // means a renderer that parses CSS but does not implement
+            // animation — most SVG rasterizers — draws an empty box. Hiding
+            // the later frames with a presentation attribute instead leaves
+            // frame 0 the default state, and a CSS animation still wins over
+            // a presentation attribute wherever animation works at all.
+            if i == 0 {
+                s.push_str(g);
+            } else {
+                s.push_str(&g.replacen("\">\n", "\" visibility=\"hidden\">\n", 1));
+            }
         }
         s.push_str("</svg>\n");
         s
     }
 
-    fn write_asset(name: &str, groups: &[String], w: u16, h: u16, hold_secs: f64) {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/assets");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(name);
-        std::fs::write(&path, svg_document(groups, w, h, hold_secs)).unwrap();
-        println!("wrote {}", path.display());
+    /// Build one asset, and publish it only when asked to.
+    ///
+    /// The document is always produced, so the generator is exercised on
+    /// every `cargo test` run and the assertions below have something to
+    /// check. It used to be built only under `VLB_SHOTS`, which made the
+    /// whole renderer dead code in CI: the pictures in the README were the
+    /// one place its bugs could show up, and by then they were published.
+    fn write_asset(
+        name: &str,
+        caption: &str,
+        groups: &[String],
+        w: u16,
+        h: u16,
+        hold_secs: f64,
+    ) -> String {
+        let svg = svg_document(groups, w, h, hold_secs, caption);
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("docs/assets")
+            .join(name);
+        if std::env::var("VLB_SHOTS").is_ok() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &svg).unwrap();
+            println!("wrote {}", path.display());
+        } else if let Ok(published) = std::fs::read_to_string(&path) {
+            // The README says these pictures cannot drift from what the
+            // program draws. That was a claim, not a fact: the 0.5.0 release
+            // shipped a dashboard labelled v0.4.0. The output is
+            // reproducible now, so the claim can simply be checked.
+            assert_eq!(
+                published, svg,
+                "docs/assets/{name} is not what the generator produces any more.\n\
+                 Regenerate it:  VLB_SHOTS=1 cargo test --bin vlb tui::tests::render_readme_assets"
+            );
+        }
+        svg
+    }
+
+    /// A triangle wave, in whole numbers.
+    ///
+    /// The fixtures used to shape their traffic with `sin` and `cos`. Two
+    /// libms do not have to agree on the last bit of a sine, and they do
+    /// not: the same fixture produced a peak of 31.6 Mbit/s on one machine
+    /// and a hair less on another, so the committed picture could not match
+    /// both. Integer arithmetic has no such freedom.
+    fn wave(i: i64, period: i64, amplitude: i64) -> i64 {
+        let x = i.rem_euclid(period);
+        let up = if x * 2 <= period { x } else { period - x };
+        up * 2 * amplitude / period
+    }
+
+    /// A fixed instant for everything the pictures print as a wall clock.
+    ///
+    /// The fixtures used to build every timestamp from `Utc::now()`, so
+    /// regenerating the README assets rewrote all five files whether or not
+    /// anything had changed, and no diff could tell you whether a layout
+    /// change had altered a picture. Durations stay relative to the real
+    /// clock, because "up for" and "last seen" are durations; only the
+    /// absolute strings come from here.
+    fn fixture_clock() -> chrono::DateTime<Utc> {
+        "2026-01-15T09:41:07Z".parse().unwrap()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2277,7 +2630,8 @@ mod tests {
         layer: Option<crate::balancer::FailureLayer>,
         detail: Option<&str>,
     ) -> ProviderSnapshot {
-        let now = Utc::now();
+        let now = fixture_clock();
+        let stamp = now;
         ProviderSnapshot {
             name: name.into(),
             gateway: gw.into(),
@@ -2286,42 +2640,77 @@ mod tests {
             role: if priority == 0 { "primary" } else { "backup" }.into(),
             state,
             last_latency_ms: (state != State::Down).then_some(latency),
-            last_check: Some(now),
+            last_check: Some(stamp),
             consecutive_failures: if state == State::Down { 3 } else { 0 },
             consecutive_successes: if state == State::Up { 240 } else { 0 },
             up_since: (state == State::Up).then(|| now - ChronoDuration::seconds(up_for_secs)),
             failure_layer: layer,
             failure_detail: detail.map(String::from),
             canary_ok: state == State::Up,
-            last_canary_at: Some(now),
+            last_canary_at: Some(stamp),
             last_canary_summary: Some("3/3 canary targets verified".into()),
             throughput_ok: state == State::Up,
-            last_throughput_at: Some(now),
-            last_throughput_summary: Some("94210 kbit/s".into()),
+            last_throughput_at: Some(stamp),
+            // Three uplinks that all measure exactly the same speed is the
+            // one detail that gives a mocked screenshot away.
+            last_throughput_summary: Some(format!("{} kbit/s", 94_210 - (priority as u64 * 8_650))),
         }
     }
 
-    fn client(ip: &str, name: Option<&str>, online: bool, rx: i64, drops: i64) -> ClientInfo {
-        let now = Utc::now();
+    /// One host for the pictures.
+    ///
+    /// `seed` separates them. Every host used to carry the same MAC address,
+    /// the same download rate, the same upload rate and the same time online,
+    /// which is not what a real network looks like and is the detail that
+    /// gives a mocked screenshot away.
+    fn client(
+        ip: &str,
+        name: Option<&str>,
+        online: bool,
+        rx: i64,
+        drops: i64,
+        seed: u8,
+    ) -> ClientInfo {
+        let now = fixture_clock();
+        let k = seed as f64;
         ClientInfo {
             ip: ip.into(),
-            mac: Some("a4:5e:60:11:22:33".into()),
+            mac: Some(format!(
+                "a4:5e:60:{:02x}:{:02x}:{:02x}",
+                0x11 + seed,
+                0x2c,
+                0x9e - seed * 7
+            )),
             hostname: name.map(String::from),
             label: None,
             online,
-            first_seen: Some(now - ChronoDuration::days(3)),
+            // A wall-clock date, so it belongs to the same day as every
+            // other absolute time in the picture.
+            first_seen: Some(fixture_clock() - ChronoDuration::days(3 + seed as i64)),
             last_seen: Some(if online {
                 now
             } else {
                 now - ChronoDuration::minutes(37)
             }),
-            rx_bps: if online { 1_540_000.0 } else { 0.0 },
-            tx_bps: if online { 210_000.0 } else { 0.0 },
+            rx_bps: if online {
+                2_950_000.0 / (1.0 + k * 0.9)
+            } else {
+                0.0
+            },
+            tx_bps: if online {
+                288_000.0 / (1.0 + k * 0.55)
+            } else {
+                0.0
+            },
             rx_bytes: rx,
-            tx_bytes: rx / 8,
+            tx_bytes: rx / (7 + seed as i64),
             disconnects: drops,
-            online_secs: if online { 15_120 } else { 3_600 },
-            session_secs: online.then_some(15_120),
+            online_secs: if online {
+                15_120 - seed as i64 * 2_640
+            } else {
+                3_600
+            },
+            session_secs: online.then_some(15_120 - seed as i64 * 2_640),
         }
     }
 
@@ -2341,63 +2730,118 @@ priority = 0
             forced: None,
             providers: Vec::new(),
             version: update::current_version().to_string(),
-            started_at: Some(Utc::now() - ChronoDuration::hours(30)),
+            started_at: Some(fixture_clock() - ChronoDuration::hours(30)),
             active_adopted: false,
             kernel_route: Some("via 10.0.0.2 dev eth0 metric 0 proto static".into()),
             failback_pending: None,
         };
         let mut app = App::new(cfg, std::path::PathBuf::from("/etc/vlb/vlb.toml"), snapshot);
+        // Every duration on screen is measured from here, so the pictures
+        // come out byte-identical however long the test takes to run.
+        app.clock = Some(fixture_clock());
+        app.zone = chrono::FixedOffset::east_opt(0);
         app.clients = vec![
-            client("192.168.8.24", Some("denis-pc"), true, 3_650_722_201, 0),
-            client("192.168.8.31", Some("kitchen-tv"), true, 812_000_000, 2),
-            client("192.168.8.12", None, true, 41_000_000, 0),
-            client("192.168.8.57", Some("iphone-anna"), false, 220_500_000, 5),
+            client("192.168.8.24", Some("denis-pc"), true, 3_650_722_201, 0, 0),
+            client("192.168.8.31", Some("kitchen-tv"), true, 812_000_000, 2, 1),
+            client("192.168.8.12", None, true, 41_000_000, 0, 2),
+            client(
+                "192.168.8.57",
+                Some("iphone-anna"),
+                false,
+                220_500_000,
+                5,
+                3,
+            ),
+            client("192.168.8.9", Some("nas"), true, 1_284_000_000, 0, 4),
+            client("192.168.8.44", Some("work-laptop"), true, 96_400_000, 1, 5),
+            client("192.168.8.71", Some("printer"), false, 2_100_000, 3, 6),
         ];
         app.clients[2].mac = None;
         app.clients[1].label = Some("TV (living room)".into());
         app
     }
 
+    /// One client's detail, as a picture that does not contradict itself.
+    ///
+    /// It used to: a header that said "over the last 24h" above a chart
+    /// spanning 39 minutes, a stated peak the chart could not reach, an
+    /// availability figure that did not match the sessions listed under it,
+    /// and a gap of 12m18s between two timestamps 12m00s apart. Everything
+    /// below is derived from three durations and one byte total, so the
+    /// numbers cannot drift apart again.
     fn sample_detail() -> ClientDetail {
-        let now = Utc::now();
-        let samples = (0..40)
-            .map(|i| ClientTrafficPoint {
-                ts: now - ChronoDuration::minutes(40 - i),
-                rx_bps: 400_000.0 + (i as f64 * 37.0 % 900_000.0),
-                tx_bps: 60_000.0 + (i as f64 * 91.0 % 120_000.0),
+        const CURRENT: i64 = 15_120; // 4h12m, still running
+        const GAP: i64 = 738; // 12m18s away
+        const PREVIOUS: i64 = 16_560; // 4h36m
+        const WINDOW: i64 = 24 * 3600;
+        let connected = CURRENT + PREVIOUS;
+
+        let end = fixture_clock();
+        let mut c = client("192.168.8.24", Some("denis-pc"), true, 3_650_722_201, 2, 0);
+        c.online_secs = CURRENT;
+        c.session_secs = Some(CURRENT);
+        let rx_total = c.rx_bytes;
+        let tx_total = c.tx_bytes;
+
+        // 15-minute buckets across the whole window, carrying traffic only
+        // while the host was actually connected.
+        let samples: Vec<ClientTrafficPoint> = (0..96)
+            .map(|i| {
+                let ago = (95 - i) as f64 * 900.0;
+                let live = ago <= CURRENT as f64
+                    || (ago >= (CURRENT + GAP) as f64 && ago <= (CURRENT + GAP + PREVIOUS) as f64);
+                ClientTrafficPoint {
+                    ts: end - ChronoDuration::seconds(ago as i64),
+                    rx_bps: if live {
+                        (760_000 + wave(i, 17, 3_900_000) + wave(i, 6, 540_000)) as f64
+                    } else {
+                        0.0
+                    },
+                    tx_bps: if live {
+                        (74_000 + wave(i + 3, 23, 430_000) + wave(i, 9, 60_000)) as f64
+                    } else {
+                        0.0
+                    },
+                }
             })
             .collect();
+
+        let peak_rx_bps = samples.iter().map(|s| s.rx_bps).fold(0.0, f64::max);
+        let peak_tx_bps = samples.iter().map(|s| s.tx_bps).fold(0.0, f64::max);
+
+        // The sessions account for every byte the header claims.
+        let prev_rx = rx_total * PREVIOUS / connected;
+        let prev_tx = tx_total * PREVIOUS / connected;
         ClientDetail {
-            client: client("192.168.8.24", Some("denis-pc"), true, 3_650_722_201, 2),
+            client: c,
             window_hours: 24,
             samples,
             sessions: vec![
                 ClientSessionInfo {
-                    started_at: now - ChronoDuration::hours(4) - ChronoDuration::minutes(12),
+                    started_at: end - ChronoDuration::seconds(CURRENT),
                     ended_at: None,
-                    duration_secs: 15_120,
-                    gap_before_secs: Some(738),
-                    rx_bytes: 3_100_000_000,
-                    tx_bytes: 190_000_000,
+                    duration_secs: CURRENT,
+                    gap_before_secs: Some(GAP),
+                    rx_bytes: rx_total - prev_rx,
+                    tx_bytes: tx_total - prev_tx,
                 },
                 ClientSessionInfo {
-                    started_at: now - ChronoDuration::hours(9),
-                    ended_at: Some(now - ChronoDuration::hours(4) - ChronoDuration::minutes(24)),
-                    duration_secs: 16_560,
+                    started_at: end - ChronoDuration::seconds(CURRENT + GAP + PREVIOUS),
+                    ended_at: Some(end - ChronoDuration::seconds(CURRENT + GAP)),
+                    duration_secs: PREVIOUS,
                     gap_before_secs: Some(120),
-                    rx_bytes: 480_000_000,
-                    tx_bytes: 18_000_000,
+                    rx_bytes: prev_rx,
+                    tx_bytes: prev_tx,
                 },
             ],
-            peak_rx_bps: 5_200_000.0,
-            peak_tx_bps: 640_000.0,
-            avg_rx_bps: 241_450.0,
-            avg_tx_bps: 30_100.0,
-            longest_session_secs: 16_560,
-            availability_pct: 62.5,
+            peak_rx_bps,
+            peak_tx_bps,
+            avg_rx_bps: rx_total as f64 / connected as f64,
+            avg_tx_bps: tx_total as f64 / connected as f64,
+            longest_session_secs: PREVIOUS,
+            availability_pct: 100.0 * connected as f64 / WINDOW as f64,
         }
     }
-
     fn dashboard_app(
         providers: Vec<ProviderSnapshot>,
         active: &str,
@@ -2419,30 +2863,37 @@ priority = 0
         app.events = events;
         app.selected = 0;
 
-        let now = Utc::now();
+        let now = fixture_clock();
         app.system = (0..60)
-            .map(|i| SystemPointWire {
-                ts: (now - ChronoDuration::seconds(60 - i)).to_rfc3339(),
-                sample: crate::sysmon::SysSample {
-                    cpu_total: 6.0 + ((i * 7) % 23) as f32,
-                    cpu_per_core: (0..4)
-                        .map(|c| 4.0 + ((i * 3 + c * 11) % 31) as f32)
-                        .collect(),
-                    mem_total: 2 * 1024 * 1024 * 1024,
-                    mem_used: 412 * 1024 * 1024,
-                    mem_available: 1_600 * 1024 * 1024,
-                    swap_total: 1024 * 1024 * 1024,
-                    swap_used: 0,
-                    load1: 0.18,
-                    load5: 0.22,
-                    load15: 0.20,
-                    net_rx_bytes: 4_812_000_000,
-                    net_tx_bytes: 812_000_000,
-                    disk_total: 40 * 1024 * 1024 * 1024,
-                    disk_used: 9 * 1024 * 1024 * 1024,
-                    uptime_s: 1_209_600,
-                    procs: 128,
-                },
+            .map(|i| {
+                // The headline figure is the mean of the cores, because that
+                // is what it is. It used to be an unrelated sawtooth, so the
+                // picture showed "CPU 28.0%" above four cores averaging 19.
+                let cores: Vec<f32> = (0..4)
+                    .map(|c| 4.0 + ((i * 3 + c * 11) % 31) as f32)
+                    .collect();
+                let total = cores.iter().sum::<f32>() / cores.len() as f32;
+                SystemPointWire {
+                    ts: (now - ChronoDuration::seconds(60 - i)).to_rfc3339(),
+                    sample: crate::sysmon::SysSample {
+                        cpu_total: total,
+                        cpu_per_core: cores,
+                        mem_total: 2 * 1024 * 1024 * 1024,
+                        mem_used: 412 * 1024 * 1024,
+                        mem_available: 1_600 * 1024 * 1024,
+                        swap_total: 1024 * 1024 * 1024,
+                        swap_used: 0,
+                        load1: 0.18,
+                        load5: 0.22,
+                        load15: 0.20,
+                        net_rx_bytes: 4_812_000_000,
+                        net_tx_bytes: 812_000_000,
+                        disk_total: 40 * 1024 * 1024 * 1024,
+                        disk_used: 9 * 1024 * 1024 * 1024,
+                        uptime_s: 1_209_600,
+                        procs: 128,
+                    },
+                }
             })
             .collect();
 
@@ -2452,14 +2903,19 @@ priority = 0
                 .map(|i| TrafficPointWire {
                     ts: (now - ChronoDuration::seconds(90 - i)).to_rfc3339(),
                     interval_s: 2.0,
+                    // The moduli here never wrapped — i tops out at 90, so
+                    // `(i * 137) % 700_000` was just `i * 137` and the chart
+                    // in the README's headline picture came out a flat line.
+                    // Two triangles of different period give it the shape
+                    // real traffic has, without leaving the integers.
                     rx_bytes: if carrying {
-                        900_000 + ((i * 137) % 700_000) as u64
+                        (620_000 + wave(i, 29, 900_000) + wave(i, 13, 240_000)) as u64
                     } else {
-                        1_200 + ((i * 7) % 900) as u64
+                        (1_400 + wave(i, 7, 900)) as u64
                     },
                     rx_packets: 900,
                     tx_bytes: if carrying {
-                        120_000 + ((i * 31) % 60_000) as u64
+                        (96_000 + wave(i + 5, 37, 130_000) + wave(i, 11, 34_000)) as u64
                     } else {
                         400
                     },
@@ -2478,13 +2934,22 @@ priority = 0
     /// `VLB_SHOTS=1 cargo test --bin vlb tui::tests::render_readme_assets`.
     #[test]
     fn render_readme_assets() {
-        if std::env::var("VLB_SHOTS").is_err() {
-            return;
-        }
         use crate::balancer::FailureLayer;
-        let now = Utc::now();
+        // One timeline, told over five frames.
+        //
+        // Each event is stamped once, at the moment it happens, and every
+        // frame is drawn at its own instant on the same clock. Ageing the
+        // events instead — the same switchover written as "1s ago", then
+        // "22s ago", then "52s ago" — printed a past event at three
+        // different wall-clock times while nothing else on the screen moved.
+        let now = fixture_clock();
+        let at = |app: App, secs: i64| -> App {
+            let mut a = app;
+            a.clock = Some(now + ChronoDuration::seconds(secs));
+            a
+        };
         let ev = |secs: i64, from: Option<&str>, to: &str, reason: &str| FailoverEventWire {
-            ts: (now - ChronoDuration::seconds(secs)).to_rfc3339(),
+            ts: (now + ChronoDuration::seconds(secs)).to_rfc3339(),
             from: from.map(String::from),
             to: to.into(),
             reason: reason.into(),
@@ -2509,7 +2974,7 @@ priority = 0
                     1,
                     State::Up,
                     14.2,
-                    91_000,
+                    412_800,
                     None,
                     None,
                 ),
@@ -2519,7 +2984,7 @@ priority = 0
                     2,
                     State::Up,
                     21.9,
-                    91_000,
+                    1_425_600,
                     None,
                     None,
                 ),
@@ -2546,40 +3011,53 @@ priority = 0
         };
 
         let settled = ev(
-            3_600,
+            -3_600,
             Some("isp-backup"),
             "isp-main",
             "failback to higher-priority 'isp-main'",
         );
+        let switched = ev(
+            31,
+            Some("isp-main"),
+            "isp-second",
+            "'isp-main' is down — switching to healthy 'isp-second' (priority 1)",
+        );
+        let failed_back = ev(
+            82,
+            Some("isp-second"),
+            "isp-main",
+            "failback to higher-priority 'isp-main' (priority 0 < 1), healthy for 30s",
+        );
         let frames = vec![
             svg_group(
-                &dashboard_app(healthy(), "isp-main", vec![settled.clone()], None),
+                &at(
+                    dashboard_app(healthy(), "isp-main", vec![settled.clone()], None),
+                    0,
+                ),
                 120,
                 34,
                 View::Dashboard,
                 "f0",
             ),
             svg_group(
-                &dashboard_app(intercepted.clone(), "isp-main", vec![settled.clone()], None),
+                &at(
+                    dashboard_app(intercepted.clone(), "isp-main", vec![settled.clone()], None),
+                    30,
+                ),
                 120,
                 34,
                 View::Dashboard,
                 "f1",
             ),
             svg_group(
-                &dashboard_app(
-                    intercepted,
-                    "isp-second",
-                    vec![
-                        ev(
-                            1,
-                            Some("isp-main"),
-                            "isp-second",
-                            "'isp-main' is down — switching to healthy 'isp-second' (priority 1)",
-                        ),
-                        settled.clone(),
-                    ],
-                    None,
+                &at(
+                    dashboard_app(
+                        intercepted,
+                        "isp-second",
+                        vec![switched.clone(), settled.clone()],
+                        None,
+                    ),
+                    31,
                 ),
                 120,
                 34,
@@ -2587,23 +3065,18 @@ priority = 0
                 "f2",
             ),
             svg_group(
-                &dashboard_app(
-                    recovering,
-                    "isp-second",
-                    vec![
-                        ev(
-                            22,
-                            Some("isp-main"),
-                            "isp-second",
-                            "'isp-main' is down — switching to healthy 'isp-second' (priority 1)",
-                        ),
-                        settled.clone(),
-                    ],
-                    Some(FailbackPending {
-                        candidate: "isp-main".into(),
-                        stable_for_secs: 8,
-                        required_secs: 30,
-                    }),
+                &at(
+                    dashboard_app(
+                        recovering,
+                        "isp-second",
+                        vec![switched.clone(), settled.clone()],
+                        Some(FailbackPending {
+                            candidate: "isp-main".into(),
+                            stable_for_secs: 22,
+                            required_secs: 30,
+                        }),
+                    ),
+                    53,
                 ),
                 120,
                 34,
@@ -2611,25 +3084,14 @@ priority = 0
                 "f3",
             ),
             svg_group(
-                &dashboard_app(
-                    healthy(),
-                    "isp-main",
-                    vec![
-                        ev(
-                            1,
-                            Some("isp-second"),
-                            "isp-main",
-                            "failback to higher-priority 'isp-main' (priority 0 < 1), healthy for 30s",
-                        ),
-                        ev(
-                            52,
-                            Some("isp-main"),
-                            "isp-second",
-                            "'isp-main' is down — switching to healthy 'isp-second' (priority 1)",
-                        ),
-                        settled,
-                    ],
-                    None,
+                &at(
+                    dashboard_app(
+                        healthy(),
+                        "isp-main",
+                        vec![failed_back, switched, settled],
+                        None,
+                    ),
+                    82,
                 ),
                 120,
                 34,
@@ -2637,16 +3099,35 @@ priority = 0
                 "f4",
             ),
         ];
-        write_asset("failover.svg", &frames, 120, 34, 2.2);
-        write_asset("tui-dashboard.svg", &frames[0..1], 120, 34, 1.0);
+        write_asset(
+            "failover.svg",
+            "The vlb dashboard through a failover: the primary uplink is caught \
+serving somebody else's bytes, traffic moves to the second uplink, the primary \
+recovers, and the route returns only once it has proven itself.",
+            &frames,
+            120,
+            34,
+            2.2,
+        );
+        write_asset(
+            "tui-dashboard.svg",
+            "The vlb dashboard: the gateway panel, host metrics, the provider \
+table with per-layer health, recent switchovers and the traffic chart.",
+            &frames[0..1],
+            120,
+            34,
+            1.0,
+        );
 
         // ── the client screens ─────────────────────────────────────────
         let app = sample_app();
         write_asset(
             "tui-clients.svg",
-            &[svg_group(&app, 132, 16, View::Clients, "f0")],
+            "The vlb client list: every host behind the gateway with its live \
+rates, totals, time online and drop count.",
+            &[svg_group(&app, 132, 19, View::Clients, "f0")],
             132,
-            16,
+            19,
             1.0,
         );
 
@@ -2654,6 +3135,8 @@ priority = 0
         detail_app.client_detail = Some(Box::new(sample_detail()));
         write_asset(
             "tui-client-detail.svg",
+            "One client in detail: its connections, the gaps between them, and \
+its average and peak rates.",
             &[svg_group(&detail_app, 132, 26, View::ClientDetail, "f0")],
             132,
             26,
@@ -2661,6 +3144,8 @@ priority = 0
         );
         write_asset(
             "clients.svg",
+            "The vlb client list, then one client in detail: its connections, \
+the gaps between them, and its average and peak rates.",
             &[
                 svg_group(&app, 132, 26, View::Clients, "f0"),
                 svg_group(&detail_app, 132, 26, View::ClientDetail, "f1"),
@@ -2668,6 +3153,71 @@ priority = 0
             132,
             26,
             3.5,
+        );
+    }
+
+    /// The dashboard is the screen an operator watches during an outage, and
+    /// the picture at the top of the README. Nothing rendered it as text
+    /// until this test, so every column width in it was unverified — and one
+    /// of them was wrong: the table asked for 128 columns inside a panel 118
+    /// wide, and the deficit came out of the provider names.
+    #[test]
+    fn dashboard_prints_provider_names_and_reasons_in_full() {
+        use crate::balancer::FailureLayer;
+        let providers = vec![
+            provider(
+                "isp-main",
+                "203.0.113.254",
+                0,
+                State::Down,
+                10.7,
+                91_000,
+                // The longest label the "why" column can be asked to hold.
+                Some(FailureLayer::ContentUnreachable),
+                Some("no canary target answered"),
+            ),
+            provider(
+                "isp-second",
+                "198.51.100.1",
+                1,
+                State::Up,
+                14.2,
+                412_800,
+                None,
+                None,
+            ),
+            provider(
+                "isp-backup",
+                "192.0.2.1",
+                2,
+                State::Up,
+                21.9,
+                1_425_600,
+                None,
+                None,
+            ),
+        ];
+        let app = dashboard_app(providers, "isp-second", vec![], None);
+        let out = render(&app, 120, 34, View::Dashboard);
+
+        for name in ["isp-main", "isp-second", "isp-backup"] {
+            assert!(out.contains(name), "provider name {name} was cut:\n{out}");
+        }
+        assert!(
+            out.contains("content-unreachable"),
+            "the failure layer was cut, which is the one thing the column is for:\n{out}"
+        );
+        assert!(
+            out.contains("203.0.113.254"),
+            "a gateway address was cut:\n{out}"
+        );
+        // The footer draws two lines; a three-row bordered block only ever
+        // showed the first, which is where the keys are and where the
+        // failure explanation is not.
+        assert!(out.contains("q quit"), "the key hints went missing:\n{out}");
+        assert!(
+            out.contains("no canary target answered"),
+            "the failure detail never reached the footer:\n{out}"
         );
     }
 
@@ -2681,14 +3231,14 @@ priority = 0
         assert!(out.contains("denis-pc"), "{out}");
         assert!(out.contains("192.168.8.24"), "{out}");
         assert!(
-            out.contains("a4:5e:60:11:22:33"),
+            out.contains("a4:5e:60:11:2c:9e"),
             "mac on a wide terminal\n{out}"
         );
         // The operator's own label wins over the DHCP hostname.
         assert!(out.contains("TV (living room)"), "{out}");
         // A host that never announced a name is not blank, it is "—".
         assert!(out.contains('—'), "{out}");
-        assert!(out.contains("3 of 4 hosts connected"), "{out}");
+        assert!(out.contains("5 of 7 hosts connected"), "{out}");
         assert!(out.contains("3.40 GiB"), "totals in binary units\n{out}");
         assert!(out.contains("Mbit/s"), "live rates in bits\n{out}");
         assert!(out.contains("window 24h"), "{out}");
@@ -2704,7 +3254,7 @@ priority = 0
 
         let medium = render(&app, 110, 16, View::Clients);
         assert!(
-            !medium.contains("a4:5e:60:11:22:33"),
+            !medium.contains("a4:5e:60:11:2c:9e"),
             "no room for MACs\n{medium}"
         );
         assert!(medium.contains("Mbit/s"), "live rates still fit\n{medium}");
@@ -2730,24 +3280,24 @@ priority = 0
     #[test]
     fn wide_terminals_show_addresses_in_full() {
         let app = sample_app();
-        let out = render(&app, 132, 16, View::Clients);
-        assert!(out.contains("a4:5e:60:11:22:33"), "{out}");
+        let out = render(&app, 132, 19, View::Clients);
+        assert!(out.contains("a4:5e:60:11:2c:9e"), "{out}");
         assert!(out.contains("192.168.8.24"), "{out}");
-        assert!(out.contains("435.20 MiB"), "{out}");
+        assert!(out.contains("3.40 GiB"), "{out}");
     }
 
     #[test]
     fn client_detail_shows_sessions_gaps_and_averages() {
         let mut app = sample_app();
         app.client_detail = Some(Box::new(sample_detail()));
-        let out = render(&app, 130, 26, View::ClientDetail);
+        let out = render(&app, 132, 26, View::ClientDetail);
 
         assert!(out.contains("denis-pc"), "{out}");
         assert!(out.contains("connected for"), "{out}");
         assert!(out.contains("average"), "{out}");
         assert!(out.contains("peak"), "{out}");
         assert!(out.contains("drops 2"), "{out}");
-        assert!(out.contains("62.5%"), "availability\n{out}");
+        assert!(out.contains("36.7%"), "availability\n{out}");
         // The gap between connections is the point of the table.
         assert!(out.contains("away before"), "{out}");
         assert!(out.contains("12m18s"), "a 738-second gap\n{out}");
