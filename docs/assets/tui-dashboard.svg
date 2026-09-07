@@ -2,7 +2,7 @@
 <title id="vlb-title">The vlb dashboard: the gateway panel, host metrics, the provider table with per-layer health, recent switchovers and the traffic chart.</title>
 <rect width="100%" height="100%" rx="8" fill="#0d1117"/>
 <g class="f0">
-<text xml:space="preserve" x="0.0" y="12.6" textLength="960.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">┌ gateway · daemon v0.5.0 up 1d 6h00m · tui v0.5.0 ────────────────────────────────────────────────────────────────────┐</text>
+<text xml:space="preserve" x="0.0" y="12.6" textLength="960.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">┌ gateway · daemon v0.5.1 up 1d 6h00m · tui v0.5.1 ────────────────────────────────────────────────────────────────────┐</text>
 <text xml:space="preserve" x="0.0" y="29.6" textLength="8.0" lengthAdjust="spacingAndGlyphs" fill="#c9d1d9">│</text>
 <text xml:space="preserve" x="8.0" y="29.6" textLength="48.0" lengthAdjust="spacingAndGlyphs" fill="#8b949e">active</text>
 <text xml:space="preserve" x="64.0" y="29.6" textLength="64.0" lengthAdjust="spacingAndGlyphs" fill="#3fb950" font-weight="bold">isp-main</text>
