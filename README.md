@@ -1,7 +1,7 @@
 # vlb — Virtual Load Balancer
 
 <p align="center">
-  <img src="docs/assets/logo.png" alt="vlb logo" width="220" />
+  <img src="docs/assets/logo.svg" alt="vlb — the direct uplink is broken, and the route steps over the break and carries on" width="240" />
 </p>
 
 <!--

@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 246 72" width="246" height="72" role="img" aria-labelledby="vlbTitle vlbDesc">
+  <title id="vlbTitle">vlb</title>
+  <desc id="vlbDesc">The direct uplink is broken, drawn as a dashed grey line; the route steps up and over the break in one unbroken green stroke and carries on. Beside it, the lowercase letters v, l and b, with the l given a tail so it cannot be read as a capital I.</desc>
+  <style>
+    .live { stroke: #2ea043 }
+    .dead { stroke: #9099a4 }
+    .word { stroke: #1f6feb }
+    @media (prefers-color-scheme: dark) {
+      .live { stroke: #3fb950 }
+      .dead { stroke: #6e7681 }
+      .word { stroke: #58a6ff }
+    }
+  </style>
+
+  <g fill="none" stroke-width="10" stroke-linecap="round" stroke-linejoin="round">
+    <!-- the uplink that stopped working -->
+    <path class="dead" d="M31 54H69" stroke-dasharray="0.1 12.6"/>
+    <!-- the route that carries the traffic over it, in one unbroken stroke -->
+    <path class="live" d="M8 54h20l12-32h20l12 32h20"/>
+  </g>
+
+  <g class="word" fill="none" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"
+     transform="translate(122 4)">
+    <!-- v: two uplinks converging on one junction, the live one picked out -->
+    <path d="M11 26L28 56" stroke="#2ea043"/>
+    <path d="M45 26L28 56"/>
+    <!-- l: a quarter-round tail, so it is never a capital I -->
+    <path d="M61 8L61 44C61 50.6 66.4 56 73 56"/>
+    <!-- b: stem, then the bowl -->
+    <path d="M89 8L89 56M89 26C101.2 26 111 32.7 111 41C111 49.3 101.2 56 89 56"/>
+  </g>
+</svg>
