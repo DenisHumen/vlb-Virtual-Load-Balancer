@@ -28,6 +28,8 @@ mod clients;
 mod health;
 #[path = "net/http.rs"]
 mod http;
+#[path = "net/pin.rs"]
+mod pin;
 #[path = "net/router.rs"]
 mod router;
 #[path = "net/system.rs"]

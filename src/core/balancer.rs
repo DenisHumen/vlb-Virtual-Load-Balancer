@@ -1252,6 +1252,18 @@ impl Balancer {
                 ),
             }
             let _ = self.stats.record_state_change(name, new.as_str());
+
+            // A provider that has just died takes its pinned connections with
+            // it. Fire on the transition, not on every tick, so a flapping
+            // uplink cannot turn this into a storm — and on *any* provider,
+            // active or not, because pinning is precisely what leaves live
+            // flows on one that is not carrying the default route.
+            if new == State::Down
+                && self.cfg.routing.pin_connections
+                && let Some(p) = self.cfg.providers.iter().find(|p| p.name == name)
+            {
+                self.evict_pinned(p).await;
+            }
         }
     }
 
@@ -1337,11 +1349,25 @@ impl Balancer {
 
         match decision {
             Decision::Keep => {
+                // What the kernel is forwarding on right now, read before
+                // anything in this arm touches it. The two installs below can
+                // both fire in one pass, so a read-back taken later would be
+                // comparing against this arm's own work.
+                let route_before = self.router.current_default().await.ok().flatten();
                 // An adopted incumbent that has now passed its checks is,
                 // from here on, simply ours. Assert the route once so it
                 // carries our metric/proto and any rival at metric 0 is
                 // removed — `replace` on an identical route changes nothing
                 // the kernel forwards on, so no flush is needed or done.
+                // Keep the pinning chain pointed at whoever is actually
+                // active, including on the pass that merely confirms it. A
+                // daemon that adopted a working route never takes the Switch
+                // arm, so without this the chain would never be installed at
+                // all on the commonest startup there is.
+                if let Some(cur) = current.as_ref().and_then(|c| by_name.get(c)) {
+                    self.repin(cur).await;
+                }
+
                 let verifying = self.active_adopted.swap(false, Ordering::SeqCst);
                 if verifying && let Some(cur) = current.as_ref().and_then(|c| by_name.get(c)) {
                     self.router
@@ -1362,9 +1388,23 @@ impl Balancer {
                         self.router
                             .set_default_route(cur.gateway, &cur.interface)
                             .await?;
-                        self.router.flush_conntrack().await;
+                        // Only if the path really moved.
+                        //
+                        // Pinning the provider that is already active, or
+                        // releasing a pin that pointed at it, re-asserts an
+                        // identical route — and used to reset every forwarded
+                        // connection on the box while doing it. An operator
+                        // command that changes nothing should cost nothing.
+                        let moved = !matches!(
+                            route_before,
+                            Some(ref r) if r.gateway == cur.gateway && r.interface == cur.interface
+                        );
+                        if moved {
+                            self.router.flush_conntrack().await;
+                        }
                         info!(
                             provider = %cur.name,
+                            moved,
                             "{}: re-asserted default route (operator request)",
                             "FORCE".bright_magenta().bold()
                         );
@@ -1432,6 +1472,13 @@ impl Balancer {
                     Ok(Some(ref r)) if r.gateway == target.gateway && r.interface == target.interface
                 );
 
+                // Aim new connections at the new provider *before* the
+                // route moves. The other order leaves a window in which a
+                // connection is born on the outgoing provider and then
+                // re-pinned to the incoming one on its next packet, which is
+                // precisely the mid-connection path change that kills it.
+                self.repin(target).await;
+
                 self.router
                     .set_default_route(target.gateway, &target.interface)
                     .await?;
@@ -1440,12 +1487,24 @@ impl Balancer {
                     debug!(
                         provider = %to,
                         "selected provider already owns the default route — \
-                         skipping the conntrack flush"
+                         nothing to reset"
+                    );
+                } else if self.cfg.routing.pin_connections {
+                    // Established flows stay where they are: each carries its
+                    // own provider's mark and is routed by that, not by the
+                    // default route that just moved. The ones that cannot
+                    // survive are the ones whose provider died, and those are
+                    // evicted by mark when it is marked down — not here, and
+                    // not everybody else's along with them.
+                    info!(
+                        provider = %to,
+                        "connections already running are staying on the provider they \
+                         started on; only new ones follow the new route"
                     );
                 } else {
                     // A real path change: existing flows are bound to the old
                     // uplink's NAT state and would black-hole until they time
-                    // out. Reset them so they reconnect immediately.
+                    // out. Drop their state so they fail fast instead.
                     self.router.flush_conntrack().await;
                 }
 
@@ -1582,13 +1641,19 @@ impl Balancer {
                     {
                         error!(error = %e, "route watchdog failed to re-install the default route");
                     } else {
-                        // Traffic has been leaving through somebody else's
-                        // choice of uplink for up to one watchdog period, so
-                        // conntrack now holds entries bound to the wrong
-                        // path. Without a flush those flows stay broken until
-                        // they time out — the same reason a normal switchover
-                        // flushes.
-                        self.router.flush_conntrack().await;
+                        // Flush only if our route was actually gone.
+                        //
+                        // Traffic that left through somebody else's choice of
+                        // uplink is bound to the wrong path and has to be
+                        // reset. But this arm also fires when our route is
+                        // present and a rival merely sits beside it at the
+                        // same metric: the kernel may well have been using
+                        // ours the whole time, and resetting every connection
+                        // on the strength of a tie nobody can observe is a
+                        // worse trade than leaving them alone.
+                        if !ours_present {
+                            self.router.flush_conntrack().await;
+                        }
                         let _ = self.stats.record_failover(&FailoverRecord {
                             timestamp: Utc::now(),
                             from_provider: Some(expected.name.clone()),
@@ -1714,6 +1779,50 @@ impl Balancer {
         }
         println!("{}", format!("└{divider}┘").bright_blue());
         println!();
+    }
+
+    /// Point the pinning chain at a provider, so connections opened from now
+    /// on are stamped with its mark.
+    ///
+    /// A no-op when pinning is off. A failure here is logged rather than
+    /// fatal: `iptables-restore` rolls a rejected batch back, so the previous
+    /// mark is still in force and the worst case is that new connections keep
+    /// going out of the provider we are leaving — which is where they would
+    /// have gone anyway a moment ago.
+    async fn repin(&self, target: &Provider) {
+        if !self.cfg.routing.pin_connections {
+            return;
+        }
+        let mark = self.cfg.mark_for(target);
+        if let Err(e) = crate::pin::install(&self.cfg, mark).await {
+            warn!(
+                provider = %target.name,
+                error = %e,
+                "could not re-aim the connection-pinning chain; new connections will                  keep using the previous provider until this succeeds"
+            );
+        }
+    }
+
+    /// Forget the connections pinned to a provider that has gone down.
+    ///
+    /// Without this, pinning is worse than not pinning: the dead provider's
+    /// table still resolves `default via <dead gateway>`, so its flows are not
+    /// misrouted, they are swallowed — and `nf_conntrack_tcp_timeout_
+    /// established` is five days. Evicting them by mark is what turns a
+    /// black hole into a fast failure, and it touches nobody else's.
+    async fn evict_pinned(&self, p: &Provider) {
+        if !self.cfg.routing.pin_connections {
+            return;
+        }
+        let mark = self.cfg.mark_for(p);
+        info!(
+            provider = %p.name,
+            mark = format!("{mark:#x}"),
+            "dropping the connections pinned to this provider so they fail fast              instead of waiting out a five-day timeout"
+        );
+        self.router
+            .flush_mark(mark, self.cfg.routing.fwmark_mask)
+            .await;
     }
 
     pub async fn shutdown(&self) {

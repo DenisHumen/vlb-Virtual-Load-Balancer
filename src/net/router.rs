@@ -222,25 +222,81 @@ impl Router {
         Ok(parse_all_defaults(&String::from_utf8_lossy(&out.stdout)))
     }
 
-    /// Drop conntrack state after a failover so existing flows reset
-    /// immediately and reconnect through the new provider instead of
-    /// black-holing until TCP timeout.
+    /// Forget every connection the kernel is tracking.
     ///
-    /// We use a single-armed NAT topology where every provider's egress
-    /// shares the gateway machine's own source IP, so there's no
-    /// `-s <old>` filter to scope the flush — a full flush is right.
+    /// After the default route moves, the flows that were using the old
+    /// uplink are bound to a path that no longer carries them. Dropping their
+    /// state does not reset them — deleting a conntrack entry emits neither
+    /// an RST nor an ICMP error — but it stops the kernel treating their
+    /// packets as an established flow, so the next one is either NATed afresh
+    /// down the new path or refused outright, instead of being sent somewhere
+    /// that will silently discard it until the application's own timeout.
+    ///
+    /// This is a blunt instrument: single-armed NAT means every provider's
+    /// egress leaves with the gateway's own address, so there is no `-s` to
+    /// scope it by, and every connection on the box goes — including ones
+    /// that were not using the provider being left. [`Self::flush_mark`]
+    /// scopes it properly once connections carry a per-provider mark.
     pub async fn flush_conntrack(&self) {
         if self.dry_run {
             return;
         }
-        // `conntrack` may be missing on minimal systems — ignore errors.
-        let _ = Command::new("conntrack")
-            .args(["-F"])
+        self.run_conntrack(&["-F"], "flush all connection tracking")
+            .await;
+    }
+
+    /// Forget only the connections carrying one provider's mark.
+    ///
+    /// `conntrack -D -m <mark>/<mask>` filters on the connection mark rather
+    /// than on addresses, which is exactly the scope a full flush lacks: the
+    /// flows of the provider that just died go, and everyone else's stay.
+    pub async fn flush_mark(&self, mark: u32, mask: u32) {
+        if self.dry_run {
+            return;
+        }
+        let filter = format!("{mark:#x}/{mask:#x}");
+        self.run_conntrack(
+            &["-D", "-m", &filter],
+            "drop the connections pinned to one provider",
+        )
+        .await;
+    }
+
+    /// `conntrack` is an optional dependency, and until now its absence and
+    /// its failures were both discarded. Neither is fatal — but an operator
+    /// whose flows are not being dropped should be able to find out why.
+    async fn run_conntrack(&self, args: &[&str], what: &str) {
+        match Command::new("conntrack")
+            .args(args)
             .kill_on_drop(true)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await;
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await
+        {
+            Ok(out) if out.status.success() => {}
+            // `-D` with nothing to delete exits 1. That is the normal case on
+            // a quiet link, not a failure.
+            Ok(out) if out.status.code() == Some(1) => {
+                debug!(what, "conntrack matched nothing");
+            }
+            Ok(out) => {
+                debug!(
+                    what,
+                    status = ?out.status.code(),
+                    stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                    "conntrack did not succeed"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    what,
+                    error = %e,
+                    "could not run conntrack — connections on a provider that has \
+                     gone away will hang until they time out rather than failing fast"
+                );
+            }
+        }
     }
 }
 

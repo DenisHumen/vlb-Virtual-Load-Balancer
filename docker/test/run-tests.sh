@@ -644,7 +644,7 @@ scenario_restart() {
     # The daemon logs whether it skipped the flush. That line is the actual
     # assertion -- conntrack counts on a near-idle lab are too noisy to
     # compare directly.
-    if daemon_log_has "skipping the conntrack flush"; then
+    if daemon_log_has "already owns the default route|nothing to reset"; then
         ok "recognised the route was already correct and skipped the flush"
     else
         # Not fatal on its own: with RUST_LOG=info the debug line is absent.
@@ -819,6 +819,88 @@ scenario_pin_survives_restart() {
 # to appear at boot, or one that was removed. Startup used to fail outright
 # on it, which took the *other* providers down with it: the daemon that
 # exists to survive one broken uplink would not start because of one.
+# The point of connection pinning, measured the way the operator feels it:
+# a transfer that is already running must not notice a failback.
+#
+# The lab reproduces the real topology exactly — each ISP masquerades to its
+# own transit address — so a flow that moves between them really is seen by
+# the origin as coming from a different host, which is what kills it in
+# production.
+scenario_pin_failback() {
+    info "pinning — a failback must not disturb a transfer that is already running"
+    reset_lab
+    if ! VLB_CONFIG=/etc/vlb/generated/vlb.pin.toml "${COMPOSE[@]}" up -d vlb >/dev/null 2>&1; then
+        bad "pin: could not bring the daemon up with pinning enabled"
+        return
+    fi
+    wait_until_stable isp-main 90 3 >/dev/null || {
+        bad "pin: no provider selected with pinning on (active = $(active_provider))"
+        note "$("${COMPOSE[@]}" logs --tail 30 vlb 2>&1)"
+        VLB_CONFIG=/etc/vlb/vlb.toml "${COMPOSE[@]}" up -d vlb >/dev/null 2>&1
+        return
+    }
+
+    if vlb_exec iptables -t mangle -S VLB_PIN 2>/dev/null | grep -q -- '--restore-mark'; then
+        ok "the pinning chain is installed"
+    else
+        bad "pin: no VLB_PIN chain in mangle"
+        note "$(vlb_exec iptables -t mangle -S 2>&1 | head -20)"
+    fi
+
+    # Drive the primary out, so the transfer below is born on the backup.
+    isp_mode isp1 expired
+    wait_for_active isp-backup 40 >/dev/null
+    [ "$(active_provider)" = "isp-backup" ] || {
+        bad "pin: setup failed, never moved to the backup"
+        VLB_CONFIG=/etc/vlb/vlb.toml "${COMPOSE[@]}" up -d vlb >/dev/null 2>&1
+        return
+    }
+
+    # A slow transfer, established through the backup and still running when
+    # the primary is reclaimed. 256 KiB at 4 kB/s is about a minute.
+    "${COMPOSE[@]}" exec -T -d client sh -c \
+        'rm -f /tmp/pin.out /tmp/pin.rc; \
+         curl -s --limit-rate 4k --max-time 180 -o /tmp/pin.out http://192.0.2.10/big.bin; \
+         echo $? > /tmp/pin.rc' >/dev/null 2>&1
+    sleep 6
+    local before
+    before=$("${COMPOSE[@]}" exec -T client sh -c 'wc -c < /tmp/pin.out' 2>/dev/null | tr -d " \r")
+    [ "${before:-0}" -gt 0 ] || { bad "pin: the transfer never started"; }
+
+    # Give the primary back. The route returns; the transfer must not.
+    isp_mode isp1 good
+    local t; t=$(wait_for_active isp-main 60)
+    [ "$(active_provider)" = "isp-main" ] \
+        && ok "failed back to the primary after ${t}s" \
+        || bad "pin: never failed back (${t}s)"
+
+    if daemon_log_has "staying on the provider they" 20; then
+        ok "the daemon said it was leaving running connections where they were"
+    else
+        bad "pin: no sign the switch spared established connections"
+    fi
+
+    # And the measurement that matters: did the bytes keep coming?
+    local rc="" waited=0
+    while [ "$waited" -lt 150 ]; do
+        rc=$("${COMPOSE[@]}" exec -T client sh -c 'cat /tmp/pin.rc 2>/dev/null' 2>/dev/null | tr -d " \r")
+        [ -n "$rc" ] && break
+        sleep 5; waited=$((waited + 5))
+    done
+    local got
+    got=$("${COMPOSE[@]}" exec -T client sh -c 'wc -c < /tmp/pin.out' 2>/dev/null | tr -d " \r")
+    if [ "$rc" = "0" ] && [ "${got:-0}" = "262144" ]; then
+        ok "the transfer survived the failback intact (${got} bytes)"
+    else
+        bad "pin: the transfer did not survive the failback (curl rc=${rc:-timeout}, ${got:-0} of 262144 bytes)"
+    fi
+
+    # Back to the standard config for the remaining scenarios.
+    VLB_CONFIG=/etc/vlb/vlb.toml "${COMPOSE[@]}" up -d vlb >/dev/null 2>&1
+    wait_until_stable isp-main 90 3 >/dev/null \
+        || bad "pin: the lab did not recover after restoring the standard config"
+}
+
 scenario_missing_interface() {
     info "a provider on an interface that does not exist — startup must carry on"
     reset_lab
@@ -1248,7 +1330,7 @@ scenario_probe_cli() {
 
 # ─────────────────────────────────────────────────────────────────────────
 
-SCENARIOS=(baseline priority_gap dead blackhole lossy dns_blocked expired canary_only throttled failback both_down restart restart_slow_primary restart_on_backup pin_survives_restart missing_interface clients watchdog netplan_fight missing_conntrack concurrent_force soak force probe_cli)
+SCENARIOS=(baseline priority_gap dead blackhole lossy dns_blocked expired canary_only throttled failback pin_failback both_down restart restart_slow_primary restart_on_backup pin_survives_restart missing_interface clients watchdog netplan_fight missing_conntrack concurrent_force soak force probe_cli)
 
 cleanup() {
     if [ "$KEEP" -eq 1 ]; then
@@ -1302,6 +1384,15 @@ priority = 5
 role = "backup"
 EOF
     } > generated/vlb.ghost.toml
+
+    # The same lab with connection pinning switched on. Injected into the
+    # existing [routing] table rather than appended, because a second
+    # [routing] header is a duplicate-table error in TOML.
+    awk '{ print }
+          /^[[:space:]]*rule_pref[[:space:]]*=/ { print "pin_connections = true" }' \
+        vlb.test.toml > generated/vlb.pin.toml
+    grep -q '^pin_connections = true' generated/vlb.pin.toml \
+        || { echo "could not build the pinning variant config" >&2; exit 1; }
 }
 generate_variant_configs
 

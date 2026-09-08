@@ -178,6 +178,38 @@ table_base  = 200
 fwmark_base = 0x200
 rule_pref   = 32000
 
+# Which bits of the packet mark are vlb's. Everything outside the mask is
+# left to whatever else marks packets on this box. Only change it if
+# something else here already owns the low 16 bits.
+fwmark_mask = 0xffff
+
+# ── Keep an established connection on the provider it started on ─────────
+#
+# Off by default, because it changes how every forwarded packet is routed.
+#
+# Without it, moving the default route moves every flow at once. That is
+# right for the flows of a provider that has died, and pure damage for
+# everything else: coming back to the primary after it recovers, pinning a
+# provider by hand, or the route watchdog tidying up after netplan all reset
+# every connection on the box. A switch that was good news arrives as a
+# dropped stream.
+#
+# With it, each forwarded connection is stamped on its first packet with the
+# mark of whichever provider was active then, and keeps being routed by that
+# stamp. New connections follow the current default; running ones stay where
+# they were born. A failback moves nothing that is already running.
+#
+# What it cannot do — and no setting here can — is keep a connection alive
+# when its own provider dies. Each next hop hides this gateway behind a
+# different public address, so the far end sees a stranger the moment traffic
+# leaves through another one. Those connections have to be remade; what this
+# changes is that they are dropped at once, by mark, rather than every other
+# connection being dropped with them. See "What survives a switch" in the
+# README for the only arrangement that does keep them alive.
+#
+# Needs `conntrack` installed: it is what evicts a dead provider's flows.
+pin_connections = false
+
 [firewall]
 manage = true
 disable_host_firewall = false

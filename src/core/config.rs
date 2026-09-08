@@ -699,6 +699,21 @@ pub struct RoutingConfig {
     pub fwmark_base: u32,
     #[serde(default = "default_rule_pref")]
     pub rule_pref: u32,
+    /// Which bits of the packet mark belong to vlb.
+    ///
+    /// `ip rule fwmark M` with no mask is an exact 32-bit comparison, so a
+    /// masked restore that leaves somebody else's high bits in place would
+    /// never match and the pin would be silently lost. Declaring the mask
+    /// here makes the rule `fwmark M/mask` and leaves the other bits to
+    /// whoever else is marking packets on this box.
+    #[serde(default = "default_fwmark_mask")]
+    pub fwmark_mask: u32,
+    /// Keep an established connection on the provider it started on.
+    ///
+    /// Off by default: it changes how every forwarded packet is routed, and
+    /// that is not a thing to switch on under an operator without asking.
+    #[serde(default)]
+    pub pin_connections: bool,
 }
 
 impl Default for RoutingConfig {
@@ -707,6 +722,8 @@ impl Default for RoutingConfig {
             table_base: default_table_base(),
             fwmark_base: default_fwmark_base(),
             rule_pref: default_rule_pref(),
+            fwmark_mask: default_fwmark_mask(),
+            pin_connections: false,
         }
     }
 }
@@ -719,6 +736,9 @@ fn default_fwmark_base() -> u32 {
 }
 fn default_rule_pref() -> u32 {
     32000
+}
+fn default_fwmark_mask() -> u32 {
+    0xffff
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1062,13 +1082,48 @@ impl Config {
                 "routing.rule_pref + max priority ({max_pref}) must be < 32766 (the main-table pref)"
             );
         }
-        // fwmark is an arbitrary 32-bit value; only ensure it's non-zero so
-        // it doesn't collide with "no mark" and stays in a safe range.
+        // The marks have to fit inside the mask, and the mask has to be
+        // wide enough to tell the providers apart.
+        //
+        // Neither is decorative. A mark of 0 matches every unmarked packet
+        // and would send all forwarded traffic into a table whose only entry
+        // is one provider's default route; a mark that does not fit the mask
+        // aliases two providers onto one table, and failover then stops
+        // discriminating while `ip rule list` still reads correctly.
         if self.routing.fwmark_base == 0 {
             bail!("routing.fwmark_base must not be 0");
         }
-        if self.routing.fwmark_base.checked_add(max_prio).is_none() {
-            bail!("routing.fwmark_base + max priority overflows u32");
+        if self.routing.fwmark_mask == 0 {
+            bail!("routing.fwmark_mask must not be 0");
+        }
+        let max_mark = match self.routing.fwmark_base.checked_add(max_prio) {
+            Some(m) => m,
+            None => bail!("routing.fwmark_base + max priority overflows u32"),
+        };
+        if max_mark & !self.routing.fwmark_mask != 0 {
+            bail!(
+                "routing.fwmark_base + max priority ({max_mark:#x}) has bits outside \
+                 routing.fwmark_mask ({:#x}); widen the mask or lower the base",
+                self.routing.fwmark_mask
+            );
+        }
+        if self.routing.fwmark_base & self.routing.fwmark_mask == 0 {
+            bail!(
+                "routing.fwmark_base ({:#x}) is zero once masked with \
+                 routing.fwmark_mask ({:#x}), which would match every unmarked packet",
+                self.routing.fwmark_base,
+                self.routing.fwmark_mask
+            );
+        }
+        // A pref of 0 is not a pref: `ip rule del pref 0` is read as "no
+        // priority filter", and the delete loop that tidies stale rules can
+        // then walk off onto the kernel's own `local` rule.
+        if self.routing.rule_pref < 100 {
+            bail!(
+                "routing.rule_pref ({}) must be at least 100 — the kernel's own rules \
+                 live below that",
+                self.routing.rule_pref
+            );
         }
 
         // Control server: empty listen is a config error; parse validated by
@@ -1501,8 +1556,14 @@ impl Config {
         self.routing.fwmark_base + p.priority
     }
 
-    /// `ip rule` pref value — unique per provider, in a range well above
-    /// the main table (32766) so we don't collide with kernel defaults.
+    /// The mark, and the bits of it that are ours, as `ip rule` and
+    /// iptables both want it.
+    pub fn mark_filter_for(&self, p: &Provider) -> String {
+        format!("{:#x}/{:#x}", self.mark_for(p), self.routing.fwmark_mask)
+    }
+
+    /// `ip rule` pref value — unique per provider, sitting below the main
+    /// table (32766) so a marked packet finds its provider's table first.
     pub fn rule_pref_for(&self, p: &Provider) -> u32 {
         self.routing.rule_pref + p.priority
     }

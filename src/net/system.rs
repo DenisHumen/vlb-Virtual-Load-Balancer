@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use std::process::Command as StdCommand;
 use tokio::process::Command;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::{Config, Provider};
 
@@ -87,11 +87,24 @@ pub const DEPENDENCIES: &[Dependency] = &[
 ///
 /// Returns the names of the missing optional ones so callers can report
 /// them; errors only when something genuinely essential is absent.
-pub async fn check_dependencies(firewall_managed: bool) -> Result<Vec<&'static str>> {
+pub async fn check_dependencies(
+    firewall_managed: bool,
+    pin_connections: bool,
+) -> Result<Vec<&'static str>> {
     let mut missing_optional = Vec::new();
     for dep in DEPENDENCIES {
         if which(dep.bin).await {
             continue;
+        }
+        // With pinning on, conntrack stops being a nicety. A flow pinned to a
+        // provider that has died is not misrouted, it is swallowed by that
+        // provider's own default route, and nothing but an eviction by mark
+        // will end it inside five days. Shipping that as best-effort would be
+        // dishonest.
+        if pin_connections && dep.bin == "conntrack" {
+            bail!(
+                "`conntrack` is not installed, and routing.pin_connections = true needs it:                  connections pinned to a provider that goes down are dropped by mark, and                  without conntrack they would hang for days instead. Install it with:                   apt-get install -y conntrack  — or set routing.pin_connections = false"
+            );
         }
         // iptables only matters if we are the ones installing rules.
         let matters = dep.required || dep.bin != "iptables" || firewall_managed;
@@ -128,7 +141,7 @@ pub async fn check_dependencies(firewall_managed: bool) -> Result<Vec<&'static s
 ///   - optionally stop ufw/firewalld (opt-in via config)
 pub async fn prepare(cfg: &Config) -> Result<Prepared> {
     info!("preparing host: sysctl, forwarding, NAT, policy routing");
-    check_dependencies(cfg.firewall.manage).await?;
+    check_dependencies(cfg.firewall.manage, cfg.routing.pin_connections).await?;
     tune_sysctl().await?;
 
     if cfg.firewall.manage {
@@ -142,6 +155,33 @@ pub async fn prepare(cfg: &Config) -> Result<Prepared> {
     }
 
     let policy_pending = setup_policy_routing(cfg).await;
+
+    // The provider tables hold one route each — their default — so once
+    // anything other than a probe is marked, they would answer for
+    // destinations `main` resolves specifically: the LAN, a VPN subnet, a
+    // management static. This rule declines to answer with a default, so
+    // those keep winning and only internet-bound traffic reaches a provider
+    // table. Installed whenever policy routing is, because the health probes
+    // are marked too.
+    if let Err(e) = setup_suppress_rule(cfg).await {
+        warn!(error = %e, "could not install the suppress rule — traffic to specific               routes in the main table may be sent to a provider gateway instead");
+    }
+
+    if cfg.routing.pin_connections {
+        crate::pin::check_supported()
+            .await
+            .context("connection pinning is enabled but this host cannot do it")?;
+        info!("connection pinning enabled: established flows stay on the provider they started on");
+    } else {
+        // Turning the feature off has to actually turn it off. The chain is
+        // deliberately left in place across a restart so traffic keeps
+        // flowing; left in place across a *disable* it would go on pinning
+        // connections that the operator has decided should not be pinned.
+        if let Err(e) = crate::pin::remove(cfg.general.lan_interface.as_deref()).await {
+            debug!(error = %e, "no connection-pinning rules to remove");
+        }
+    }
+
     // Reported back so the router only removes a provisional route that this
     // process actually created.
     let installed_bootstrap = ensure_bootstrap_default(cfg).await;
@@ -494,8 +534,9 @@ pub async fn setup_provider_policy_route(cfg: &Config, p: &Provider) -> Result<(
 
     let gw = p.gateway.to_string();
     let table_str = table.to_string();
-    let mark_str = mark.to_string();
+    let mark_filter = cfg.mark_filter_for(p);
     let pref_str = pref.to_string();
+    let _ = mark;
 
     // (1) Default route inside the per-provider table. `ip route replace`
     //     handles both "no route yet" and "route from a prior run".
@@ -524,12 +565,28 @@ pub async fn setup_provider_policy_route(cfg: &Config, p: &Provider) -> Result<(
     }
 
     // (2) Remove any stale rule(s) sitting at our pref. `ip rule del`
-    //     removes a SINGLE matching rule per call, so we loop until
-    //     deletion fails (ENOENT) to drain prior-run leftovers or
-    //     duplicates added by other tooling.
-    loop {
+    //     removes a SINGLE matching rule per call, so loop until deletion
+    //     fails (ENOENT) to drain prior-run leftovers or duplicates added by
+    //     other tooling.
+    //
+    //     Name the whole selector, and bound the loop. `ip rule del pref P`
+    //     alone sends a priority and nothing else, and iproute2 reads a
+    //     request with no selector as "delete the first rule you have" — on a
+    //     pref that does not exist that can take out a rule nobody asked
+    //     about. An unbounded loop over a misbehaving iproute2 would keep
+    //     going.
+    for _ in 0..16 {
         let del = Command::new("ip")
-            .args(["rule", "del", "pref", &pref_str])
+            .args([
+                "rule",
+                "del",
+                "pref",
+                &pref_str,
+                "fwmark",
+                &mark_filter,
+                "lookup",
+                &table_str,
+            ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
@@ -541,26 +598,96 @@ pub async fn setup_provider_policy_route(cfg: &Config, p: &Provider) -> Result<(
         }
     }
 
-    // (3) Install a fresh rule: fwmark M lookup T at pref P.
+    // (3) Install a fresh rule: fwmark M/mask lookup T at pref P.
+    //
+    //     The mask is not optional once anything other than a probe carries
+    //     a mark. Without a `/mask` iproute2 omits FRA_FWMASK and the kernel
+    //     compares all 32 bits, so a mark restored under a mask — leaving any
+    //     bit another tool set — stops matching and the packet quietly falls
+    //     through to the main table.
     let add = Command::new("ip")
         .args([
-            "rule", "add", "pref", &pref_str, "fwmark", &mark_str, "lookup", &table_str,
+            "rule",
+            "add",
+            "pref",
+            &pref_str,
+            "fwmark",
+            &mark_filter,
+            "lookup",
+            &table_str,
         ])
         .kill_on_drop(true)
         .status()
         .await
         .context("failed to invoke `ip rule add`")?;
     if !add.success() {
-        bail!("failed to add ip rule: fwmark {mark_str} lookup {table_str} pref {pref_str}");
+        bail!("failed to add ip rule: fwmark {mark_filter} lookup {table_str} pref {pref_str}");
     }
 
-    let mark_hex = format!("0x{mark:x}");
     info!(
         provider = %p.name,
         table,
-        mark = %mark_hex,
+        mark = %mark_filter,
         pref,
         "policy route installed"
     );
+    Ok(())
+}
+
+/// Keep the provider tables from swallowing traffic that is not going to the
+/// internet.
+///
+/// Each provider table holds exactly one route — its default. Once forwarded
+/// packets carry marks, those tables are consulted before `main`, so anything
+/// `main` resolves specifically (the LAN itself, a VPN subnet, a management
+/// static) would be matched by the provider's default instead and flung at
+/// the ISP router. `suppress_prefixlength 0` makes the rule below decline to
+/// answer with a default route, so `main`'s specific routes win and only
+/// internet-bound traffic ever reaches a provider table.
+pub async fn setup_suppress_rule(cfg: &Config) -> Result<()> {
+    let pref = cfg.routing.rule_pref.saturating_sub(1).to_string();
+
+    for _ in 0..16 {
+        let del = Command::new("ip")
+            .args([
+                "rule",
+                "del",
+                "pref",
+                &pref,
+                "lookup",
+                "main",
+                "suppress_prefixlength",
+                "0",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .status()
+            .await
+            .context("failed to invoke `ip rule del` for the suppress rule")?;
+        if !del.success() {
+            break;
+        }
+    }
+
+    let add = Command::new("ip")
+        .args([
+            "rule",
+            "add",
+            "pref",
+            &pref,
+            "lookup",
+            "main",
+            "suppress_prefixlength",
+            "0",
+        ])
+        .kill_on_drop(true)
+        .status()
+        .await
+        .context("failed to invoke `ip rule add` for the suppress rule")?;
+    if !add.success() {
+        bail!("failed to add the suppress rule at pref {pref}");
+    }
+    info!(pref = %pref, "suppress rule installed: main's specific routes win over a provider default");
     Ok(())
 }

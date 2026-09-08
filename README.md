@@ -392,6 +392,72 @@ to, rather than showing an empty screen.
 
 ---
 
+## What survives a switch
+
+The honest answer, because it decides what you can expect from this box.
+
+**A connection whose provider is still working survives.** With
+`routing.pin_connections = true`, each forwarded connection is stamped on its
+first packet with the mark of whichever uplink was active then, and keeps
+being routed by that stamp rather than by the current default route. So the
+switches that are *good news* — the primary recovering and the route coming
+back to it, an operator pinning a provider by hand, the watchdog putting the
+route back after `netplan apply` — move nothing that is already running. Only
+new connections follow the new route.
+
+That is most of the switching a healthy gateway does, and until 0.6.0 every
+one of them reset every connection on the box.
+
+**A connection whose provider actually dies does not survive, and cannot.**
+Each of your uplinks is a router that hides this gateway behind *its own*
+public address. The moment traffic leaves through a different one, the far
+end receives packets from an address it has no connection with, and hangs up.
+Nothing installed on this machine can prevent that: the address belongs to
+the ISP router one hop away, and sending its address through a different ISP
+is source spoofing, which the upstream drops.
+
+What vlb does instead is make the loss surgical and immediate. When a
+provider goes down its connections are evicted **by mark**, so they fail at
+once instead of waiting out a five-day conntrack timeout — and nobody else's
+connections are touched. Before, a single blip on the primary cost you two
+resets of everything: one leaving, one coming back.
+
+```toml
+[routing]
+pin_connections = true      # needs conntrack installed
+```
+
+Off by default. It changes how every forwarded packet is routed, so switch it
+on deliberately, and watch `sudo vlb status` for a round afterwards.
+
+<details>
+<summary>If you need streams to survive a dead uplink too</summary>
+
+There is exactly one arrangement that does it, and it is a change of
+topology rather than a setting: give the traffic a public address that does
+not belong to any of the uplinks.
+
+Rent a small server with a static address and run a single WireGuard tunnel
+to it from the gateway. LAN traffic goes into the tunnel, so the far end
+always sees the rented server's address; vlb switches only the tunnel's
+*outer* packets between uplinks, and WireGuard re-homes on the first
+authenticated packet from the new path without a rekey. A stream stalls for
+about as long as the failover takes and then continues.
+
+The costs are real: every byte crosses that server twice, you pay for its
+bandwidth, the MTU has to be clamped to the smallest of your uplinks or large
+packets vanish silently, and the server becomes a single point of failure of
+its own. vlb does not manage this for you today. It is written down here so
+the trade is visible, not because it is recommended.
+
+The other textbook answer — BGP with your own address space, which is what a
+device like an F5 relies on — is not available on links that hand out a
+NAT'd address on a shared LAN.
+
+</details>
+
+---
+
 ## Who is on the network — client statistics
 
 Press <kbd>c</kbd> in the dashboard, or run `vlb clients`. Every host behind
@@ -702,7 +768,9 @@ dns_check_name      = "cloudflare.com"
 [routing]
 table_base  = 200                # provider tables: 200, 201, ...
 fwmark_base = 0x200              # provider marks:  0x200, 0x201, ...
+fwmark_mask = 0xffff             # which bits of the mark are ours
 rule_pref   = 32000              # ip rule preference
+pin_connections = false          # keep a connection on the uplink it started on
 
 [firewall]
 manage                 = true    # write iptables MASQUERADE / mangle rules
@@ -1423,6 +1491,7 @@ runs as root. If you're running by hand, prefix with `sudo`.
     │   ├── clients.rs        # LAN client discovery + per-host accounting
     │   ├── health.rs         # ICMP / DNS probes (fwmark-bound)
     │   ├── http.rs           # minimal SO_MARK-bound HTTP/HTTPS client
+    │   ├── pin.rs            # per-connection provider marking (mangle chain)
     │   ├── router.rs         # writes to the kernel routing table
     │   ├── system.rs         # iptables / sysctl / ip rule / table bring-up
     │   └── traffic.rs        # /proc/net/dev sampling
