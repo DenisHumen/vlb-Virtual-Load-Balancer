@@ -95,6 +95,7 @@ Prefer a release binary and no build? [One command for that too](#install-or-upd
 |---|---|
 | [Why](#why) · [What it does](#what-it-actually-does) | the pitch |
 | [Guided setup](#guided-setup-and-the-menu) · [Install / update](#install-or-update-on-a-server) · [From a checkout](#update-from-a-git-checkout) | getting it running |
+| [What survives a switch](#what-survives-a-switch) | connections during a failover |
 | [Client statistics](#who-is-on-the-network--client-statistics) | who is using the link |
 | [Configuration](#configuration-reference) · [CLI](#cli) · [TUI](#tui-hotkeys) | day-to-day use |
 | [How it works](#how-it-works) · [Failure modes](#failure-modes-we-cover) | the design |
@@ -348,18 +349,26 @@ prints the kernel's own routes and policy rules, and tails the log.
 ## Update from a git checkout
 
 If you run `vlb` straight out of a clone rather than from a release, the
-whole update is:
+whole update is one command:
 
 ```bash
-cd ~/load_balancer && git pull && sudo bash scripts/vlb.sh restart
+sudo bash scripts/vlb.sh update
 ```
 
-Any `scripts/vlb.sh` command that needs the binary rebuilds it when the
-sources are newer — and then **restarts the running daemon**, because a
-rebuild on its own leaves the old process in memory serving the old
-behaviour. That used to be the confusing half of updating this way: `git
-pull` plus a command that clearly rebuilt something, and none of the new
-features anywhere to be seen.
+It pulls, builds, checks the new binary against **this machine's own
+configuration**, installs it wherever the service actually runs it from,
+restarts, and waits for it to answer. If it does not come back, the previous
+binary is put back, the service is restarted again, and the reason is printed
+from the journal. Each earlier step fails safe on its own: a pull that
+conflicts, a build that does not compile, or a binary that rejects your
+config all stop before anything is deployed, and rewind the checkout.
+
+> **If you have been updating with `git pull && vlb.sh restart`, that never
+> deployed anything.** A build writes `target/release/vlb`; the systemd unit
+> runs `/usr/local/bin/vlb`. The restart in between re-executed the old
+> binary and reported success, and the `start` that followed raced the
+> running daemon for the control port. Fixed in 0.6.0, which is also why
+> features you pulled may never have appeared. Use `update`.
 
 The restart does not interrupt traffic (see [How it works](#how-it-works)):
 the new process adopts the default route the old one left in the kernel.

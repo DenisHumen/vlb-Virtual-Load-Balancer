@@ -25,20 +25,26 @@
 #   diag               Diagnostic dump (interfaces, DB rows, control port)
 #   probe              Time every health layer per provider (sizes your timeouts)
 #   clients            Who is behind the gateway: traffic, uptime, drops
-#   update             Install the newest release from GitHub
+#   update             Pull, build, deploy and restart; roll back if it fails
 #   test               fmt + clippy + unit tests; `test --lab` adds the docker lab
 #   logs               Tail the daemon log file
 #   install-service    Install + enable systemd/vlb.service (Linux, root)
 #   uninstall-service  Disable + remove the installed systemd unit
 #   help               Show this help
 #
-# Updating from a git checkout:
-#   git pull && sudo bash scripts/vlb.sh restart
+# Updating:
+#   sudo bash scripts/vlb.sh update
 #
-#   Any command that needs the binary rebuilds it when the sources are newer,
-#   and then restarts the running daemon so the new build actually takes
-#   over — a rebuild alone leaves the old process running. The restart does
-#   not interrupt traffic: the new daemon adopts the route the old one left.
+#   From a git checkout that is what it does: pull, build, check the new
+#   binary against this machine's own configuration, deploy it to wherever
+#   the service actually runs it from, restart, and wait for it to answer. If
+#   it does not come back, the previous binary is put back and the reason is
+#   printed. Off a checkout it hands over to the daemon's own release updater,
+#   which has the same safety net. Force either with `update --git` or
+#   `update --release`.
+#
+#   The restart does not interrupt traffic: the new daemon adopts the route
+#   the old one left in the kernel rather than choosing again.
 #
 # Environment:
 #   VLB_CONFIG   path to the TOML config (default: examples/vlb.example.toml)
@@ -135,6 +141,30 @@ ensure_rust() {
     ok "rust toolchain installed: $(rustc --version)"
 }
 
+# The path systemd will execute, which is not the path a build writes to.
+#
+# This is the gap the whole update story fell through: `cargo build` writes
+# target/release/vlb, the unit's ExecStart is /usr/local/bin/vlb, and a
+# `systemctl restart` in between re-executes the *old* binary while printing
+# that it restarted. An install adopted from elsewhere may run it from a third
+# place, so ask systemd rather than assuming.
+deployed_bin() {
+    local from_unit=""
+    if command -v systemctl >/dev/null; then
+        from_unit=$(systemctl show -p ExecStart --value "$VLB_SERVICE" 2>/dev/null \
+                      | sed -n 's/.*path=\([^ ;]*\).*/\1/p' | head -n1) || true
+        [[ -z "$from_unit" ]] && from_unit=$(systemctl cat "$VLB_SERVICE" 2>/dev/null \
+                      | sed -n 's/^ExecStart=\([^ ]*\).*/\1/p' | head -n1) || true
+    fi
+    [[ -n "$from_unit" ]] && { printf '%s' "$from_unit"; return 0; }
+    printf '%s' /usr/local/bin/vlb
+}
+
+service_active() {
+    command -v systemctl >/dev/null \
+        && systemctl is-active --quiet "$VLB_SERVICE" 2>/dev/null
+}
+
 require_bin() {
     # Rebuild when the binary is missing OR when any source file (Cargo.toml,
     # Cargo.lock, anything under src/) is newer than it. Without this, a
@@ -188,6 +218,14 @@ restart_after_rebuild() {
     fi
 
     if (( systemd_active )); then
+        # Copy the build to where the unit will look for it. Restarting
+        # without this re-runs the previous binary and reports success.
+        local deployed; deployed=$(deployed_bin)
+        if [[ "$(readlink -f "$VLB_BIN")" != "$(readlink -f "$deployed")" ]]; then
+            install -m 0755 "$VLB_BIN" "$deployed" \
+                || { warn "could not write ${deployed}; the service still runs the old build"; return 0; }
+            log "deployed the new build to ${deployed}"
+        fi
         log "restarting ${VLB_SERVICE} so the new build takes over"
         if systemctl restart "$VLB_SERVICE"; then
             ok "${VLB_SERVICE} restarted — traffic kept flowing (the route is adopted, not re-chosen)"
@@ -244,6 +282,14 @@ cmd_run() {
 
 cmd_start() {
     require_bin; require_cfg
+    # systemd owns this box: say so and stop, rather than racing the unit for
+    # the control port and starting a second balancer. Two balancers both
+    # install default routes and both flush conntrack on their own switchovers.
+    if service_active; then
+        ok "${VLB_SERVICE} is running under systemd — nothing to start"
+        log "  restart it with:  sudo systemctl restart ${VLB_SERVICE}"
+        return 0
+    fi
     if is_running; then
         warn "already running (pid $(cat "$VLB_PID"))"
         return 0
@@ -281,6 +327,11 @@ cmd_start() {
 }
 
 cmd_stop() {
+    if service_active; then
+        log "stopping ${VLB_SERVICE} (systemd)"
+        systemctl stop "$VLB_SERVICE" && ok "stopped" || warn "systemctl stop failed"
+        return 0
+    fi
     if ! is_running; then
         warn "not running"
         rm -f "$VLB_PID"
@@ -301,7 +352,25 @@ cmd_stop() {
     ok "stopped"
 }
 
-cmd_restart() { cmd_stop; cmd_start; }
+cmd_restart() {
+    # Under systemd a restart is one operation, not a stop and a start: the
+    # unit re-executes the deployed binary, and the new process adopts the
+    # route the old one left behind, so traffic is not disturbed.
+    if service_active; then
+        require_bin
+        local deployed; deployed=$(deployed_bin)
+        if [[ -x "$VLB_BIN" && "$(readlink -f "$VLB_BIN")" != "$(readlink -f "$deployed")" ]]; then
+            install -m 0755 "$VLB_BIN" "$deployed"                 || die "could not write ${deployed} — run this as root"
+            log "deployed the current build to ${deployed}"
+        fi
+        log "restarting ${VLB_SERVICE}"
+        systemctl restart "$VLB_SERVICE" || die "systemctl restart ${VLB_SERVICE} failed"
+        ok "restarted — the route is adopted, not re-chosen, so traffic kept flowing"
+        return 0
+    fi
+    cmd_stop
+    cmd_start
+}
 
 cmd_status() {
     require_bin; require_cfg
@@ -357,19 +426,177 @@ cmd_uninstall_service() {
 cmd_probe()   { require_bin; require_cfg; "$VLB_BIN" --config "$VLB_CONFIG" probe "$@"; }
 cmd_clients() { require_bin; require_cfg; "$VLB_BIN" --config "$VLB_CONFIG" clients "$@"; }
 
-cmd_update() {
-    # Self-update needs to write the installed binary and bounce the unit,
-    # both of which are root-only in a production install.
-    require_cfg
-    local bin="$VLB_BIN"
-    [[ -x /usr/local/bin/vlb ]] && bin=/usr/local/bin/vlb
-    [[ -x "$bin" ]] || die "no vlb binary found (looked at $VLB_BIN and /usr/local/bin/vlb)"
-    if [[ $EUID -ne 0 && -w "$bin" ]]; then
-        warn "not root: the binary can be replaced but the service cannot be restarted"
-    fi
-    "$bin" --config "$VLB_CONFIG" update "$@"
+# ─────────────────────────────────────────────────────────────────────────
+# Updating, and being able to go back
+#
+# Two ways to update this gateway, and until now only one of them worked.
+#
+#   * From a GitHub release: the daemon does it itself. `vlb update` fetches
+#     the tarball, verifies it, validates this machine's config with the new
+#     binary, probes the canary with it, swaps it in, restarts, and puts the
+#     old one back if the service does not come home. That path is sound.
+#
+#   * From this git checkout, which is how this deployment is actually run.
+#     The documented recipe — `git pull && vlb.sh restart` — deployed nothing:
+#     a build writes target/release/vlb, the unit runs /usr/local/bin/vlb, and
+#     the restart in between re-executed the old binary while reporting
+#     success. `update` below is that path done properly, with the same
+#     promise the release path makes: if the new build does not come back
+#     serving, the previous one is restored and the reason is printed.
+# ─────────────────────────────────────────────────────────────────────────
+
+# Wait until the daemon answers on its control port. Returns 1 on timeout.
+wait_until_serving() {
+    local secs="${1:-30}" bin="$2"
+    for _ in $(seq 1 "$secs"); do
+        if "$bin" --config "$VLB_CONFIG" status >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
 }
 
+# Why did it not come back? Whatever the operator would have had to go and
+# look up themselves.
+failure_reason() {
+    if command -v journalctl >/dev/null && systemctl list-unit-files "${VLB_SERVICE}.service" >/dev/null 2>&1; then
+        journalctl -u "$VLB_SERVICE" -n 20 --no-pager 2>/dev/null | tail -n 20
+    elif [[ -r "$VLB_LOG" ]]; then
+        tail -n 20 "$VLB_LOG"
+    else
+        echo "(no journal and no ${VLB_LOG} to read)"
+    fi
+}
+
+cmd_update() {
+    require_cfg
+    local mode="${1:-auto}"
+    [[ "$mode" == --release || "$mode" == --git ]] && shift || mode=auto
+
+    if [[ "$mode" == auto ]]; then
+        if [[ -d "${REPO_DIR}/.git" ]]; then mode=--git; else mode=--release; fi
+    fi
+
+    if [[ "$mode" == --release ]]; then
+        # The daemon's own updater, which already has the full safety net.
+        local bin; bin=$(deployed_bin)
+        [[ -x "$bin" ]] || bin="$VLB_BIN"
+        [[ -x "$bin" ]] || die "no vlb binary found (looked at $(deployed_bin) and $VLB_BIN)"
+        if [[ $EUID -ne 0 && -w "$bin" ]]; then
+            warn "not root: the binary can be replaced but the service cannot be restarted"
+        fi
+        exec "$bin" --config "$VLB_CONFIG" update "$@"
+    fi
+
+    # ── from the checkout ────────────────────────────────────────────────
+    [[ $EUID -eq 0 ]] || die "updating deploys a binary and restarts the service; run it with sudo"
+    command -v git >/dev/null || die "git is not installed, so this checkout cannot be updated"
+
+    local deployed; deployed=$(deployed_bin)
+    local owner; owner=$(stat -c '%U' "$REPO_DIR" 2>/dev/null || echo root)
+    local backup="${deployed}.previous"
+    local before after
+    before=$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null) \
+        || die "${REPO_DIR} is not a git checkout"
+
+    log "updating from the checkout"
+    log "at ${before:0:9}, deployed binary ${deployed}"
+
+    # (1) A dirty tree is the operator's, not ours to discard.
+    if ! git -C "$REPO_DIR" diff --quiet || ! git -C "$REPO_DIR" diff --cached --quiet; then
+        warn "the checkout has uncommitted changes:"
+        git -C "$REPO_DIR" status --short | sed 's/^/    /'
+        die "commit or discard them first — refusing to build something that is not in git"
+    fi
+
+    # (2) Fetch. A failure here has changed nothing.
+    local pull_out
+    if ! pull_out=$(sudo -u "$owner" git -C "$REPO_DIR" pull --ff-only 2>&1); then
+        printf '%s\n' "$pull_out" | sed 's/^/    /'
+        die "git pull failed — nothing was changed"
+    fi
+    after=$(git -C "$REPO_DIR" rev-parse HEAD)
+    if [[ "$before" == "$after" ]]; then
+        ok "already at the latest commit (${after:0:9}) — nothing to do"
+        return 0
+    fi
+    log "now at ${after:0:9}"
+    git -C "$REPO_DIR" --no-pager log --oneline "${before}..${after}" | sed 's/^/    /'
+
+    # (3) Build. Still nothing deployed, so a failure only rewinds the source.
+    log "building"
+    local build_out
+    if ! build_out=$(VLB_NO_RESTART=1 bash "${BASH_SOURCE[0]}" build 2>&1); then
+        printf '%s\n' "$build_out" | tail -n 25 | sed 's/^/    /'
+        warn "the new sources do not build — rewinding the checkout to ${before:0:9}"
+        sudo -u "$owner" git -C "$REPO_DIR" reset --hard "$before" >/dev/null 2>&1 \
+            || warn "could not rewind the checkout; it is left at ${after:0:9}"
+        die "update aborted: the build failed. The gateway is untouched and still running the previous version."
+    fi
+    [[ -x "$VLB_BIN" ]] || die "the build reported success but produced no ${VLB_BIN}"
+
+    # (4) Does the new binary accept this machine's configuration? A config
+    #     the daemon rejects is a gateway that does not come back.
+    local check_out
+    if ! check_out=$("$VLB_BIN" --config "$VLB_CONFIG" check 2>&1); then
+        printf '%s\n' "$check_out" | tail -n 20 | sed 's/^/    /'
+        warn "rewinding the checkout to ${before:0:9}"
+        sudo -u "$owner" git -C "$REPO_DIR" reset --hard "$before" >/dev/null 2>&1 || true
+        die "update aborted: the new build rejects ${VLB_CONFIG}. The gateway is untouched."
+    fi
+    ok "the new build accepts ${VLB_CONFIG}"
+
+    # (5) Deploy, keeping the binary we are replacing.
+    if [[ -x "$deployed" ]]; then
+        cp -a "$deployed" "$backup" || die "could not save the current binary to ${backup}"
+        log "previous binary kept at ${backup}"
+    fi
+    install -m 0755 "$VLB_BIN" "$deployed" || die "could not install to ${deployed}"
+    ok "deployed $("$deployed" --version 2>/dev/null || echo "the new build") to ${deployed}"
+
+    # (6) Restart and wait for it to answer. This is the point of no return
+    #     for the old binary, so everything after it can roll back.
+    if service_active || command -v systemctl >/dev/null; then
+        systemctl restart "$VLB_SERVICE" 2>/dev/null || true
+    else
+        VLB_NO_RESTART=1 bash "${BASH_SOURCE[0]}" stop >/dev/null 2>&1 || true
+        VLB_NO_RESTART=1 bash "${BASH_SOURCE[0]}" start >/dev/null 2>&1 || true
+    fi
+
+    if wait_until_serving 30 "$deployed"; then
+        ok "the new version is serving"
+        "$deployed" --config "$VLB_CONFIG" status 2>/dev/null | sed 's/^/    /' || true
+        log "  the previous binary is still at ${backup} if you want it back"
+        return 0
+    fi
+
+    # (7) It did not come back. Put the old one in and say why.
+    warn "the new version did not answer on ${VLB_CONFIG##*/}'s control port within 30s"
+    echo
+    warn "  why it failed, from the log:"
+    failure_reason | sed 's/^/    /'
+    echo
+
+    if [[ -f "$backup" ]]; then
+        log "rolling back to the previous binary"
+        install -m 0755 "$backup" "$deployed" || die "ROLLBACK FAILED: could not restore ${deployed} from ${backup} — restore it by hand and restart ${VLB_SERVICE}"
+        if service_active || command -v systemctl >/dev/null; then
+            systemctl restart "$VLB_SERVICE" 2>/dev/null || true
+        fi
+        if wait_until_serving 30 "$deployed"; then
+            ok "rolled back — the gateway is serving the previous version again"
+        else
+            warn "the previous version did not come back either; the gateway may be down"
+            warn "  look at:  journalctl -u ${VLB_SERVICE} -n 50"
+        fi
+    else
+        warn "there was no previous binary at ${backup} to roll back to"
+    fi
+
+    warn "the checkout is left at ${after:0:9}; rewind it with:  git -C ${REPO_DIR} reset --hard ${before:0:9}"
+    die "update failed and was rolled back — the reason is above"
+}
 cmd_test() {
     # Everything that can run without root or docker, first.
     require_cargo

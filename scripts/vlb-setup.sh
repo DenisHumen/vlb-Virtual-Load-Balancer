@@ -834,29 +834,20 @@ EOF
 
 menu_update() {
     head1 "Update"
-    local owner; owner=$(repo_owner)
-    if [[ -d "${REPO_DIR}/.git" ]]; then
-        log "pulling the latest sources"
-        if [[ "$owner" != root ]] && id "$owner" >/dev/null 2>&1; then
-            sudo -u "$owner" -H git -C "$REPO_DIR" pull --ff-only || warn "git pull did not succeed"
-        else
-            git -C "$REPO_DIR" pull --ff-only || warn "git pull did not succeed"
+    # One implementation, in vlb.sh, so the menu and the command line cannot
+    # drift apart on the one operation that has to be able to go back. This
+    # used to pull, rebuild and restart with no rollback of any kind.
+    bash "${SCRIPT_DIR}/vlb.sh" update >&9 2>&9 9>&- 8<&-         || warn "the update did not succeed — the reason is above"
+
+    # A stock unit gains fixes too; a hand-edited one is left alone.
+    if [[ -f "$UNIT_SRC" && -f "$UNIT_PATH" ]] && ! cmp -s "$UNIT_SRC" "$UNIT_PATH"; then
+        if ask_yes_no "The bundled systemd unit differs from the installed one. Replace it?" "y"; then
+            cp -a "$UNIT_PATH" "${UNIT_PATH}.bak"
+            install -m 0644 "$UNIT_SRC" "$UNIT_PATH"
+            systemctl daemon-reload
+            ok "unit updated (previous kept as ${UNIT_PATH}.bak)"
+            restart_daemon
         fi
-        build_binary
-        [[ -x "$INSTALLED_BIN" ]] && install -m 0755 "$BUILT_BIN" "$INSTALLED_BIN"
-        # A stock unit gains fixes too; a hand-edited one is left alone.
-        if [[ -f "$UNIT_SRC" && -f "$UNIT_PATH" ]] && ! cmp -s "$UNIT_SRC" "$UNIT_PATH"; then
-            if ask_yes_no "The bundled systemd unit differs from the installed one. Replace it?" "y"; then
-                cp -a "$UNIT_PATH" "${UNIT_PATH}.bak"
-                install -m 0644 "$UNIT_SRC" "$UNIT_PATH"
-                systemctl daemon-reload
-                ok "unit updated (previous kept as ${UNIT_PATH}.bak)"
-            fi
-        fi
-        restart_daemon
-        wait_until_serving || true
-    else
-        warn "this is not a git checkout; use  sudo vlb update  to fetch a release instead"
     fi
     pause
 }
