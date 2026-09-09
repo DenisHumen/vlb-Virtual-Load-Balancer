@@ -788,8 +788,51 @@ EOF
 #
 # Its own menu entry rather than a line in the config for the operator to
 # find, because it is the setting that decides whether a failback is felt.
+# Does the build that is actually deployed know this setting?
+#
+# The menu validates every change with the binary that will run it, which is
+# right — but when the checkout is newer than the deployed build, the answer
+# comes back as a raw TOML parse error about an unknown field, and the real
+# cause (an old binary, not a bad setting) is nowhere in it. Ask first.
+pinning_supported() {
+    local bin; bin=$(vlb_binary) || return 1
+    local probe; probe=$(mktemp)
+    # Inserted into the existing [routing] table rather than appended: a
+    # second [routing] header is a duplicate-table error in TOML, and the
+    # probe would then fail for a reason that has nothing to do with the key.
+    awk '
+        /^[[:space:]]*pin_connections[[:space:]]*=/ { next }
+        { print }
+        /^[[:space:]]*\[routing\][[:space:]]*$/ { print "pin_connections = false" }
+    ' "$CONFIG_PATH" >"$probe"
+    local out
+    out=$("$bin" --config "$probe" check 2>&1) && { rm -f "$probe"; return 0; }
+    rm -f "$probe"
+    grep -q "unknown field .pin_connections" <<<"$out" && return 1
+    # Some other complaint about the config entirely — not our question.
+    return 0
+}
+
 menu_pinning() {
     head1 "Connections during a switch"
+
+    if ! pinning_supported; then
+        warn "the vlb running on this machine is older than this checkout and does"
+        warn "not know this setting yet, so turning it on would only produce a"
+        warn "configuration it refuses to load."
+        msg ""
+        msg "  Deploy the current sources first:"
+        msg "    sudo bash scripts/vlb.sh update"
+        msg ""
+        if ask_yes_no "Run that now?" "y"; then
+            bash "${SCRIPT_DIR}/vlb.sh" update >&9 2>&9 9>&- 8<&- \
+                || warn "the update did not succeed — the reason is above"
+            msg ""
+            log "open this entry again once the update has finished"
+        fi
+        pause
+        return 0
+    fi
 
     local current="off"
     grep -qE '^[[:space:]]*pin_connections[[:space:]]*=[[:space:]]*true' "$CONFIG_PATH" \

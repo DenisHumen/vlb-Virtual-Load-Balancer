@@ -445,6 +445,20 @@ cmd_clients() { require_bin; require_cfg; "$VLB_BIN" --config "$VLB_CONFIG" clie
 #     serving, the previous one is restored and the reason is printed.
 # ─────────────────────────────────────────────────────────────────────────
 
+# git, run as whoever owns the checkout.
+#
+# As root it also has to say the directory is not dubious: git refuses to
+# operate on a repository owned by somebody else unless told, and that refusal
+# would otherwise read as "the pull failed".
+as_owner() {
+    local who="$1"; shift
+    if [[ "$who" == root ]]; then
+        git -c "safe.directory=${REPO_DIR}" -C "$REPO_DIR" "$@"
+    else
+        sudo -u "$who" git -C "$REPO_DIR" "$@"
+    fi
+}
+
 # Wait until the daemon answers on its control port. Returns 1 on timeout.
 wait_until_serving() {
     local secs="${1:-30}" bin="$2"
@@ -494,7 +508,20 @@ cmd_update() {
     command -v git >/dev/null || die "git is not installed, so this checkout cannot be updated"
 
     local deployed; deployed=$(deployed_bin)
+    # Who owns the checkout, if anybody this machine can name.
+    #
+    # Running git as the owner keeps root out of their .git and off their
+    # index. But a bind mount, an NFS export or a container can present a uid
+    # with no passwd entry, and `stat` then says UNKNOWN — at which point
+    # `sudo -u UNKNOWN` fails and the whole update stops before it has done
+    # anything. Fall back to root there, telling git the directory is not
+    # dubious, rather than refusing to update at all.
     local owner; owner=$(stat -c '%U' "$REPO_DIR" 2>/dev/null || echo root)
+    if [[ -z "$owner" || "$owner" == UNKNOWN ]] || ! id "$owner" >/dev/null 2>&1; then
+        [[ "$owner" != root ]] && \
+            warn "the checkout's owner is not a user this machine knows; running git as root"
+        owner=root
+    fi
     local backup="${deployed}.previous"
     local before after
     before=$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null) \
@@ -512,17 +539,26 @@ cmd_update() {
 
     # (2) Fetch. A failure here has changed nothing.
     local pull_out
-    if ! pull_out=$(sudo -u "$owner" git -C "$REPO_DIR" pull --ff-only 2>&1); then
+    if ! pull_out=$(as_owner "$owner" pull --ff-only 2>&1); then
         printf '%s\n' "$pull_out" | sed 's/^/    /'
         die "git pull failed — nothing was changed"
     fi
     after=$(git -C "$REPO_DIR" rev-parse HEAD)
     if [[ "$before" == "$after" ]]; then
-        ok "already at the latest commit (${after:0:9}) — nothing to do"
-        return 0
+        # Not "nothing to do".
+        #
+        # An operator who ran `git pull` by hand first — which is what the
+        # old instructions told them to do — arrives here with a checkout
+        # that is current and a *deployed binary that is not*. Returning at
+        # this point is what left this gateway running a build from before
+        # the sources it was sitting on, with no sign that anything was
+        # wrong. What matters is whether the deployed binary matches the
+        # checkout, and that is decided after the build, below.
+        log "the checkout is already at ${after:0:9}; checking what is deployed"
+    else
+        log "now at ${after:0:9}"
+        git -C "$REPO_DIR" --no-pager log --oneline "${before}..${after}" | sed 's/^/    /'
     fi
-    log "now at ${after:0:9}"
-    git -C "$REPO_DIR" --no-pager log --oneline "${before}..${after}" | sed 's/^/    /'
 
     # (3) Build. Still nothing deployed, so a failure only rewinds the source.
     log "building"
@@ -530,11 +566,17 @@ cmd_update() {
     if ! build_out=$(VLB_NO_RESTART=1 bash "${BASH_SOURCE[0]}" build 2>&1); then
         printf '%s\n' "$build_out" | tail -n 25 | sed 's/^/    /'
         warn "the new sources do not build — rewinding the checkout to ${before:0:9}"
-        sudo -u "$owner" git -C "$REPO_DIR" reset --hard "$before" >/dev/null 2>&1 \
+        as_owner "$owner" reset --hard "$before" >/dev/null 2>&1 \
             || warn "could not rewind the checkout; it is left at ${after:0:9}"
         die "update aborted: the build failed. The gateway is untouched and still running the previous version."
     fi
     [[ -x "$VLB_BIN" ]] || die "the build reported success but produced no ${VLB_BIN}"
+
+    # Is what is deployed already what this checkout builds?
+    if [[ -x "$deployed" ]] && cmp -s "$VLB_BIN" "$deployed"; then
+        ok "already up to date: ${deployed} is what ${after:0:9} builds"
+        return 0
+    fi
 
     # (4) Does the new binary accept this machine's configuration? A config
     #     the daemon rejects is a gateway that does not come back.
@@ -542,7 +584,7 @@ cmd_update() {
     if ! check_out=$("$VLB_BIN" --config "$VLB_CONFIG" check 2>&1); then
         printf '%s\n' "$check_out" | tail -n 20 | sed 's/^/    /'
         warn "rewinding the checkout to ${before:0:9}"
-        sudo -u "$owner" git -C "$REPO_DIR" reset --hard "$before" >/dev/null 2>&1 || true
+        as_owner "$owner" reset --hard "$before" >/dev/null 2>&1 || true
         die "update aborted: the new build rejects ${VLB_CONFIG}. The gateway is untouched."
     fi
     ok "the new build accepts ${VLB_CONFIG}"
