@@ -401,9 +401,31 @@ cmd_install_service() {
     if [[ "$(readlink -f "$VLB_CONFIG" 2>/dev/null)" != "$(readlink -f /etc/vlb/vlb.toml 2>/dev/null)" ]]; then
         install -m 0644 -D "$VLB_CONFIG" /etc/vlb/vlb.toml
     fi
+    # One daemon at a time.
+    #
+    # A gateway started with `vlb.sh start` holds the control port. Enabling
+    # the unit on top of that hands systemd a process that cannot bind, and
+    # `Restart=always` then flaps it forever while the pid-file daemon carries
+    # on regardless — a service that looks installed, is permanently failing,
+    # and is not the thing routing anything.
+    if is_running; then
+        log "stopping the daemon started from the checkout, so the unit can take over"
+        VLB_NO_RESTART=1 cmd_stop >/dev/null 2>&1 || true
+    fi
+
     systemctl daemon-reload
     systemctl enable --now vlb.service
-    ok "service installed, enabled and started"
+
+    # Did it come up, and is it the build just installed? `enable --now`
+    # returning 0 only means systemd accepted the job.
+    local want; want=$(binary_version /usr/local/bin/vlb)
+    if [[ -n "$want" ]] && wait_until_version /usr/local/bin/vlb "$want" 30; then
+        ok "service installed and enabled — the daemon is running ${want} and will come back after a reboot"
+    else
+        warn "the unit is installed but the daemon is not answering as ${want:-the new build}"
+        failure_reason | sed 's/^/    /'
+        die "install-service failed — look at:  journalctl -u ${VLB_SERVICE} -n 50"
+    fi
     systemctl --no-pager status vlb.service || true
 }
 
@@ -506,6 +528,25 @@ wait_until_version() {
         sleep 1
     done
     return 1
+}
+
+# Say something if the gateway is running out of the source tree.
+#
+# It works, and it is what `vlb.sh start` does — but it means there is no
+# systemd unit, so the gateway does not come back on its own after a reboot,
+# and the running binary lives in somebody's home directory where a `cargo
+# clean` or a moved checkout takes the network down with it.
+warn_if_running_from_checkout() {
+    service_active && return 0
+    local pid exe=""
+    pid=$(pgrep -x vlb 2>/dev/null | head -1 || true)
+    [[ -n "$pid" ]] && exe=$(readlink -f "/proc/${pid}/exe" 2>/dev/null || true)
+    [[ -n "$exe" && "$exe" == "$REPO_DIR"/* ]] || return 0
+    echo
+    warn "this gateway is running from the checkout (${exe}) with no systemd unit."
+    warn "It will not come back on its own after a reboot, and it depends on this"
+    warn "directory staying where it is. Install the service once and that is fixed:"
+    warn "    sudo bash scripts/vlb.sh install-service"
 }
 
 # Restart however this box actually runs the daemon, and say if it could not.
@@ -647,6 +688,7 @@ cmd_update() {
             restart_daemon_now || true
             if wait_until_version "$deployed" "$want" 30; then
                 ok "the daemon is now running ${want}"
+                warn_if_running_from_checkout
             else
                 warn "the daemon still reports $(running_version "$deployed")"
                 failure_reason | sed 's/^/    /'
@@ -655,6 +697,7 @@ cmd_update() {
             return 0
         fi
         ok "already up to date: ${deployed} is what ${after:0:9} builds, and it is running"
+        warn_if_running_from_checkout
         return 0
     fi
 
@@ -686,6 +729,7 @@ cmd_update() {
     if [[ -n "$want" ]] && wait_until_version "$deployed" "$want" 30; then
         ok "the daemon is running ${want}"
         log "  the previous binary is still at ${backup} if you want it back"
+        warn_if_running_from_checkout
         return 0
     fi
     if [[ -z "$want" ]] && wait_until_serving 30 "$deployed"; then

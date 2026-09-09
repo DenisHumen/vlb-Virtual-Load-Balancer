@@ -20,7 +20,7 @@ installs the highest-priority healthy one as the kernel default route,
 flushes conntrack on switch, and ships a TUI / control protocol / SQLite
 stats so you can actually see what's happening.
 
-> **Status:** `0.6.3`. Runs in production, and the failover behaviour is
+> **Status:** `0.6.4`. Runs in production, and the failover behaviour is
 > covered by a docker lab that breaks the network nine different ways — and
 > restarts the daemon under it three more — on every CI run. Still pre-1.0:
 > config keys can change between minor versions, and `vlb check` will tell
@@ -372,6 +372,15 @@ config all stop before anything is deployed, and rewind the checkout.
 
 The restart does not interrupt traffic (see [How it works](#how-it-works)):
 the new process adopts the default route the old one left in the kernel.
+
+> **Install the service once.** `sudo bash scripts/vlb.sh start` runs the
+> gateway from the checkout with a pid file, which works but does not survive
+> a reboot and depends on that directory staying where it is. One command
+> fixes it, and `update` says so if it finds the gateway running that way:
+>
+> ```bash
+> sudo bash scripts/vlb.sh install-service
+> ```
 
 ```bash
 sudo bash scripts/vlb.sh status     # what is running now
