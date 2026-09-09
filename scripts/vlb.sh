@@ -471,6 +471,69 @@ wait_until_serving() {
     return 1
 }
 
+# The version the *running daemon* reports, which is not the version of the
+# binary on disk.
+running_version() {
+    # The `|| true` is load-bearing. Under `pipefail` a daemon that is not
+    # listening makes this pipeline fail, and `v=$(running_version …)` with
+    # `set -e` in force then ends the script mid-update — silently, right
+    # after the binary has been replaced and before anything can be rolled
+    # back. Found by the lab, which is the only reason it is not still there.
+    local out
+    out=$("$1" --config "$VLB_CONFIG" status 2>/dev/null || true)
+    printf '%s' "$out" \
+        | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        | head -n1
+}
+
+# What a binary says it is.
+binary_version() {
+    local out
+    out=$("$1" --version 2>/dev/null || true)
+    printf '%s' "$out" | awk '{print $NF}'
+}
+
+# Wait until the daemon answering is the one we just deployed.
+#
+# "Something answers" is not the same question. A restart that silently did
+# not happen leaves the previous daemon answering happily, and an update that
+# checked only for an answer would call that success — which is exactly what
+# it did on a box whose systemd unit was not the thing running vlb.
+wait_until_version() {
+    local bin="$1" want="$2" secs="${3:-30}"
+    for _ in $(seq 1 "$secs"); do
+        [[ "$(running_version "$bin")" == "$want" ]] && return 0
+        sleep 1
+    done
+    return 1
+}
+
+# Restart however this box actually runs the daemon, and say if it could not.
+restart_daemon_now() {
+    if service_active; then
+        log "restarting ${VLB_SERVICE} (systemd)"
+        systemctl restart "$VLB_SERVICE" && return 0
+        warn "systemctl restart ${VLB_SERVICE} failed"
+        return 1
+    fi
+    if is_running; then
+        log "restarting the daemon from its pid file"
+        VLB_NO_RESTART=1 bash "${BASH_SOURCE[0]}" stop >/dev/null 2>&1 || true
+        VLB_NO_RESTART=1 bash "${BASH_SOURCE[0]}" start >/dev/null 2>&1 && return 0
+        warn "could not start the daemon again"
+        return 1
+    fi
+    # A unit that exists but is not running: start it.
+    if command -v systemctl >/dev/null \
+        && systemctl list-unit-files "${VLB_SERVICE}.service" >/dev/null 2>&1; then
+        log "starting ${VLB_SERVICE}"
+        systemctl restart "$VLB_SERVICE" && return 0
+    fi
+    warn "nothing appears to be running, so there was nothing to restart"
+    warn "  start it with:  sudo bash scripts/vlb.sh start"
+    return 1
+}
+
 # Why did it not come back? Whatever the operator would have had to go and
 # look up themselves.
 failure_reason() {
@@ -574,7 +637,24 @@ cmd_update() {
 
     # Is what is deployed already what this checkout builds?
     if [[ -x "$deployed" ]] && cmp -s "$VLB_BIN" "$deployed"; then
-        ok "already up to date: ${deployed} is what ${after:0:9} builds"
+        # The binary being current does not mean the daemon is running it.
+        local want running
+        want=$(binary_version "$deployed")
+        running=$(running_version "$deployed")
+        if [[ -n "$running" && -n "$want" && "$running" != "$want" ]]; then
+            warn "${deployed} is ${want}, but the daemon answering is ${running}"
+            warn "it was never restarted onto the current binary — doing that now"
+            restart_daemon_now || true
+            if wait_until_version "$deployed" "$want" 30; then
+                ok "the daemon is now running ${want}"
+            else
+                warn "the daemon still reports $(running_version "$deployed")"
+                failure_reason | sed 's/^/    /'
+                die "could not get the daemon onto ${want}"
+            fi
+            return 0
+        fi
+        ok "already up to date: ${deployed} is what ${after:0:9} builds, and it is running"
         return 0
     fi
 
@@ -597,24 +677,33 @@ cmd_update() {
     install -m 0755 "$VLB_BIN" "$deployed" || die "could not install to ${deployed}"
     ok "deployed $("$deployed" --version 2>/dev/null || echo "the new build") to ${deployed}"
 
-    # (6) Restart and wait for it to answer. This is the point of no return
-    #     for the old binary, so everything after it can roll back.
-    if service_active || command -v systemctl >/dev/null; then
-        systemctl restart "$VLB_SERVICE" 2>/dev/null || true
-    else
-        VLB_NO_RESTART=1 bash "${BASH_SOURCE[0]}" stop >/dev/null 2>&1 || true
-        VLB_NO_RESTART=1 bash "${BASH_SOURCE[0]}" start >/dev/null 2>&1 || true
-    fi
+    # (6) Restart and wait for the NEW version to answer. This is the point
+    #     of no return for the old binary, so everything after it can roll
+    #     back.
+    local want; want=$(binary_version "$deployed")
+    restart_daemon_now || true
 
-    if wait_until_serving 30 "$deployed"; then
+    if [[ -n "$want" ]] && wait_until_version "$deployed" "$want" 30; then
+        ok "the daemon is running ${want}"
+        log "  the previous binary is still at ${backup} if you want it back"
+        return 0
+    fi
+    if [[ -z "$want" ]] && wait_until_serving 30 "$deployed"; then
+        # No version to compare against; an answer is the best we have.
         ok "the new version is serving"
-        "$deployed" --config "$VLB_CONFIG" status 2>/dev/null | sed 's/^/    /' || true
         log "  the previous binary is still at ${backup} if you want it back"
         return 0
     fi
 
-    # (7) It did not come back. Put the old one in and say why.
-    warn "the new version did not answer on ${VLB_CONFIG##*/}'s control port within 30s"
+    # (7) It did not come back as the new version. Put the old one in and say
+    #     why. This also catches a restart that silently did not happen: the
+    #     previous daemon answers, but it answers with the previous version.
+    local running; running=$(running_version "$deployed")
+    if [[ -n "$running" ]]; then
+        warn "the daemon is answering, but it reports ${running}, not ${want:-the new build}"
+    else
+        warn "the new version did not answer within 30s"
+    fi
     echo
     warn "  why it failed, from the log:"
     failure_reason | sed 's/^/    /'
@@ -623,9 +712,7 @@ cmd_update() {
     if [[ -f "$backup" ]]; then
         log "rolling back to the previous binary"
         install -m 0755 "$backup" "$deployed" || die "ROLLBACK FAILED: could not restore ${deployed} from ${backup} — restore it by hand and restart ${VLB_SERVICE}"
-        if service_active || command -v systemctl >/dev/null; then
-            systemctl restart "$VLB_SERVICE" 2>/dev/null || true
-        fi
+        restart_daemon_now || true
         if wait_until_serving 30 "$deployed"; then
             ok "rolled back — the gateway is serving the previous version again"
         else

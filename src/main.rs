@@ -57,6 +57,16 @@ use crate::balancer::Balancer;
 use crate::config::Config;
 use crate::control::{Request, Response};
 
+/// Where to look for the configuration when nobody said.
+fn default_config_path() -> &'static str {
+    const INSTALLED: &str = "/etc/vlb/vlb.toml";
+    if std::path::Path::new(INSTALLED).is_file() {
+        INSTALLED
+    } else {
+        "vlb.toml"
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "vlb",
@@ -66,7 +76,13 @@ use crate::control::{Request, Response};
 )]
 struct Cli {
     /// Path to the TOML configuration file.
-    #[arg(short, long, default_value = "vlb.toml", global = true)]
+    ///
+    /// Defaults to the installed configuration when there is one. It used to
+    /// default to a bare `vlb.toml`, so `sudo vlb status` on a working
+    /// gateway answered "failed to read config file vlb.toml" unless you
+    /// happened to be standing in the right directory — which is a strange
+    /// thing for a daemon that has a config in /etc to say.
+    #[arg(short, long, default_value = default_config_path(), global = true)]
     config: PathBuf,
 
     /// Do not modify system state (sysctl, iptables, ip route). Useful for dry-runs.
