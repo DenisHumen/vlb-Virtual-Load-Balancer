@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -170,6 +170,11 @@ pub struct Balancer {
     throughput_url: Option<crate::http::Url>,
     router: Router,
     stats: Arc<Stats>,
+    /// Connections pinned per provider mark, and when it was counted.
+    ///
+    /// Counting means dumping the whole conntrack table, so the dashboard
+    /// asking once a second must not turn into a table dump once a second.
+    pinned_cache: RwLock<Option<(Instant, HashMap<u32, u64>)>>,
     providers: RwLock<HashMap<String, ProviderState>>,
     active: RwLock<Option<String>>,
     /// Operator pin: when set, the balancer tries to keep this provider
@@ -368,6 +373,14 @@ pub struct ProviderSnapshot {
     pub last_throughput_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub last_throughput_summary: Option<String>,
+    /// How many tracked connections are pinned to this provider.
+    ///
+    /// `None` when pinning is off, or when `conntrack` could not be read.
+    /// This is the number that says whether the feature is doing anything:
+    /// after a failback the provider that was left should still be carrying
+    /// the connections that started on it.
+    #[serde(default)]
+    pub pinned_connections: Option<u64>,
 }
 
 impl Balancer {
@@ -549,6 +562,7 @@ impl Balancer {
             throughput_url,
             router,
             stats,
+            pinned_cache: RwLock::new(None),
             providers: RwLock::new(providers),
             active: RwLock::new(active),
             force_override: RwLock::new(forced),
@@ -1781,6 +1795,33 @@ impl Balancer {
         println!();
     }
 
+    /// How many connections are pinned to each provider, cached.
+    ///
+    /// Reading this means dumping the whole conntrack table, which on a busy
+    /// gateway is not free and which the dashboard would otherwise ask for
+    /// once a second. Ten seconds is fresh enough for a number that only
+    /// moves when connections open and close.
+    async fn pinned_counts(&self) -> Option<HashMap<u32, u64>> {
+        if !self.cfg.routing.pin_connections {
+            return None;
+        }
+        const TTL: Duration = Duration::from_secs(10);
+        {
+            let cache = self.pinned_cache.read().await;
+            if let Some((at, counts)) = cache.as_ref()
+                && at.elapsed() < TTL
+            {
+                return Some(counts.clone());
+            }
+        }
+        let counts = self
+            .router
+            .pinned_counts(self.cfg.routing.fwmark_mask)
+            .await?;
+        *self.pinned_cache.write().await = Some((Instant::now(), counts.clone()));
+        Some(counts)
+    }
+
     /// Point the pinning chain at a provider, so connections opened from now
     /// on are stamped with its mark.
     ///
@@ -1861,6 +1902,7 @@ impl Balancer {
             Ok(Some(r)) => Some(r.to_string()),
             _ => None,
         };
+        let pinned = self.pinned_counts().await;
         let ps = self.providers.read().await;
         let active = self.active.read().await.clone();
         let forced = self.force_override.read().await.clone();
@@ -1887,6 +1929,9 @@ impl Balancer {
                 throughput_ok: p.throughput_ok,
                 last_throughput_at: p.last_throughput_at,
                 last_throughput_summary: p.last_throughput_summary.clone(),
+                pinned_connections: pinned
+                    .as_ref()
+                    .map(|c| c.get(&self.cfg.mark_for(&p.cfg)).copied().unwrap_or(0)),
             })
             .collect();
         providers.sort_by_key(|p| p.priority);

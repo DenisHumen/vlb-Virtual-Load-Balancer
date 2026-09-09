@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::process::Command;
@@ -260,6 +261,52 @@ impl Router {
             "drop the connections pinned to one provider",
         )
         .await;
+    }
+
+    /// How many tracked connections carry each provider mark.
+    ///
+    /// One dump of the table, tallied in a single pass, rather than one
+    /// `conntrack -L -m …` per provider: the table is dumped in full either
+    /// way, and a gateway with tens of thousands of flows should not pay for
+    /// that three times to answer one question.
+    ///
+    /// `None` when conntrack is absent or unreadable — the caller shows
+    /// nothing rather than claiming zero.
+    pub async fn pinned_counts(&self, mask: u32) -> Option<HashMap<u32, u64>> {
+        if self.dry_run {
+            return None;
+        }
+        let out = Command::new("conntrack")
+            .args(["-L", "-o", "extended"])
+            .kill_on_drop(true)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .await
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut counts: HashMap<u32, u64> = HashMap::new();
+        for line in text.lines() {
+            // `mark=512` sits among the flags at the end of each entry.
+            let Some(at) = line.find("mark=") else {
+                continue;
+            };
+            let rest = &line[at + 5..];
+            let end = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
+            let Ok(mark) = rest[..end].parse::<u32>() else {
+                continue;
+            };
+            let masked = mark & mask;
+            if masked != 0 {
+                *counts.entry(masked).or_default() += 1;
+            }
+        }
+        Some(counts)
     }
 
     /// `conntrack` is an optional dependency, and until now its absence and

@@ -784,6 +784,87 @@ EOF
     done
 }
 
+# Keep connections on the uplink they started on.
+#
+# Its own menu entry rather than a line in the config for the operator to
+# find, because it is the setting that decides whether a failback is felt.
+menu_pinning() {
+    head1 "Connections during a switch"
+
+    local current="off"
+    grep -qE '^[[:space:]]*pin_connections[[:space:]]*=[[:space:]]*true' "$CONFIG_PATH" \
+        && current="on"
+
+    cat >&9 <<'EOF'
+When this is off, moving the default route moves every connection at once.
+Coming back to the primary after it recovers, pinning a provider by hand and
+the route watchdog tidying up after netplan all reset every connection on the
+box — and those are most of the switches a healthy gateway makes.
+
+When it is on, each connection stays on the uplink it started on. Only new
+connections follow the new route, so those switches are not felt at all.
+
+It cannot save a connection whose own uplink dies: that uplink's router gives
+you its own public address, and the far end hangs up the moment traffic comes
+from a different one. What it does there is drop that uplink's connections at
+once, and leave everyone else's alone.
+EOF
+    msg ""
+    if [[ "$current" == on ]]; then
+        ok "  currently ON"
+    else
+        dim "  currently off"
+    fi
+
+    if ! command -v conntrack >/dev/null; then
+        warn "conntrack is not installed, and this needs it to release the"
+        warn "connections of an uplink that goes down. Install it first:"
+        warn "  sudo apt-get install -y conntrack"
+        pause
+        return 0
+    fi
+
+    local want
+    if [[ "$current" == on ]]; then
+        ask_yes_no $'\nTurn it off?' "n" || { pause; return 0; }
+        want=false
+    else
+        ask_yes_no $'\nTurn it on?' "y" || { pause; return 0; }
+        want=true
+    fi
+
+    local candidate; candidate=$(mktemp)
+    # Replace the key if it is there, add it under [routing] if it is not.
+    awk -v want="$want" '
+        /^[[:space:]]*pin_connections[[:space:]]*=/ { print "pin_connections = " want; seen = 1; next }
+        { print }
+        /^[[:space:]]*\[routing\][[:space:]]*$/ && !seen { print "pin_connections = " want; seen = 1 }
+    ' "$CONFIG_PATH" > "$candidate"
+
+    if ! grep -qE "^pin_connections = (true|false)" "$candidate"; then
+        rm -f "$candidate"
+        warn "could not find a [routing] section to change — edit ${CONFIG_PATH} by hand"
+        pause
+        return 0
+    fi
+
+    if install_config "$candidate"; then
+        rm -f "$candidate"
+        restart_daemon
+        wait_until_serving || true
+        if [[ "$want" == true ]]; then
+            ok "connections now stay on the uplink they started on"
+            dim "  watch the 'pinned' line in  sudo vlb tui  to see it working"
+        else
+            ok "connection pinning is off again"
+        fi
+    else
+        rm -f "$candidate"
+        warn "the daemon rejected that change (shown above); nothing was altered"
+    fi
+    pause
+}
+
 menu_diagnose() {
     local bin; bin=$(vlb_binary) || { warn "no binary"; return; }
     while :; do
@@ -876,6 +957,7 @@ main_menu() {
   5) Restart
   6) Diagnose a problem
   7) Update from git
+  8) Connections during a switch
   0) Quit
 EOF
         local choice; ask choice "Choice" "0"
@@ -887,8 +969,9 @@ EOF
             5) restart_daemon; wait_until_serving || true; pause ;;
             6) menu_diagnose ;;
             7) menu_update ;;
+            8) menu_pinning ;;
             0|q|"") printf '\n' >&9; return 0 ;;
-            *) warn "pick 0-7" ;;
+            *) warn "pick 0-8" ;;
         esac
     done
 }

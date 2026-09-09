@@ -714,7 +714,20 @@ fn draw_dashboard(f: &mut ratatui::Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            // Two lines plus borders, or three when connection pinning adds
+            // its own.
+            Constraint::Length(
+                if app
+                    .snapshot
+                    .providers
+                    .iter()
+                    .any(|p| p.pinned_connections.is_some())
+                {
+                    5
+                } else {
+                    4
+                },
+            ),
             Constraint::Length(9),
             Constraint::Length(3 + app.snapshot.providers.len() as u16),
             Constraint::Length(events_h),
@@ -813,11 +826,39 @@ fn draw_gateway(f: &mut ratatui::Frame, area: Rect, app: &App) {
         ),
     ]);
 
+    // A third line, only where the feature is on: which provider is holding
+    // which connections. This is the number that says whether pinning is
+    // doing anything — after a failback the provider that was left should
+    // still be carrying the connections that started on it, and if that
+    // column reads zero everywhere the chain is not marking.
+    let mut lines = vec![Line::from(line1), line2];
+    if s.providers.iter().any(|p| p.pinned_connections.is_some()) {
+        let mut held: Vec<Span> = vec![Span::styled("pinned ", Style::default().fg(Color::Gray))];
+        let mut first = true;
+        for p in &s.providers {
+            let Some(n) = p.pinned_connections else {
+                continue;
+            };
+            if !first {
+                held.push(Span::styled("  ·  ", Style::default().fg(Color::DarkGray)));
+            }
+            first = false;
+            held.push(Span::styled(
+                format!("{} ", p.name),
+                Style::default().fg(Color::White),
+            ));
+            held.push(Span::styled(
+                fmt_count(n),
+                Style::default()
+                    .fg(if n > 0 { Color::Cyan } else { Color::DarkGray })
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        lines.push(Line::from(held));
+    }
+
     let block = Block::default().borders(Borders::ALL).title(title);
-    f.render_widget(
-        Paragraph::new(vec![Line::from(line1), line2]).block(block),
-        area,
-    );
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// Recent failovers, newest first: the answer to "what happened last night".
@@ -2654,6 +2695,13 @@ mod tests {
             // Three uplinks that all measure exactly the same speed is the
             // one detail that gives a mocked screenshot away.
             last_throughput_summary: Some(format!("{} kbit/s", 94_210 - (priority as u64 * 8_650))),
+            // The pictures show pinning on, because that is the arrangement
+            // worth showing: connections held on the uplink they started on.
+            pinned_connections: Some(match priority {
+                0 => 148,
+                1 => 26,
+                _ => 3,
+            }),
         }
     }
 

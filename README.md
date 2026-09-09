@@ -20,7 +20,7 @@ installs the highest-priority healthy one as the kernel default route,
 flushes conntrack on switch, and ships a TUI / control protocol / SQLite
 stats so you can actually see what's happening.
 
-> **Status:** `0.6.0`. Runs in production, and the failover behaviour is
+> **Status:** `0.6.1`. Runs in production, and the failover behaviour is
 > covered by a docker lab that breaks the network nine different ways — and
 > restarts the daemon under it three more — on every CI run. Still pre-1.0:
 > config keys can change between minor versions, and `vlb check` will tell
@@ -422,13 +422,36 @@ once instead of waiting out a five-day conntrack timeout — and nobody else's
 connections are touched. Before, a single blip on the primary cost you two
 resets of everything: one leaving, one coming back.
 
+```bash
+sudo bash scripts/vlb.sh install      # menu → 8) Connections during a switch
+```
+
+or by hand:
+
 ```toml
 [routing]
 pin_connections = true      # needs conntrack installed
 ```
 
 Off by default. It changes how every forwarded packet is routed, so switch it
-on deliberately, and watch `sudo vlb status` for a round afterwards.
+on deliberately.
+
+Then you can see it working. The dashboard's gateway panel grows a line
+counting the connections each uplink is holding, and after a failback the
+uplink that was left should still be carrying the ones that started on it:
+
+```text
+active isp-second   pin auto
+kernel via 10.0.1.1 dev ens18 metric 0 proto static
+pinned isp-main 148  ·  isp-second 26  ·  isp-backup 3
+```
+
+The same numbers are in `sudo vlb status` as `pinned_connections`.
+
+This assumes the software that must not be interrupted runs on a machine
+*behind* the gateway, which is the usual arrangement: only forwarded traffic
+is pinned. Connections the gateway itself opens are not, deliberately —
+marking those is how an operator locks themselves out of their own box.
 
 <details>
 <summary>If you need streams to survive a dead uplink too</summary>
