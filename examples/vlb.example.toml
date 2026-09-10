@@ -8,8 +8,26 @@ gateway_address = "10.0.0.100"
 [health]
 interval_secs = 3
 timeout_ms = 1000
-failure_threshold = 2
+
+# How sure it has to be before it moves everybody.
+#
+# A switch is not free: it resets every established connection on the
+# network. So the bar is "this uplink has stopped working", not "this uplink
+# just had a bad second". Four consecutive failed rounds at a 3-second
+# interval is twelve seconds of an uplink being continuously unreachable
+# before anyone is moved. Lower it if you would rather lose connections than
+# lose twelve seconds; raise it if the links are lossy.
+failure_threshold = 4
 success_threshold = 2
+
+# DNS gets its own, higher, count.
+#
+# UDP/53 loses a packet now and then on a link that is otherwise perfect, and
+# a lost lookup is a retry, not an outage. Counting it the way an unreachable
+# gateway is counted is how a gateway ends up switching uplinks over a
+# hiccup.
+dns_failure_threshold = 4
+
 status_print_secs = 30
 
 # External targets probed through each provider's fwmark. Mix IPs and
@@ -69,7 +87,10 @@ quorum = "majority"
 # Consecutive failing rounds before the provider is marked unhealthy. This
 # is ignored when content comes back *tampered*: wrong bytes are proof, not a
 # symptom, so that acts immediately.
-failure_threshold = 2
+#
+# Three rounds at a 10-second interval is half a minute of the canary failing
+# before anybody is moved. A single failed fetch is a failed fetch.
+failure_threshold = 3
 
 # Left unset on purpose: the default is "vlb/<version> (uplink-canary)" and
 # follows the binary. Pinned here, every gateway set up from this template
@@ -137,9 +158,13 @@ min_kbps = 128
 interval_secs = 120
 timeout_ms = 15000
 
-# Throughput is the noisiest signal here: a burst of local traffic can depress
-# a single sample. Hence a threshold rather than acting on one reading.
-failure_threshold = 2
+# Throughput is the noisiest signal here, and on a gateway the noise is your
+# own users: a 64 KiB probe fired across a link that is already busy comes
+# back slow through no fault of the ISP. vlb samples the interface on both
+# sides of the probe and does not count a slow reading against a link that
+# was demonstrably carrying more than the floor at the time — but a threshold
+# on top of that is still worth having.
+failure_threshold = 3
 
 # ─────────────────────────────────────────────────────────────────────────
 # Switching policy

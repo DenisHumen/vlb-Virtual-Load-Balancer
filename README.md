@@ -20,7 +20,7 @@ installs the highest-priority healthy one as the kernel default route,
 flushes conntrack on switch, and ships a TUI / control protocol / SQLite
 stats so you can actually see what's happening.
 
-> **Status:** `0.6.4`. Runs in production, and the failover behaviour is
+> **Status:** `0.7.0`. Runs in production, and the failover behaviour is
 > covered by a docker lab that breaks the network nine different ways — and
 > restarts the daemon under it three more — on every CI run. Still pre-1.0:
 > config keys can change between minor versions, and `vlb check` will tell
@@ -95,7 +95,7 @@ Prefer a release binary and no build? [One command for that too](#install-or-upd
 |---|---|
 | [Why](#why) · [What it does](#what-it-actually-does) | the pitch |
 | [Guided setup](#guided-setup-and-the-menu) · [Install / update](#install-or-update-on-a-server) · [From a checkout](#update-from-a-git-checkout) | getting it running |
-| [What survives a switch](#what-survives-a-switch) | connections during a failover |
+| [How readily it switches](#how-readily-it-switches) · [What survives a switch](#what-survives-a-switch) | failover behaviour |
 | [Client statistics](#who-is-on-the-network--client-statistics) | who is using the link |
 | [Configuration](#configuration-reference) · [CLI](#cli) · [TUI](#tui-hotkeys) | day-to-day use |
 | [How it works](#how-it-works) · [Failure modes](#failure-modes-we-cover) | the design |
@@ -398,6 +398,44 @@ gateway's settings.
 
 The dashboard says so plainly if it is newer than the daemon it is talking
 to, rather than showing an empty screen.
+
+---
+
+## How readily it switches
+
+A switch is not free: it resets every connection on the network. So the bar is
+"this uplink has stopped working", not "this uplink just had a bad second".
+
+Each layer keeps its own count, because a lost UDP query and a forged payment
+page are not the same kind of evidence:
+
+| layer | default | what it means |
+|---|---|---|
+| reachability | 4 rounds, ~12s | the next hop or the internet has been unanswerable that long |
+| DNS | 4 rounds, ~12s | UDP/53 drops packets on perfect links; one lost lookup is a retry |
+| content canary | 3 rounds, ~30s | one failed fetch is one failed fetch |
+| throughput floor | 3 measurements | see below |
+
+Wrong bytes are the exception. A forged payment page or a hijacked resolver is
+proof rather than a symptom, so those act on the first observation.
+
+**The throughput floor does not count your own users against you.** It exists
+to catch an ISP capping an unpaid account at 64 kbit/s. On a gateway it will
+also catch the traffic you are carrying: a 64 KiB probe fired across a busy
+link comes back slow through nobody's fault. Left alone that is a loop — the
+link is called throttled, everyone is moved off, the link goes quiet, the next
+measurement is fast, everyone moves back, and the gateway switches every few
+minutes for as long as anybody is using it. vlb samples the interface on both
+sides of the probe and does not count a slow reading against a link that was
+demonstrably carrying more than the floor at the time.
+
+Change the whole set from the menu rather than by hand:
+
+```bash
+sudo bash scripts/vlb.sh install     # → 9) How readily it switches
+```
+
+Quick is about six seconds, Balanced twelve, Patient thirty.
 
 ---
 

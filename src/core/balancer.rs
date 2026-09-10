@@ -136,6 +136,10 @@ struct ProviderState {
     /// Consecutive failing canary rounds. Tracked separately from the ICMP
     /// counters because the canary runs on its own, slower cadence.
     canary_failures: u32,
+    /// Consecutive DNS rounds that have failed. UDP/53 drops a packet now and
+    /// then on a link that is otherwise perfect, so this is counted
+    /// separately from the layers whose failure means something.
+    dns_failures: u32,
     last_canary_at: Option<DateTime<Utc>>,
     last_canary_summary: Option<String>,
     canary_ok: bool,
@@ -383,6 +387,29 @@ pub struct ProviderSnapshot {
     pub pinned_connections: Option<u64>,
 }
 
+/// Was the link merely busy, rather than capped below the floor?
+///
+/// The throughput floor exists to catch an ISP capping an unpaid account at
+/// 64 kbit/s. On a gateway it also catches the operator's own users: a 64 KiB
+/// probe fired across a link that is already carrying traffic comes back slow
+/// through nobody's fault. A link that moved more than the floor in other
+/// people's bytes during the measurement is, by observation, not capped below
+/// the floor.
+///
+/// Only for the provider currently carrying traffic. Single-armed NAT puts
+/// every provider's egress on one interface, so on a standby uplink those
+/// bytes belong to whichever provider is active, and the same reasoning would
+/// excuse a genuinely throttled link. A standby link is idle anyway, which is
+/// exactly when the measurement can be trusted.
+fn busy_rather_than_capped(
+    is_active: bool,
+    verdict_ok: bool,
+    concurrent_kbps: Option<u64>,
+    floor_kbps: u64,
+) -> bool {
+    is_active && !verdict_ok && concurrent_kbps.is_some_and(|k| k >= floor_kbps)
+}
+
 impl Balancer {
     pub async fn new(cfg: Config, dry_run: bool, prepared: Prepared) -> Result<Arc<Self>> {
         let stats = Arc::new(Stats::open(&cfg.database.path, &cfg.providers)?);
@@ -527,6 +554,7 @@ impl Balancer {
                     failure_layer: None,
                     failure_detail: None,
                     canary_failures: 0,
+                    dns_failures: 0,
                     last_canary_at: None,
                     last_canary_summary: None,
                     canary_tampered: None,
@@ -886,6 +914,50 @@ impl Balancer {
                 }
             };
 
+            // Has DNS failed for long enough to mean anything?
+            //
+            // One lost UDP/53 query is normal on a working link. Counting it
+            // the way an unreachable gateway is counted is how a gateway ends
+            // up switching uplinks over a hiccup, and a switch costs every
+            // established connection on the network.
+            let dns_failing = {
+                let ok = dns_probe_opt
+                    .as_ref()
+                    .map(|p| p.is_success())
+                    .unwrap_or(true);
+                let mut ps = self.providers.write().await;
+                match ps.get_mut(&name) {
+                    Some(e) => {
+                        if ok {
+                            if e.dns_failures > 0 {
+                                debug!(
+                                    provider = %name,
+                                    after = e.dns_failures,
+                                    "DNS answered again"
+                                );
+                            }
+                            e.dns_failures = 0;
+                            false
+                        } else {
+                            e.dns_failures = e.dns_failures.saturating_add(1);
+                            let threshold = self.cfg.health.dns_failure_threshold.max(1);
+                            if e.dns_failures < threshold {
+                                debug!(
+                                    provider = %name,
+                                    failures = e.dns_failures,
+                                    threshold,
+                                    "a DNS query went unanswered — not calling the link down for it"
+                                );
+                                false
+                            } else {
+                                true
+                            }
+                        }
+                    }
+                    None => !ok,
+                }
+            };
+
             // Roll the layers up into one verdict, keeping the *first*
             // failing layer as the cause so the log points at the real
             // problem rather than a downstream symptom.
@@ -904,11 +976,7 @@ impl Balancer {
                     FailureLayer::Internet,
                     "gateway is reachable but no external probe target answered".to_string(),
                 ));
-            } else if !dns_probe_opt
-                .as_ref()
-                .map(|p| p.is_success())
-                .unwrap_or(true)
-            {
+            } else if dns_failing {
                 failure = Some((
                     FailureLayer::Dns,
                     "ICMP reaches the internet but UDP/53 got no valid answer \
@@ -1056,6 +1124,34 @@ impl Balancer {
             async move { crate::health::resolve_a_via(&resolvers, &host, resolve_timeout, mark).await }
         };
 
+        // What the interface was carrying while we measured.
+        //
+        // The floor exists to catch an ISP capping an unpaid account at
+        // 64 kbit/s. It is not meant to catch the operator's own users, and
+        // on a gateway it catches them constantly: a 64 KiB probe fired
+        // across a link that is already busy comes back slow, the provider is
+        // called throttled, traffic moves away, the link goes quiet, the next
+        // measurement is fast, traffic comes back — and the gateway switches
+        // every few minutes for as long as anybody is using it.
+        //
+        // Sampling the interface on both sides of the probe separates the two
+        // cases. A link carrying megabits of somebody else's traffic is
+        // demonstrably not capped below the floor, whatever our own transfer
+        // managed to get.
+        let iface = self
+            .cfg
+            .providers
+            .iter()
+            .find(|p| p.name == name)
+            .map(|p| p.interface.clone());
+        let before = match &iface {
+            Some(i) => crate::traffic::snapshot()
+                .await
+                .ok()
+                .and_then(|m| m.get(i).copied()),
+            None => None,
+        };
+
         let verdict = crate::canary::check_throughput_via(
             &url,
             floor,
@@ -1066,6 +1162,26 @@ impl Balancer {
         )
         .await;
 
+        let concurrent_kbps = match (&iface, before) {
+            (Some(i), Some(before)) => crate::traffic::snapshot()
+                .await
+                .ok()
+                .and_then(|m| m.get(i).copied())
+                .and_then(|after| crate::traffic::delta(before, after))
+                .and_then(|d| {
+                    let (bytes, elapsed) = verdict.transfer();
+                    let secs = elapsed.as_secs_f64();
+                    if secs <= 0.0 {
+                        return None;
+                    }
+                    // Our own transfer is in that counter too; the rest is
+                    // everyone else's.
+                    let others = d.rx_bytes.saturating_sub(bytes as u64);
+                    Some(((others as f64 * 8.0) / secs / 1000.0) as u64)
+                }),
+            _ => None,
+        };
+
         let now = Utc::now();
         let _ = self.stats.record_health(&HealthRecord {
             provider: name.to_string(),
@@ -1075,7 +1191,27 @@ impl Balancer {
             kind: "throughput",
         });
 
-        let summary = verdict.describe();
+        // Only for the provider actually carrying traffic. On a standby
+        // uplink the bytes crossing the interface belong to whichever
+        // provider is active — single-armed NAT puts them all on one
+        // interface — so the same reasoning there would excuse a genuinely
+        // throttled link. A standby link is idle anyway, which is exactly
+        // when the measurement can be trusted.
+        let is_active = self.active.read().await.as_deref() == Some(name);
+        let busy_not_throttled =
+            busy_rather_than_capped(is_active, verdict.is_ok(), concurrent_kbps, floor);
+
+        let summary = if busy_not_throttled {
+            format!(
+                "{} — but the link carried {} kbit/s of client traffic during the \
+                 measurement, which is above the {floor} kbit/s floor, so it is busy, \
+                 not capped",
+                verdict.describe(),
+                concurrent_kbps.unwrap_or(0)
+            )
+        } else {
+            verdict.describe()
+        };
         let threshold = self.cfg.canary.throughput.failure_threshold;
 
         let mut ps = self.providers.write().await;
@@ -1085,8 +1221,13 @@ impl Balancer {
         entry.last_throughput_at = Some(now);
         entry.last_throughput_summary = Some(summary.clone());
 
-        if verdict.is_ok() {
-            if entry.throughput_failures > 0 {
+        if verdict.is_ok() || busy_not_throttled {
+            if busy_not_throttled {
+                info!(
+                    provider = %name,
+                    "not counting a slow measurement against a link that is busy: {summary}"
+                );
+            } else if entry.throughput_failures > 0 {
                 info!(provider = %name, "throughput recovered: {summary}");
             }
             entry.throughput_failures = 0;
@@ -2839,5 +2980,36 @@ mod tests {
         );
         let back: FailureLayer = serde_json::from_str("\"throttled\"").unwrap();
         assert_eq!(back, FailureLayer::Throttled);
+    }
+
+    /// The gateway used to switch every few minutes on a working link, and
+    /// this rule is why it no longer does: a 64 KiB probe across a link the
+    /// operator's own users are saturating comes back slow, and calling that
+    /// "throttled" moved everybody off, which emptied the link, which made
+    /// the next measurement fast, which moved everybody back.
+    #[test]
+    fn a_busy_link_is_not_a_capped_link() {
+        const FLOOR: u64 = 128;
+
+        assert!(
+            busy_rather_than_capped(true, false, Some(4_000), FLOOR),
+            "the active link carried 4 Mbit/s of client traffic while our probe crawled —              it is busy, not capped"
+        );
+        assert!(
+            !busy_rather_than_capped(true, false, Some(40), FLOOR),
+            "40 kbit/s total is below the floor: that is what a cap looks like"
+        );
+        assert!(
+            !busy_rather_than_capped(false, false, Some(4_000), FLOOR),
+            "on a standby uplink those bytes belong to whichever provider is active, so              they say nothing about this one"
+        );
+        assert!(
+            !busy_rather_than_capped(true, true, Some(4_000), FLOOR),
+            "a measurement that passed is not excused, it simply passed"
+        );
+        assert!(
+            !busy_rather_than_capped(true, false, None, FLOOR),
+            "no reading of the interface means no excuse — count the failure"
+        );
     }
 }

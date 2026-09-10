@@ -908,6 +908,107 @@ EOF
     pause
 }
 
+# How sure the gateway has to be before it moves everybody.
+#
+# Its own entry because it is the setting an operator actually reaches for,
+# and because getting it wrong in either direction is felt: too eager and the
+# gateway switches on a hiccup, resetting every connection on the network;
+# too patient and an outage lasts longer than it needed to.
+menu_sensitivity() {
+    head1 "How readily it switches"
+
+    local health dns canary tput
+    health=$(config_value failure_threshold "$CONFIG_PATH" health)
+    dns=$(config_value dns_failure_threshold "$CONFIG_PATH" health)
+    canary=$(config_value failure_threshold "$CONFIG_PATH" canary)
+    tput=$(config_value failure_threshold "$CONFIG_PATH" canary.throughput)
+    local interval; interval=$(config_value interval_secs "$CONFIG_PATH" health)
+    [[ -n "$interval" ]] || interval=3
+
+    cat >&9 <<'EOF'
+A switch is not free: it resets every connection on the network. So the
+question is how long an uplink must be continuously broken before everybody
+is moved off it.
+
+Reachability is checked every few seconds; DNS, the content canary and the
+throughput floor each get their own count, because a lost UDP query and a
+forged payment page are not the same kind of evidence.
+EOF
+    msg ""
+    msg "  now: reachability ${health:-?} rounds (~$(( ${health:-2} * interval ))s) · DNS ${dns:-unset} · canary ${canary:-?} · throughput ${tput:-?}"
+    msg ""
+    cat >&9 <<'EOF'
+  1) Quick      6s   switch fast, accept that a hiccup can cost connections
+  2) Balanced   12s  the shipped default — a hiccup is ignored, an outage is not
+  3) Patient    30s  for lossy links, or when a reset is worse than a stall
+  0) Leave it as it is
+EOF
+
+    local choice; ask choice "Choice" "0"
+    local h d c t
+    case "$choice" in
+        1) h=2; d=2; c=2; t=2 ;;
+        2) h=4; d=4; c=3; t=3 ;;
+        3) h=10; d=10; c=5; t=4 ;;
+        *) return 0 ;;
+    esac
+
+    local candidate; candidate=$(mktemp)
+    set_config_value "$CONFIG_PATH" health failure_threshold "$h" > "$candidate"
+    set_config_value "$candidate" health dns_failure_threshold "$d" > "${candidate}.2" \
+        && mv "${candidate}.2" "$candidate"
+    set_config_value "$candidate" canary failure_threshold "$c" > "${candidate}.2" \
+        && mv "${candidate}.2" "$candidate"
+    set_config_value "$candidate" canary.throughput failure_threshold "$t" > "${candidate}.2" \
+        && mv "${candidate}.2" "$candidate"
+
+    if install_config "$candidate"; then
+        rm -f "$candidate"
+        restart_daemon
+        wait_until_serving || true
+        ok "an uplink now has to be broken for about $(( h * interval ))s before anyone is moved"
+    else
+        rm -f "$candidate"
+        warn "the daemon rejected that change (shown above); nothing was altered"
+    fi
+    pause
+}
+
+# Read one key out of one TOML table. Tables are flat here, so "the next
+# occurrence after the header, before the next header" is the whole grammar
+# that is needed.
+config_value() {
+    local key="$1" file="$2" table="$3"
+    awk -v key="$key" -v table="[$table]" '
+        $0 ~ /^[[:space:]]*\[/ { in_table = ($0 ~ "^[[:space:]]*\\" table "[[:space:]]*$") }
+        in_table && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+            sub(/^[^=]*=[[:space:]]*/, ""); sub(/[[:space:]]*#.*/, ""); gsub(/[[:space:]]/, "")
+            print; exit
+        }
+    ' "$file"
+}
+
+# Set one key in one TOML table, adding it if it is not there. Prints the
+# whole file; the caller decides what to do with it.
+set_config_value() {
+    local file="$1" table="$2" key="$3" value="$4"
+    awk -v key="$key" -v value="$value" -v table="[$table]" '
+        function flush_pending() {
+            if (in_table && !done) { print key " = " value; done = 1 }
+        }
+        $0 ~ /^[[:space:]]*\[/ {
+            flush_pending()
+            in_table = ($0 ~ "^[[:space:]]*\\" table "[[:space:]]*$")
+            print; next
+        }
+        in_table && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+            print key " = " value; done = 1; next
+        }
+        { print }
+        END { flush_pending() }
+    ' "$file"
+}
+
 menu_diagnose() {
     local bin; bin=$(vlb_binary) || { warn "no binary"; return; }
     while :; do
@@ -1001,6 +1102,7 @@ main_menu() {
   6) Diagnose a problem
   7) Update from git
   8) Connections during a switch
+  9) How readily it switches
   0) Quit
 EOF
         local choice; ask choice "Choice" "0"
@@ -1013,8 +1115,9 @@ EOF
             6) menu_diagnose ;;
             7) menu_update ;;
             8) menu_pinning ;;
+            9) menu_sensitivity ;;
             0|q|"") printf '\n' >&9; return 0 ;;
-            *) warn "pick 0-8" ;;
+            *) warn "pick 0-9" ;;
         esac
     done
 }

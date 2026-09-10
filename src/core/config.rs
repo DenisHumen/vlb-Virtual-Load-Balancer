@@ -578,6 +578,15 @@ pub struct HealthConfig {
     pub timeout_ms: u64,
     #[serde(default = "default_failure_threshold")]
     pub failure_threshold: u32,
+    /// Consecutive DNS rounds that must fail before DNS counts as broken.
+    ///
+    /// Separate from `failure_threshold`, and higher, because UDP/53 is the
+    /// layer that loses a packet for no reason. Treating one lost query the
+    /// way an unreachable gateway is treated makes a gateway that switches
+    /// uplinks over a hiccup — and a switch costs every established
+    /// connection, which is far worse than one slow lookup.
+    #[serde(default = "default_dns_failure_threshold")]
+    pub dns_failure_threshold: u32,
     #[serde(default = "default_success_threshold")]
     pub success_threshold: u32,
     /// External probe targets. Each entry is either an IPv4 literal
@@ -632,6 +641,7 @@ impl Default for HealthConfig {
             interval_secs: default_interval(),
             timeout_ms: default_timeout_ms(),
             failure_threshold: default_failure_threshold(),
+            dns_failure_threshold: default_dns_failure_threshold(),
             success_threshold: default_success_threshold(),
             probe_targets: default_probe_targets(),
             dns_check_enabled: default_dns_enabled(),
@@ -649,6 +659,9 @@ fn default_interval() -> u64 {
 }
 fn default_timeout_ms() -> u64 {
     1000
+}
+fn default_dns_failure_threshold() -> u32 {
+    4
 }
 fn default_failure_threshold() -> u32 {
     2

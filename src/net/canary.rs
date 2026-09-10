@@ -596,6 +596,19 @@ pub enum ThroughputVerdict {
 }
 
 impl ThroughputVerdict {
+    /// How much was moved, and how long it took.
+    ///
+    /// Needed to work out what *else* the link was carrying at the time: the
+    /// interface counter includes this transfer, so it has to be subtracted
+    /// before the remainder can be called somebody else's traffic.
+    pub fn transfer(&self) -> (usize, std::time::Duration) {
+        match self {
+            ThroughputVerdict::Ok { bytes, elapsed, .. }
+            | ThroughputVerdict::TooSlow { bytes, elapsed, .. } => (*bytes, *elapsed),
+            _ => (0, std::time::Duration::ZERO),
+        }
+    }
+
     pub fn is_ok(&self) -> bool {
         matches!(self, ThroughputVerdict::Ok { .. })
     }
