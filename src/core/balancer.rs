@@ -490,6 +490,14 @@ fn traffic_rows(
     rows
 }
 
+/// Is the daemon still waiting for its first verdicts? True while some
+/// provider has not been probed to Up or Down, for at most the first two
+/// minutes — a provider that never reaches a verdict must not keep an
+/// outage from being reported for ever.
+fn still_settling(states: impl IntoIterator<Item = State>, since_start: Duration) -> bool {
+    since_start < Duration::from_secs(120) && states.into_iter().any(|s| s == State::Unknown)
+}
+
 /// Is the status frame due? Always the first time, whenever what it shows
 /// has changed, and otherwise every `every_secs` (never, if 0).
 fn status_due(
@@ -1601,6 +1609,11 @@ impl Balancer {
             (views, by_name)
         };
 
+        let settling = still_settling(
+            views.iter().map(|v| v.state),
+            (now - self.started_at).to_std().unwrap_or_default(),
+        );
+
         let mut active_guard = self.active.write().await;
         let current: Option<String> = (*active_guard).clone();
 
@@ -1630,10 +1643,19 @@ impl Balancer {
             *self.failback_pending.lock().unwrap() = pending;
         }
 
-        let outage = self.no_healthy.lock().unwrap().observe(
-            matches!(decision, Decision::NoHealthyProvider),
-            std::time::Instant::now(),
-        );
+        // Nothing up *yet* is not an outage. Right after a start every
+        // provider is still unprobed, selection says "nothing is healthy",
+        // and the installed route is kept — which is exactly right, and was
+        // logged as an ERROR on every restart.
+        let no_healthy = matches!(decision, Decision::NoHealthyProvider);
+        let outage = if no_healthy && settling {
+            OutageLine::Quiet
+        } else {
+            self.no_healthy
+                .lock()
+                .unwrap()
+                .observe(no_healthy, std::time::Instant::now())
+        };
         if let OutageLine::Ended { lasted } = outage {
             info!(
                 "a healthy provider is back after {} with none",
@@ -1851,6 +1873,9 @@ impl Balancer {
                         "still no healthy providers after {} — nothing has passed its checks yet",
                         repeat::human(lasted)
                     ),
+                    _ if settling => {
+                        debug!("no provider has a verdict yet — keeping the installed route")
+                    }
                     _ => debug!("no healthy providers (unchanged)"),
                 }
                 Ok(())
@@ -3383,6 +3408,24 @@ mod tests {
                 ("b".to_string(), "lan".to_string(), 3_000),
                 ("c".to_string(), "wan2".to_string(), 500),
             ]
+        );
+    }
+
+    /// After a restart every provider is unprobed for a few seconds, and
+    /// "nothing is healthy" is the literal truth that used to be logged as
+    /// an ERROR on every start. Once the providers have verdicts — or after
+    /// two minutes, whatever they have — it is an outage again.
+    #[test]
+    fn a_fresh_start_is_not_an_outage() {
+        let s = Duration::from_secs;
+        use State::{Down, Unknown, Up};
+        assert!(still_settling([Unknown, Unknown, Unknown], s(2)));
+        assert!(still_settling([Down, Unknown], s(10)), "one still unprobed");
+        assert!(!still_settling([Down, Down], s(10)), "every verdict is in");
+        assert!(!still_settling([Up, Down], s(10)));
+        assert!(
+            !still_settling([Unknown, Unknown], s(121)),
+            "a provider stuck without a verdict cannot hide an outage"
         );
     }
 
