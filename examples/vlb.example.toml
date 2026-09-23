@@ -242,6 +242,14 @@ disable_host_firewall = false
 [database]
 path = "/var/lib/vlb/stats.db"
 
+# Hand the space that pruning frees back to the filesystem. SQLite reuses
+# freed pages but never shrinks the file by itself, so without this the file
+# stays at the largest size it ever reached. A database from an older release
+# is rewritten once at startup if it is mostly empty pages (skipped, with a
+# warning, when the disk lacks room for a copy); after that a small step
+# follows every prune.
+auto_compact = true
+
 [control]
 # Unauthenticated; loopback only, and validation refuses anything else.
 listen = "127.0.0.1:7650"

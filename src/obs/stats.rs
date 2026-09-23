@@ -4,6 +4,7 @@ use rusqlite::{Connection, params};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
+use tracing::info;
 
 use crate::clients::ClientCounters;
 use crate::config::Provider;
@@ -135,11 +136,19 @@ impl Stats {
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open stats db at {}", path.display()))?;
 
+        // Incremental auto-vacuum, so the pages that pruning frees can be
+        // handed back to the filesystem instead of keeping the file at its
+        // high-water mark forever. SQLite only honours this before the first
+        // table is created, so it has to come first — and on an existing
+        // database it changes nothing until that database is rewritten,
+        // which is what `compact_on_start` is for.
+        //
         // WAL + NORMAL sync gives us durability across crashes with minimal
         // write amplification — important when health-check writes happen
         // every few seconds per provider.
         conn.execute_batch(
-            "PRAGMA journal_mode = WAL;\
+            "PRAGMA auto_vacuum = INCREMENTAL;\
+             PRAGMA journal_mode = WAL;\
              PRAGMA synchronous = NORMAL;\
              PRAGMA foreign_keys = ON;",
         )
@@ -147,16 +156,23 @@ impl Stats {
 
         conn.execute_batch(SCHEMA)
             .context("failed to apply stats schema")?;
+        migrate(&conn).context("failed to migrate the stats schema")?;
+        // Views are recreated on every open rather than `IF NOT EXISTS`:
+        // otherwise a database keeps whatever definition it was created with,
+        // bugs included, for as long as it lives.
+        conn.execute_batch(VIEWS)
+            .context("failed to create stats views")?;
 
         for p in providers {
             conn.execute(
-                "INSERT INTO providers(name, gateway, interface, priority, role)
-                 VALUES(?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO providers(name, gateway, interface, priority, role, removed_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, NULL)
                  ON CONFLICT(name) DO UPDATE SET
                      gateway = excluded.gateway,
                      interface = excluded.interface,
                      priority = excluded.priority,
-                     role = excluded.role",
+                     role = excluded.role,
+                     removed_at = NULL",
                 params![
                     p.name,
                     p.gateway.to_string(),
@@ -166,10 +182,195 @@ impl Stats {
                 ],
             )?;
         }
+        // A provider that was renamed or dropped from the config is history,
+        // not a current uplink. Its row stays — health and traffic rows
+        // refer to it by name — but it is marked, so nothing reading the
+        // table mistakes it for one that is still configured.
+        let configured: std::collections::HashSet<&str> =
+            providers.iter().map(|p| p.name.as_str()).collect();
+        let listed: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT name FROM providers WHERE removed_at IS NULL")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let now = Utc::now().to_rfc3339();
+        for name in listed.iter().filter(|n| !configured.contains(n.as_str())) {
+            conn.execute(
+                "UPDATE providers SET removed_at = ?2 WHERE name = ?1",
+                params![name, now],
+            )?;
+        }
 
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Providers that are in the database but no longer in the config.
+    pub fn removed_providers(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT name FROM providers WHERE removed_at IS NOT NULL ORDER BY name")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    // ── keeping the file small ──────────────────────────────────────────
+    //
+    // SQLite reuses the pages that deleted rows leave behind, so the file
+    // does not grow without bound — but it never shrinks either. After any
+    // peak (a longer retention, an older release that did not prune, a burst
+    // of samples) the file stays at its largest size for good, most of it
+    // empty. On a gateway that runs from an SD card or a small VPS disk that
+    // is a real cost, so vlb keeps the free pages handed back: a one-off
+    // rewrite for databases created before this existed, and a small
+    // incremental step after every prune from then on.
+
+    /// Rewrite a bloated database once, switching it to incremental
+    /// auto-vacuum on the way.
+    ///
+    /// Only for the daemon at startup, before any background loop writes:
+    /// `VACUUM` holds the database for as long as it takes to copy the live
+    /// data (seconds for hundreds of megabytes). Routing does not wait for
+    /// it — the kernel keeps forwarding on the routes already installed.
+    /// Never returns an error: a failed compaction is logged and startup
+    /// carries on.
+    pub fn compact_on_start(&self, path: &Path) -> Compaction {
+        self.compact_on_start_with(path, COMPACT_MIN_FREE_BYTES, available_space)
+    }
+
+    fn compact_on_start_with(
+        &self,
+        path: &Path,
+        min_free_bytes: u64,
+        free_space: impl Fn(&Path) -> Option<u64>,
+    ) -> Compaction {
+        let conn = self.conn.lock().unwrap();
+        let pages = match PageStats::read(&conn) {
+            Ok(p) => p,
+            Err(e) => {
+                return Compaction::Failed {
+                    error: format!("could not read the page counts: {e:#}"),
+                };
+            }
+        };
+        // Already incremental: the per-prune step keeps it trimmed.
+        if pages.auto_vacuum != AUTO_VACUUM_NONE {
+            return Compaction::NotNeeded;
+        }
+        let free = pages.free_bytes();
+        if free <= min_free_bytes.max(pages.file_bytes() / 4) {
+            return Compaction::NotNeeded;
+        }
+
+        // VACUUM writes a complete copy of the live data before it lets go
+        // of the old one, and in WAL mode the copy passes through the WAL
+        // as well. Twice the live data is the margin that makes running
+        // out of disk halfway impossible.
+        let need = pages.data_bytes().saturating_mul(2);
+        let dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let manual = format!(
+            "stop vlb, then run: sqlite3 {} 'PRAGMA auto_vacuum = INCREMENTAL; VACUUM;'",
+            path.display()
+        );
+        match free_space(dir) {
+            Some(avail) if avail >= need => {}
+            Some(avail) => {
+                return Compaction::Skipped {
+                    reason: format!(
+                        "{} of {} is free pages, but compacting needs {} of disk space and \
+                         only {} is available; {manual}",
+                        crate::format::bytes(free),
+                        crate::format::bytes(pages.file_bytes()),
+                        crate::format::bytes(need),
+                        crate::format::bytes(avail),
+                    ),
+                };
+            }
+            None => {
+                return Compaction::Skipped {
+                    reason: format!(
+                        "could not tell how much disk space is free in {}; {manual}",
+                        dir.display()
+                    ),
+                };
+            }
+        }
+
+        let before = on_disk_size(path);
+        info!(
+            file = %crate::format::bytes(before),
+            free_pages = %crate::format::bytes(free),
+            data = %crate::format::bytes(pages.data_bytes()),
+            "stats: compacting the database once (routing is unaffected; probes resume when \
+             this finishes)"
+        );
+        let started = std::time::Instant::now();
+        let result = conn
+            .execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;")
+            .and_then(|()| conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);"));
+        let elapsed = started.elapsed();
+        if let Err(e) = result {
+            return Compaction::Failed {
+                error: format!("VACUUM failed after {elapsed:.1?}: {e}; {manual}"),
+            };
+        }
+        let mode = PageStats::read(&conn).map(|p| p.auto_vacuum).unwrap_or(-1);
+        if mode != AUTO_VACUUM_INCREMENTAL {
+            return Compaction::Failed {
+                error: format!(
+                    "VACUUM ran but auto_vacuum is still {mode}; the file was compacted once \
+                     but will grow back"
+                ),
+            };
+        }
+        Compaction::Done {
+            before,
+            after: on_disk_size(path),
+            elapsed,
+        }
+    }
+
+    /// Hand free pages back to the filesystem, a bounded step at a time.
+    ///
+    /// Called after a prune that deleted something. Each step holds the
+    /// write lock only for [`RECLAIM_STEP_PAGES`] pages and the lock is
+    /// released between steps, so the probe writers never queue behind a
+    /// long reclaim. Returns the number of pages reclaimed; `0` on a
+    /// database that is not in incremental mode (it has not been compacted
+    /// yet), where there is nothing this can do.
+    pub fn reclaim_free_pages(&self) -> Result<u64> {
+        let mut reclaimed = 0;
+        for _ in 0..RECLAIM_MAX_STEPS {
+            let conn = self.conn.lock().unwrap();
+            let before = PageStats::read(&conn)?;
+            if before.auto_vacuum != AUTO_VACUUM_INCREMENTAL || before.freelist == 0 {
+                break;
+            }
+            // Stepped to the end, not `execute_batch`: this pragma frees one
+            // page per result row, so a single step would free one page.
+            {
+                let mut stmt =
+                    conn.prepare(&format!("PRAGMA incremental_vacuum({RECLAIM_STEP_PAGES})"))?;
+                let mut rows = stmt.query([])?;
+                while rows.next()?.is_some() {}
+            }
+            let after = PageStats::read(&conn)?;
+            let step = before.freelist.saturating_sub(after.freelist);
+            reclaimed += step;
+            if step == 0 || after.freelist == 0 {
+                break;
+            }
+        }
+        Ok(reclaimed)
+    }
+
+    #[cfg(test)]
+    fn page_stats(&self) -> Result<PageStats> {
+        Ok(PageStats::read(&self.conn.lock().unwrap())?)
     }
 
     pub fn record_health(&self, r: &HealthRecord) -> Result<()> {
@@ -622,21 +823,24 @@ impl Stats {
     /// Remove traffic samples older than `retention_hours`. Cheap — the
     /// index on `ts` turns it into a range delete.
     pub fn prune_traffic(&self, retention_hours: u32) -> Result<usize> {
+        self.prune_traffic_at(retention_hours, Utc::now())
+    }
+
+    pub fn prune_traffic_at(&self, retention_hours: u32, now: DateTime<Utc>) -> Result<usize> {
         if retention_hours == 0 {
             return Ok(0);
         }
-        let window = format!("-{retention_hours} hours");
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
-            "DELETE FROM traffic_samples WHERE ts < datetime('now', ?1)",
-            params![window],
+            "DELETE FROM traffic_samples WHERE ts < ?1",
+            params![cutoff(now, retention_hours)],
         )?;
         Ok(n)
     }
 
-    /// Sum rx/tx bytes+packets per provider over a trailing time window.
-    pub fn traffic_totals(&self, hours: u32) -> Result<Vec<TrafficTotals>> {
-        let window = format!("-{hours} hours");
+    /// Sum rx/tx bytes+packets per provider over the `hours` before `now`.
+    pub fn traffic_totals_at(&self, hours: u32, now: DateTime<Utc>) -> Result<Vec<TrafficTotals>> {
+        let window = cutoff(now, hours);
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT provider,
@@ -645,7 +849,7 @@ impl Stats {
                     COALESCE(SUM(tx_bytes), 0),
                     COALESCE(SUM(tx_packets), 0)
              FROM traffic_samples
-             WHERE ts >= datetime('now', ?1)
+             WHERE ts >= ?1
              GROUP BY provider
              ORDER BY provider",
         )?;
@@ -748,14 +952,17 @@ impl Stats {
 
     /// Range-delete old system samples. Returns the number of rows removed.
     pub fn prune_system(&self, retention_hours: u32) -> Result<usize> {
+        self.prune_system_at(retention_hours, Utc::now())
+    }
+
+    pub fn prune_system_at(&self, retention_hours: u32, now: DateTime<Utc>) -> Result<usize> {
         if retention_hours == 0 {
             return Ok(0);
         }
-        let window = format!("-{retention_hours} hours");
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
-            "DELETE FROM system_samples WHERE ts < datetime('now', ?1)",
-            params![window],
+            "DELETE FROM system_samples WHERE ts < ?1",
+            params![cutoff(now, retention_hours)],
         )?;
         Ok(n)
     }
@@ -821,9 +1028,27 @@ impl Stats {
     /// Used by the `vlb stats` CLI subcommand; the query runs read-only and
     /// does not block probe writers for any meaningful duration.
     pub fn report(&self, hours: u32, recent: u32) -> Result<String> {
+        self.report_at(hours, recent, Utc::now())
+    }
+
+    pub fn report_at(&self, hours: u32, recent: u32, now: DateTime<Utc>) -> Result<String> {
         use std::fmt::Write;
+        // History of a provider that has since left the config is still
+        // history, but it must not read as a current uplink.
+        let removed: std::collections::HashSet<String> = self
+            .removed_providers()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let shown = |name: &str| -> String {
+            if removed.contains(name) {
+                format!("{name} (removed)")
+            } else {
+                name.to_string()
+            }
+        };
         let conn = self.conn.lock().unwrap();
-        let window = format!("-{hours} hours");
+        let window = cutoff(now, hours);
 
         let mut s = String::new();
         let _ = writeln!(s, "vlb stats — last {hours}h window");
@@ -837,7 +1062,7 @@ impl Stats {
                     ROUND(AVG(CAST(success AS REAL)) * 100, 2) AS pct,
                     ROUND(AVG(latency_ms), 2) AS avg_ms
              FROM health_checks
-             WHERE ts >= datetime('now', ?1)
+             WHERE ts >= ?1
              GROUP BY provider, kind
              ORDER BY provider, kind",
         )?;
@@ -860,6 +1085,7 @@ impl Stats {
             let avg_str = avg_ms
                 .map(|v| format!("{v:.2}"))
                 .unwrap_or_else(|| "--".into());
+            let provider = shown(&provider);
             let _ = writeln!(
                 s,
                 "{provider:<18} {kind:<10} {total:>8} {ok:>8} {pct:>8.2} {avg_str:>10}"
@@ -870,12 +1096,12 @@ impl Stats {
         }
 
         // Traffic totals per provider over the same window. We have to
-        // release the connection lock before calling `traffic_totals`
+        // release the connection lock before calling `traffic_totals_at`
         // because it re-acquires the same mutex internally.
         drop(rows);
         drop(stmt);
         drop(conn);
-        let traffic = self.traffic_totals(hours).unwrap_or_default();
+        let traffic = self.traffic_totals_at(hours, now).unwrap_or_default();
         let _ = writeln!(s);
         let _ = writeln!(s, "traffic totals:");
         let _ = writeln!(s, "{}", "-".repeat(72));
@@ -891,7 +1117,11 @@ impl Stats {
                 let _ = writeln!(
                     s,
                     "{:<18} {:>14} {:>12} {:>14} {:>12}",
-                    t.provider, t.rx_bytes, t.rx_packets, t.tx_bytes, t.tx_packets
+                    shown(&t.provider),
+                    t.rx_bytes,
+                    t.rx_packets,
+                    t.tx_bytes,
+                    t.tx_packets
                 );
             }
         }
@@ -906,7 +1136,7 @@ impl Stats {
                         AVG(load1),     MAX(load1),
                         MAX(mem_total), MAX(swap_used)
                  FROM system_samples
-                 WHERE ts >= datetime('now', ?1)",
+                 WHERE ts >= ?1",
             )?;
             let mut rows = stmt.query(params![window])?;
             if let Some(row) = rows.next()? {
@@ -992,6 +1222,137 @@ impl Stats {
     }
 }
 
+/// Free pages a database that predates incremental auto-vacuum may carry
+/// before it is rewritten at startup — or a quarter of the file, whichever
+/// is larger. Below that the one-off rewrite costs more than it saves.
+const COMPACT_MIN_FREE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Pages handed back per `incremental_vacuum` step: 16 MiB at the default
+/// 4 KiB page size, a few tens of milliseconds of write lock.
+const RECLAIM_STEP_PAGES: u32 = 4_000;
+
+/// Steps per call. An hourly prune frees far less than this; the cap only
+/// matters after a retention cut, which then drains over a few prunes
+/// instead of in one long burst.
+const RECLAIM_MAX_STEPS: u32 = 16;
+
+const AUTO_VACUUM_NONE: i64 = 0;
+const AUTO_VACUUM_INCREMENTAL: i64 = 2;
+
+/// The page-level shape of the database file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageStats {
+    pub page_size: u64,
+    pub page_count: u64,
+    pub freelist: u64,
+    /// 0 = none, 1 = full, 2 = incremental.
+    pub auto_vacuum: i64,
+}
+
+impl PageStats {
+    fn read(conn: &Connection) -> rusqlite::Result<Self> {
+        let get = |pragma: &str| conn.query_row(pragma, [], |r| r.get::<_, i64>(0));
+        Ok(Self {
+            page_size: get("PRAGMA page_size")?.max(0) as u64,
+            page_count: get("PRAGMA page_count")?.max(0) as u64,
+            freelist: get("PRAGMA freelist_count")?.max(0) as u64,
+            auto_vacuum: get("PRAGMA auto_vacuum")?,
+        })
+    }
+
+    pub fn free_bytes(&self) -> u64 {
+        self.freelist.saturating_mul(self.page_size)
+    }
+
+    pub fn file_bytes(&self) -> u64 {
+        self.page_count.saturating_mul(self.page_size)
+    }
+
+    pub fn data_bytes(&self) -> u64 {
+        self.page_count
+            .saturating_sub(self.freelist)
+            .saturating_mul(self.page_size)
+    }
+}
+
+/// What `compact_on_start` did.
+#[derive(Debug)]
+pub enum Compaction {
+    /// Already in incremental mode, or not bloated enough to be worth it.
+    NotNeeded,
+    /// Worth doing but not safe right now; the reason includes the command
+    /// to do it by hand.
+    Skipped {
+        reason: String,
+    },
+    Done {
+        before: u64,
+        after: u64,
+        elapsed: std::time::Duration,
+    },
+    Failed {
+        error: String,
+    },
+}
+
+/// Bytes the database occupies on disk: the file plus its WAL.
+fn on_disk_size(path: &Path) -> u64 {
+    let len = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    len(path) + len(Path::new(&wal))
+}
+
+/// Space available to an unprivileged writer on the filesystem holding
+/// `dir`, or `None` if it cannot be told.
+fn available_space(dir: &Path) -> Option<u64> {
+    let dir = std::fs::canonicalize(dir).ok()?;
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    disks
+        .list()
+        .iter()
+        .filter(|d| dir.starts_with(d.mount_point()))
+        .max_by_key(|d| d.mount_point().as_os_str().len())
+        .map(|d| d.available_space())
+}
+
+/// Bring a database created by an older release up to the current schema.
+///
+/// `CREATE TABLE IF NOT EXISTS` never touches a table that is already there,
+/// so a column added later has to be added here — and only ever added, with
+/// a default, so the previous release can still open the file after a
+/// rollback.
+fn migrate(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "providers", "removed_at")? {
+        conn.execute_batch("ALTER TABLE providers ADD COLUMN removed_at TEXT;")?;
+    }
+    Ok(())
+}
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for name in names {
+        if name? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The start of a trailing window, in the form the `ts` columns are stored
+/// in.
+///
+/// Computed here rather than with SQLite's `datetime('now', …)`: that
+/// returns `2026-09-20 19:30:00`, the stored values look like
+/// `2026-09-20T19:30:00.123+00:00`, and the comparison is textual — `T`
+/// sorts after the space, so every row from the cutoff's calendar day read
+/// as newer than the cutoff. Every `ts` is written by `to_rfc3339()` on a
+/// UTC time, so values in the same form compare correctly as text.
+fn cutoff(now: DateTime<Utc>, hours: u32) -> String {
+    (now - chrono::Duration::hours(i64::from(hours))).to_rfc3339()
+}
+
 /// Timestamps are stored as RFC 3339 text. A row that somehow holds
 /// something else is not worth failing a whole query over — the alternative
 /// is a dashboard that goes blank because of one bad row — so it reads as
@@ -1016,11 +1377,12 @@ fn map_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClientSessionRow> {
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS providers (
-    name      TEXT PRIMARY KEY,
-    gateway   TEXT NOT NULL,
-    interface TEXT NOT NULL,
-    priority  INTEGER NOT NULL,
-    role      TEXT NOT NULL
+    name       TEXT PRIMARY KEY,
+    gateway    TEXT NOT NULL,
+    interface  TEXT NOT NULL,
+    priority   INTEGER NOT NULL,
+    role       TEXT NOT NULL,
+    removed_at TEXT           -- set when the provider left the config
 );
 
 CREATE TABLE IF NOT EXISTS health_checks (
@@ -1132,9 +1494,19 @@ CREATE TABLE IF NOT EXISTS kv (
     value      TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+"#;
 
--- Convenience view: per-provider rolling success ratio over last 1h.
-CREATE VIEW IF NOT EXISTS provider_health_summary AS
+/// Views, dropped and recreated on every open (see `Stats::open`).
+///
+/// The cutoff is `strftime('%Y-%m-%dT%H:%M:%S', …)`, not `datetime(…)`:
+/// stored timestamps have a `T` between date and time, `datetime` puts a
+/// space there, and in a text comparison that made "the last hour" mean
+/// "since midnight UTC".
+const VIEWS: &str = r#"
+-- Convenience view: per-provider rolling success ratio over the last hour,
+-- for the providers in the current config.
+DROP VIEW IF EXISTS provider_health_summary;
+CREATE VIEW provider_health_summary AS
 SELECT
     provider,
     COUNT(*)                                   AS total,
@@ -1142,7 +1514,8 @@ SELECT
     ROUND(AVG(CAST(success AS REAL)) * 100, 2) AS success_pct,
     ROUND(AVG(latency_ms), 2)                  AS avg_latency_ms
 FROM health_checks
-WHERE ts >= datetime('now', '-1 hour')
+WHERE ts >= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-1 hour')
+  AND provider NOT IN (SELECT name FROM providers WHERE removed_at IS NOT NULL)
 GROUP BY provider;
 "#;
 
@@ -1283,7 +1656,7 @@ mod tests {
         stats
             .record_traffic("p0", "eth0", Utc::now(), 1.0, &delta)
             .unwrap();
-        let totals = stats.traffic_totals(1).unwrap();
+        let totals = stats.traffic_totals_at(1, Utc::now()).unwrap();
         assert_eq!(totals.len(), 1);
         assert_eq!(totals[0].provider, "p0");
         assert_eq!(totals[0].rx_bytes, 1024);
@@ -1521,5 +1894,316 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(tmp.with_extension("db-wal"));
         let _ = std::fs::remove_file(tmp.with_extension("db-shm"));
+    }
+
+    fn temp_db(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "vlb-{tag}-{}-{}.db",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ))
+    }
+
+    fn remove_db(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    fn utc(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    fn provider(name: &str) -> Provider {
+        Provider {
+            name: name.into(),
+            gateway: Ipv4Addr::new(10, 0, 0, 1),
+            interface: "eth0".into(),
+            priority: 0,
+            role: ProviderRole::Primary,
+        }
+    }
+
+    /// Fill `health_checks` with `n` rows in one transaction.
+    fn fill(conn: &Connection, n: usize) {
+        conn.execute_batch("BEGIN").unwrap();
+        {
+            let mut stmt = conn
+                .prepare(
+                    "INSERT INTO health_checks(provider, ts, success, latency_ms, kind)
+                     VALUES('p0', '2020-01-01T00:00:00+00:00', 1, 12.5, 'gateway')",
+                )
+                .unwrap();
+            for _ in 0..n {
+                stmt.execute([]).unwrap();
+            }
+        }
+        conn.execute_batch("COMMIT").unwrap();
+    }
+
+    /// What an older release left behind: no auto-vacuum, and a table that
+    /// was filled and then emptied, so most of the file is free pages.
+    fn legacy_db(path: &Path, rows: usize) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "PRAGMA auto_vacuum = NONE;
+             PRAGMA journal_mode = WAL;
+             CREATE TABLE providers (
+                 name TEXT PRIMARY KEY, gateway TEXT NOT NULL,
+                 interface TEXT NOT NULL, priority INTEGER NOT NULL,
+                 role TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        fill(&conn, rows);
+        conn.execute_batch("DELETE FROM health_checks;").unwrap();
+    }
+
+    /// Every trailing window used to be compared against SQLite's
+    /// `datetime('now', …)`, which has a space where the stored timestamps
+    /// have a `T` — so anything from the cutoff's calendar day counted as
+    /// inside the window. Rows an hour either side of the cutoff, on the
+    /// same UTC day and across midnight, pin down where the cut really is.
+    #[test]
+    fn trailing_windows_cut_at_the_hour_not_at_midnight() {
+        for (now, case) in [
+            ("2026-09-20T19:30:00Z", "cutoff mid-day"),
+            ("2026-09-21T00:30:00Z", "cutoff just after midnight"),
+        ] {
+            let now = utc(now);
+            let db = temp_db("windows");
+            let stats = Stats::open(&db, &mk_providers()).unwrap();
+
+            let cut = now - chrono::Duration::hours(72);
+            let before_cut = cut - chrono::Duration::hours(1);
+            let after_cut = cut + chrono::Duration::hours(1);
+            let d = crate::traffic::IfCounters {
+                rx_bytes: 100,
+                rx_packets: 1,
+                tx_bytes: 10,
+                tx_packets: 1,
+            };
+            for ts in [before_cut, after_cut] {
+                stats.record_traffic("p0", "eth0", ts, 1.0, &d).unwrap();
+                stats
+                    .record_system(ts, &SysSample::default(), false)
+                    .unwrap();
+                stats
+                    .record_health(&HealthRecord {
+                        provider: "p0".into(),
+                        timestamp: ts,
+                        success: true,
+                        latency_ms: Some(5.0),
+                        kind: "gateway",
+                    })
+                    .unwrap();
+            }
+
+            // Totals and the report see the row inside the window only.
+            let totals = stats.traffic_totals_at(72, now).unwrap();
+            assert_eq!(totals.len(), 1, "{case}");
+            assert_eq!(
+                totals[0].rx_bytes, 100,
+                "{case}: totals reached past the cutoff"
+            );
+            let report = stats.report_at(72, 5, now).unwrap();
+            let health_total = report
+                .lines()
+                .find(|l| l.starts_with("p0 ") && l.contains("gateway"))
+                .and_then(|l| l.split_whitespace().nth(2))
+                .unwrap_or_else(|| panic!("{case}: no health line in\n{report}"));
+            assert_eq!(health_total, "1", "{case}: report reached past the cutoff");
+
+            // Pruning removes exactly the row before the cutoff.
+            assert_eq!(stats.prune_traffic_at(72, now).unwrap(), 1, "{case}");
+            assert_eq!(stats.prune_system_at(72, now).unwrap(), 1, "{case}");
+            assert_eq!(stats.prune_traffic_at(72, now).unwrap(), 0, "{case}");
+            assert_eq!(stats.prune_system_at(72, now).unwrap(), 0, "{case}");
+            let left: String = stats
+                .conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT ts FROM traffic_samples", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(left, after_cut.to_rfc3339(), "{case}");
+
+            drop(stats);
+            remove_db(&db);
+        }
+    }
+
+    /// "The last hour" in the summary view used to mean "since midnight UTC".
+    /// The view runs on SQLite's clock, so the rows are placed relative to
+    /// the real now, with wide margins either side.
+    #[test]
+    fn health_summary_view_covers_the_last_hour() {
+        let db = temp_db("view");
+        let stats = Stats::open(&db, &[provider("p0"), provider("gone")]).unwrap();
+        let now = Utc::now();
+        for (who, minutes_ago) in [("p0", 150), ("p0", 90), ("p0", 20), ("gone", 10)] {
+            stats
+                .record_health(&HealthRecord {
+                    provider: who.into(),
+                    timestamp: now - chrono::Duration::minutes(minutes_ago),
+                    success: true,
+                    latency_ms: Some(1.0),
+                    kind: "gateway",
+                })
+                .unwrap();
+        }
+        drop(stats);
+
+        // Reopened without `gone`: its fresh row is history, not an uplink.
+        let stats = Stats::open(&db, &[provider("p0")]).unwrap();
+        let rows: Vec<(String, i64)> = {
+            let conn = stats.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT provider, total FROM provider_health_summary ORDER BY provider")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(rows, vec![("p0".to_string(), 1)]);
+
+        drop(stats);
+        remove_db(&db);
+    }
+
+    /// A database from before incremental auto-vacuum, emptied out, is
+    /// rewritten once: it switches mode, loses its free pages, shrinks on
+    /// disk — and a second start leaves it alone.
+    #[test]
+    fn a_bloated_legacy_database_is_compacted_once() {
+        let db = temp_db("legacy");
+        legacy_db(&db, 50_000);
+
+        let stats = Stats::open(&db, &mk_providers()).unwrap();
+        let before = stats.page_stats().unwrap();
+        assert_eq!(
+            before.auto_vacuum, AUTO_VACUUM_NONE,
+            "opening alone must not rewrite"
+        );
+        assert!(before.freelist * 2 > before.page_count, "{before:?}");
+        let size_before = on_disk_size(&db);
+
+        match stats.compact_on_start_with(&db, 0, |_| Some(u64::MAX)) {
+            Compaction::Done { before, after, .. } => {
+                assert!(after < before, "{before} -> {after}")
+            }
+            other => panic!("expected a compaction, got {other:?}"),
+        }
+        let after = stats.page_stats().unwrap();
+        assert_eq!(after.auto_vacuum, AUTO_VACUUM_INCREMENTAL);
+        assert!(after.freelist < 8, "{after:?}");
+        let size_after = on_disk_size(&db);
+        assert!(
+            size_after * 4 < size_before,
+            "{size_before} -> {size_after}"
+        );
+
+        assert!(matches!(
+            stats.compact_on_start_with(&db, 0, |_| Some(u64::MAX)),
+            Compaction::NotNeeded
+        ));
+        // The migration added the column the new code writes.
+        {
+            let conn = stats.conn.lock().unwrap();
+            assert!(has_column(&conn, "providers", "removed_at").unwrap());
+        }
+
+        drop(stats);
+        remove_db(&db);
+    }
+
+    /// VACUUM needs room for a copy of the live data. Short of it — or not
+    /// knowing — the rewrite is skipped with the command to run by hand, and
+    /// the database is left exactly as it was.
+    #[test]
+    fn compaction_is_skipped_without_the_disk_space_for_it() {
+        let db = temp_db("nospace");
+        legacy_db(&db, 20_000);
+        let stats = Stats::open(&db, &mk_providers()).unwrap();
+        let before = stats.page_stats().unwrap();
+
+        for free in [Some(0), None] {
+            match stats.compact_on_start_with(&db, 0, |_| free) {
+                Compaction::Skipped { reason } => {
+                    assert!(reason.contains("VACUUM"), "no manual command in: {reason}")
+                }
+                other => panic!("expected a skip with {free:?} bytes free, got {other:?}"),
+            }
+        }
+        assert_eq!(stats.page_stats().unwrap(), before);
+
+        // Not bloated enough to be worth it: left alone as well.
+        assert!(matches!(
+            stats.compact_on_start_with(&db, u64::MAX, |_| Some(u64::MAX)),
+            Compaction::NotNeeded
+        ));
+
+        drop(stats);
+        remove_db(&db);
+    }
+
+    /// A new database is incremental from the start, and the step after a
+    /// prune hands the freed pages back.
+    #[test]
+    fn pages_freed_by_a_prune_are_returned() {
+        let db = temp_db("reclaim");
+        let stats = Stats::open(&db, &mk_providers()).unwrap();
+        assert_eq!(
+            stats.page_stats().unwrap().auto_vacuum,
+            AUTO_VACUUM_INCREMENTAL
+        );
+        fill(&stats.conn.lock().unwrap(), 50_000);
+        assert_eq!(stats.prune_health(72).unwrap(), 50_000);
+        let freed = stats.page_stats().unwrap();
+        assert!(freed.freelist > 100, "{freed:?}");
+
+        let reclaimed = stats.reclaim_free_pages().unwrap();
+        let after = stats.page_stats().unwrap();
+        assert_eq!(reclaimed, freed.freelist);
+        assert_eq!(after.freelist, 0);
+        assert!(after.page_count < freed.page_count);
+        // Nothing left to do is not an error.
+        assert_eq!(stats.reclaim_free_pages().unwrap(), 0);
+
+        drop(stats);
+        remove_db(&db);
+    }
+
+    /// Providers renamed or dropped from the config stay in the table —
+    /// their history refers to them — but are marked, and come back to life
+    /// if they are configured again.
+    #[test]
+    fn providers_that_left_the_config_are_not_current() {
+        let db = temp_db("removed");
+        drop(Stats::open(&db, &[provider("a"), provider("b")]).unwrap());
+
+        let stats = Stats::open(&db, &[provider("a"), provider("c")]).unwrap();
+        assert_eq!(stats.removed_providers().unwrap(), vec!["b".to_string()]);
+        stats
+            .record_health(&HealthRecord {
+                provider: "b".into(),
+                timestamp: Utc::now(),
+                success: true,
+                latency_ms: None,
+                kind: "gateway",
+            })
+            .unwrap();
+        let report = stats.report(1, 5).unwrap();
+        assert!(report.contains("b (removed)"), "{report}");
+        drop(stats);
+
+        let stats = Stats::open(&db, &[provider("b")]).unwrap();
+        assert_eq!(
+            stats.removed_providers().unwrap(),
+            vec!["a".to_string(), "c".to_string()]
+        );
+        drop(stats);
+        remove_db(&db);
     }
 }

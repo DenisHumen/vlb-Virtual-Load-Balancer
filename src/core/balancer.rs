@@ -22,7 +22,8 @@ use crate::notify;
 use crate::router::Router;
 use crate::selection::{Decision, FlapTracker, ProviderView, SelectionInput, decide};
 use crate::stats::{
-    ClientRollup, FailoverEvent, FailoverRecord, HealthRecord, Stats, SystemPoint, TrafficPoint,
+    ClientRollup, Compaction, FailoverEvent, FailoverRecord, HealthRecord, Stats, SystemPoint,
+    TrafficPoint,
 };
 use crate::sysmon::SysMonitor;
 use crate::system::Prepared;
@@ -410,9 +411,40 @@ fn busy_rather_than_capped(
     is_active && !verdict_ok && concurrent_kbps.is_some_and(|k| k >= floor_kbps)
 }
 
+/// Rewrite a bloated statistics database once, before anything else writes
+/// to it. Never fails startup: the worst outcome is a warning and a file
+/// that stays as large as it was.
+async fn compact_stats_on_start(stats: &Arc<Stats>, path: &std::path::Path) {
+    let (stats, path) = (stats.clone(), path.to_path_buf());
+    let outcome = tokio::task::spawn_blocking(move || stats.compact_on_start(&path)).await;
+    match outcome {
+        Ok(Compaction::NotNeeded) => {}
+        Ok(Compaction::Done {
+            before,
+            after,
+            elapsed,
+        }) => info!(
+            before = %crate::format::bytes(before),
+            after = %crate::format::bytes(after),
+            took = ?elapsed,
+            "stats: database compacted; it now shrinks after every prune"
+        ),
+        Ok(Compaction::Skipped { reason }) => {
+            warn!("stats: database not compacted: {reason}")
+        }
+        Ok(Compaction::Failed { error }) => {
+            warn!("stats: database compaction failed, carrying on without it: {error}")
+        }
+        Err(e) => warn!(error = %e, "stats: database compaction did not run"),
+    }
+}
+
 impl Balancer {
     pub async fn new(cfg: Config, dry_run: bool, prepared: Prepared) -> Result<Arc<Self>> {
         let stats = Arc::new(Stats::open(&cfg.database.path, &cfg.providers)?);
+        if cfg.database.auto_compact {
+            compact_stats_on_start(&stats, &cfg.database.path).await;
+        }
         let router = Router::new(dry_run, prepared.installed_bootstrap);
         let now = Utc::now();
 
@@ -1824,6 +1856,22 @@ impl Balancer {
         }
     }
 
+    /// Give the pages a prune just freed back to the filesystem.
+    ///
+    /// Bounded steps with the lock released in between (see
+    /// `Stats::reclaim_free_pages`), so it never holds up the probe writers
+    /// for long. A no-op until the database is in incremental mode.
+    fn reclaim_after_prune(&self) {
+        if !self.cfg.database.auto_compact {
+            return;
+        }
+        match self.stats.reclaim_free_pages() {
+            Ok(0) => {}
+            Ok(pages) => debug!(pages, "stats: returned free pages to the filesystem"),
+            Err(e) => warn!(error = %e, "stats: could not return free pages"),
+        }
+    }
+
     /// Hourly prune of `health_checks`. Without this the table grows without
     /// bound — several rows per provider every few seconds adds up to tens
     /// of millions of rows a year on a box that is never restarted.
@@ -1844,7 +1892,10 @@ impl Balancer {
                 }
             }
             match self.stats.prune_health(retention) {
-                Ok(n) if n > 0 => info!(deleted = n, "health: pruned old check rows"),
+                Ok(n) if n > 0 => {
+                    info!(deleted = n, "health: pruned old check rows");
+                    self.reclaim_after_prune();
+                }
                 Ok(_) => {}
                 Err(e) => warn!(error = %e, "health: prune failed"),
             }
@@ -2531,7 +2582,10 @@ impl Balancer {
             if cfg.retention_hours > 0 && (now - last_prune).num_seconds() > 3600 {
                 last_prune = now;
                 match self.stats.prune_clients(cfg.retention_hours) {
-                    Ok(n) if n > 0 => info!(deleted = n, "clients: pruned old history"),
+                    Ok(n) if n > 0 => {
+                        info!(deleted = n, "clients: pruned old history");
+                        self.reclaim_after_prune();
+                    }
                     Ok(_) => {}
                     Err(e) => warn!(error = %e, "clients: prune failed"),
                 }
@@ -2816,7 +2870,10 @@ impl Balancer {
             // Prune at most once per hour.
             if retention > 0 && (now - last_prune).num_seconds() > 3600 {
                 match self.stats.prune_traffic(retention) {
-                    Ok(n) if n > 0 => info!(deleted = n, "traffic: pruned old samples"),
+                    Ok(n) if n > 0 => {
+                        info!(deleted = n, "traffic: pruned old samples");
+                        self.reclaim_after_prune();
+                    }
                     Ok(_) => {}
                     Err(e) => warn!(error = %e, "traffic: prune failed"),
                 }
@@ -2861,7 +2918,10 @@ impl Balancer {
 
             if retention > 0 && (now - last_prune).num_seconds() > 3600 {
                 match self.stats.prune_system(retention) {
-                    Ok(n) if n > 0 => info!(deleted = n, "system: pruned old samples"),
+                    Ok(n) if n > 0 => {
+                        info!(deleted = n, "system: pruned old samples");
+                        self.reclaim_after_prune();
+                    }
                     Ok(_) => {}
                     Err(e) => warn!(error = %e, "system: prune failed"),
                 }

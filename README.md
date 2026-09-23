@@ -847,7 +847,8 @@ manage                 = true    # write iptables MASQUERADE / mangle rules
 disable_host_firewall  = false   # leave UFW etc. alone
 
 [database]
-path = "/var/lib/vlb/stats.db"
+path         = "/var/lib/vlb/stats.db"
+auto_compact = true              # hand space freed by pruning back to the disk
 
 [canary]                         # content authenticity — see below
 enabled         = true
@@ -1004,6 +1005,21 @@ provider has passed **every** layer continuously for `failback_stable_secs`.
 If a link proves unstable — more than `flap_threshold` switches inside
 `flap_window_secs` — that wait doubles for each extra switch, capped at
 `max_failback_stable_secs`, and decays on its own once the link settles.
+
+### The statistics database
+
+Every table with a `retention_hours` is pruned hourly to exactly that window.
+With `auto_compact = true` (the default) the space those rows occupied goes
+back to the filesystem too: SQLite reuses freed pages but never shrinks the
+file on its own, so without it the file would stay at the largest size it ever
+reached.
+
+A database created by a release before 0.7.1 is rewritten once, at the first
+start, when more than a quarter of it (and at least 64 MiB) is empty pages.
+That takes seconds for a few hundred megabytes of data; routing does not wait
+for it, only the first probes do. It is skipped, with a warning and the
+command to run by hand, if the disk does not have room for twice the live data.
+From then on a small step after every prune keeps the file trimmed.
 
 ### Client accounting
 

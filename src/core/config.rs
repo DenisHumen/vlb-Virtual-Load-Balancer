@@ -783,12 +783,18 @@ fn default_true() -> bool {
 pub struct DatabaseConfig {
     #[serde(default = "default_db_path")]
     pub path: PathBuf,
+    /// Give the space that pruning frees back to the filesystem: rewrite a
+    /// bloated database once at startup, then trim a little after every
+    /// prune. Without it the file stays at its largest size for good.
+    #[serde(default = "default_true")]
+    pub auto_compact: bool,
 }
 
 impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
             path: default_db_path(),
+            auto_compact: true,
         }
     }
 }
