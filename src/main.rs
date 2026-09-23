@@ -41,6 +41,8 @@ mod traffic;
 mod logger;
 #[path = "obs/notify.rs"]
 mod notify;
+#[path = "obs/repeat.rs"]
+mod repeat;
 #[path = "obs/stats.rs"]
 mod stats;
 #[path = "obs/sysmon.rs"]

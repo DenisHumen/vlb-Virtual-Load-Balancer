@@ -28,7 +28,11 @@ success_threshold = 2
 # hiccup.
 dns_failure_threshold = 4
 
-status_print_secs = 30
+# The status frame in the log. It is printed whenever a provider changes
+# state or the active provider changes, and otherwise this often; 0 prints it
+# only on changes. Every half minute — the old default — is thousands of
+# identical frames a day in the journal.
+status_print_secs = 900
 
 # External targets probed through each provider's fwmark. Mix IPs and
 # hostnames: hostnames are resolved through that provider's own mark-bound

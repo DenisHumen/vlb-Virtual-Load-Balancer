@@ -761,6 +761,15 @@ vlb --config /etc/vlb/vlb.toml tui
 vlb --config /etc/vlb/vlb.toml stats --hours 24
 ```
 
+The journal is kept for events. A provider that starts failing gets one
+warning with the reason, a summary every 15 minutes while it stays that way
+(`isp-b still failing: … — 90 failed checks in the last 15m`), and a line when
+its state changes; the per-check detail is at DEBUG (`RUST_LOG=debug`). "No
+healthy providers" is logged when it starts, every 15 minutes while it lasts,
+and with its duration when it ends. The status frame is printed when a
+provider's state or the active provider changes, and otherwise every
+`health.status_print_secs` (default 15 minutes; 0 = only on changes).
+
 The unit is written for a gateway, and the choices are deliberate:
 
 | Setting                         | Why                                                                 |
@@ -834,6 +843,7 @@ probe_targets       = ["1.1.1.1", "8.8.8.8", "google.com"]
 dns_check_enabled   = true
 dns_resolvers       = ["1.1.1.1", "8.8.8.8"]
 dns_check_name      = "cloudflare.com"
+status_print_secs   = 900        # status frame in the log: on every change, and this often (0 = changes only)
 
 [routing]
 table_base  = 200                # provider tables: 200, 201, ...

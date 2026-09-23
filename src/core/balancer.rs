@@ -19,6 +19,7 @@ use crate::health::{
     ProbeTarget, check_dns_integrity_via, check_dns_via, check_gateway, check_internet_via,
 };
 use crate::notify;
+use crate::repeat::{self, FailureLine, FailureLog, OutageLine, OutageLog};
 use crate::router::Router;
 use crate::selection::{Decision, FlapTracker, ProviderView, SelectionInput, decide};
 use crate::stats::{
@@ -208,6 +209,10 @@ pub struct Balancer {
     /// Last line handed to systemd, so an unchanged status is not re-sent on
     /// every tick.
     last_status_line: StdMutex<String>,
+    /// "No healthy providers" is re-decided after every probe of every
+    /// provider; this keeps it to one line when it starts, a reminder now
+    /// and then, and one line when it ends.
+    no_healthy: StdMutex<OutageLog>,
 }
 
 /// A better provider is healthy and the daemon is waiting for it to prove
@@ -439,6 +444,24 @@ async fn compact_stats_on_start(stats: &Arc<Stats>, path: &std::path::Path) {
     }
 }
 
+/// Is the status frame due? Always the first time, whenever what it shows
+/// has changed, and otherwise every `every_secs` (never, if 0).
+fn status_due(
+    last: Option<&(String, std::time::Instant)>,
+    fingerprint: &str,
+    now: std::time::Instant,
+    every_secs: u64,
+) -> bool {
+    match last {
+        None => true,
+        Some((printed, at)) => {
+            printed != fingerprint
+                || (every_secs > 0
+                    && now.saturating_duration_since(*at) >= Duration::from_secs(every_secs))
+        }
+    }
+}
+
 impl Balancer {
     pub async fn new(cfg: Config, dry_run: bool, prepared: Prepared) -> Result<Arc<Self>> {
         let stats = Arc::new(Stats::open(&cfg.database.path, &cfg.providers)?);
@@ -635,6 +658,7 @@ impl Balancer {
             started_at: now,
             failback_pending: StdMutex::new(None),
             last_status_line: StdMutex::new(String::new()),
+            no_healthy: StdMutex::new(OutageLog::default()),
         });
         me.publish_status().await;
         Ok(me)
@@ -785,6 +809,8 @@ impl Balancer {
         // provider is simply — and truthfully — down.
         let mut policy_ready = self.dry_run || !self.policy_pending.contains(&name);
         let mut policy_attempts: u32 = 0;
+
+        let mut failure_log = FailureLog::default();
 
         loop {
             tokio::select! {
@@ -1114,18 +1140,38 @@ impl Balancer {
                 .or_else(|| gw_probe.latency_ms());
 
             if let Some((layer, detail)) = &failure {
-                if layer.is_conclusive() {
+                // Full line when it is news, a summary now and then while it
+                // lasts, DEBUG for every round in between. A provider that is
+                // down for a day would otherwise write thousands of identical
+                // warnings and bury the lines that matter.
+                let line = failure_log.failed(layer.as_str(), std::time::Instant::now());
+                match (line, layer.is_conclusive()) {
                     // Loud, because this is the case that used to go
                     // completely unnoticed and leave clients offline.
-                    error!(
+                    (FailureLine::Report, true) => error!(
                         provider = %name,
                         layer = layer.as_str(),
                         "{} {} — {detail}",
                         "UPLINK COMPROMISED".bright_red().bold(),
                         name.bright_white().bold(),
-                    );
-                } else {
-                    warn!(provider = %name, layer = layer.as_str(), "unhealthy: {detail}");
+                    ),
+                    (FailureLine::Report, false) => {
+                        warn!(provider = %name, layer = layer.as_str(), "unhealthy: {detail}")
+                    }
+                    (FailureLine::Summary { checks, over }, conclusive) => {
+                        let text = format!(
+                            "{name} still failing: {detail} — {checks} failed checks in the last {}",
+                            repeat::human(over)
+                        );
+                        if conclusive {
+                            error!(provider = %name, layer = layer.as_str(), "{text}");
+                        } else {
+                            warn!(provider = %name, layer = layer.as_str(), "{text}");
+                        }
+                    }
+                    (FailureLine::Repeat, _) => {
+                        debug!(provider = %name, layer = layer.as_str(), "unhealthy: {detail}")
+                    }
                 }
             }
 
@@ -1534,6 +1580,17 @@ impl Balancer {
             *self.failback_pending.lock().unwrap() = pending;
         }
 
+        let outage = self.no_healthy.lock().unwrap().observe(
+            matches!(decision, Decision::NoHealthyProvider),
+            std::time::Instant::now(),
+        );
+        if let OutageLine::Ended { lasted } = outage {
+            info!(
+                "a healthy provider is back after {} with none",
+                repeat::human(lasted)
+            );
+        }
+
         match decision {
             Decision::Keep => {
                 // What the kernel is forwarding on right now, read before
@@ -1727,13 +1784,24 @@ impl Balancer {
             }
 
             Decision::NoHealthyProvider => {
-                if let Some(cur) = current {
-                    error!(
+                match (outage, current) {
+                    (OutageLine::Started, Some(cur)) => error!(
                         provider = %cur,
                         "no healthy providers — keeping the installed route (traffic may black-hole)"
-                    );
-                } else {
-                    warn!("no healthy providers yet — waiting for first successful probes");
+                    ),
+                    (OutageLine::Reminder { lasted }, Some(cur)) => error!(
+                        provider = %cur,
+                        "still no healthy providers after {} — keeping the installed route",
+                        repeat::human(lasted)
+                    ),
+                    (OutageLine::Started, None) => {
+                        warn!("no healthy providers yet — waiting for first successful probes")
+                    }
+                    (OutageLine::Reminder { lasted }, None) => warn!(
+                        "still no healthy providers after {} — nothing has passed its checks yet",
+                        repeat::human(lasted)
+                    ),
+                    _ => debug!("no healthy providers (unchanged)"),
                 }
                 Ok(())
             }
@@ -1914,16 +1982,47 @@ impl Balancer {
             }
         }
 
-        let interval = Duration::from_secs(self.cfg.health.status_print_secs.max(5));
+        // The frame is printed when something an operator cares about has
+        // changed — a provider's state, the active provider, a pin — and
+        // otherwise only every `status_print_secs` (0: never on a timer).
+        // Printing it every half minute regardless wrote thousands of
+        // identical frames a day into the journal.
+        let every = self.cfg.health.status_print_secs;
+        let poll = Duration::from_secs(self.cfg.health.interval_secs.max(1));
+        let mut last: Option<(String, std::time::Instant)> = None;
         loop {
-            self.print_status().await;
+            let fingerprint = self.status_fingerprint().await;
+            let now = std::time::Instant::now();
+            if status_due(last.as_ref(), &fingerprint, now, every) {
+                self.print_status().await;
+                last = Some((fingerprint, now));
+            }
             tokio::select! {
-                _ = tokio::time::sleep(interval) => {}
+                _ = tokio::time::sleep(poll) => {}
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() { return; }
                 }
             }
         }
+    }
+
+    /// What the status frame says that matters: who is active, who is
+    /// pinned, and each provider's state — not latencies or timestamps,
+    /// which differ on every look.
+    async fn status_fingerprint(&self) -> String {
+        let active = self.active.read().await.clone().unwrap_or_default();
+        let forced = self.force_override.read().await.clone().unwrap_or_default();
+        let ps = self.providers.read().await;
+        let mut states: Vec<(u32, &str, &str)> = ps
+            .values()
+            .map(|p| (p.cfg.priority, p.cfg.name.as_str(), p.state.as_str()))
+            .collect();
+        states.sort();
+        let states: Vec<String> = states
+            .iter()
+            .map(|(_, name, state)| format!("{name}={state}"))
+            .collect();
+        format!("active={active} forced={forced} {}", states.join(" "))
     }
 
     async fn print_status(&self) {
@@ -3071,5 +3170,33 @@ mod tests {
             !busy_rather_than_capped(true, false, None, FLOOR),
             "no reading of the interface means no excuse — count the failure"
         );
+    }
+
+    /// The status frame used to be printed every 30 s whatever happened —
+    /// thousands of identical frames a day. It is now printed when what it
+    /// shows changes, and on a timer only as often as configured.
+    #[test]
+    fn the_status_frame_is_printed_on_change_and_on_its_timer() {
+        let t0 = std::time::Instant::now();
+        let s = |n: u64| t0 + Duration::from_secs(n);
+        let last = ("active=a a=up b=down".to_string(), t0);
+
+        assert!(status_due(None, "anything", t0, 900), "first frame");
+        assert!(!status_due(Some(&last), &last.0, s(60), 900), "nothing new");
+        assert!(
+            status_due(Some(&last), "active=b a=down b=up", s(60), 900),
+            "a change is printed at once"
+        );
+        assert!(status_due(Some(&last), &last.0, s(900), 900), "timer");
+        assert!(
+            !status_due(Some(&last), &last.0, s(86_400), 0),
+            "0 means only on changes"
+        );
+        assert!(
+            status_due(Some(&last), "active=b", s(10), 0),
+            "a change still is printed with 0"
+        );
+        // An explicitly configured short interval keeps working.
+        assert!(status_due(Some(&last), &last.0, s(30), 30));
     }
 }

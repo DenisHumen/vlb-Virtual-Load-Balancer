@@ -620,6 +620,9 @@ pub struct HealthConfig {
     /// the resolver might cache forever.
     #[serde(default = "default_dns_name")]
     pub dns_check_name: String,
+    /// How often the status frame is printed to the log when nothing has
+    /// changed. It is always printed when a provider's state or the active
+    /// provider changes; 0 means only then.
     #[serde(default = "default_status_interval")]
     pub status_print_secs: u64,
     /// Ask each resolver for a random name under `.invalid`, which RFC 6761
@@ -670,7 +673,7 @@ fn default_success_threshold() -> u32 {
     2
 }
 fn default_status_interval() -> u64 {
-    30
+    900
 }
 fn default_health_retention() -> u32 {
     72
@@ -1070,8 +1073,8 @@ impl Config {
                 bail!("health.dns_check_name must be a non-empty FQDN (e.g. cloudflare.com)");
             }
         }
-        if self.health.status_print_secs < 5 {
-            bail!("health.status_print_secs must be >= 5");
+        if self.health.status_print_secs != 0 && self.health.status_print_secs < 5 {
+            bail!("health.status_print_secs must be 0 (print only when something changes) or >= 5");
         }
 
         // Routing-table reservations: 0 unspec, 253 default, 254 main,
@@ -1630,6 +1633,18 @@ mod tests {
     fn validate_ok_minimal() {
         let cfg = base_cfg(vec![provider("p0", 0)]);
         cfg.validate().unwrap();
+    }
+
+    /// 0 now means "print the status frame only when something changes";
+    /// the explicit values older configs carry keep validating.
+    #[test]
+    fn status_print_secs_accepts_zero_and_old_values() {
+        for (secs, ok) in [(0, true), (1, false), (4, false), (5, true), (30, true)] {
+            let mut cfg = base_cfg(vec![provider("p0", 0)]);
+            cfg.health.status_print_secs = secs;
+            assert_eq!(cfg.validate().is_ok(), ok, "status_print_secs = {secs}");
+        }
+        assert_eq!(HealthConfig::default().status_print_secs, 900);
     }
 
     /// Priorities no longer have to start at 0, and gaps are fine. A
