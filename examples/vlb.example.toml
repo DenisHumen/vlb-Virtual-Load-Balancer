@@ -258,6 +258,14 @@ auto_compact = true
 # Unauthenticated; loopback only, and validation refuses anything else.
 listen = "127.0.0.1:7650"
 
+# Traffic per provider, for the dashboard graph and `vlb stats`.
+#
+# With `firewall.manage = true` forwarded traffic is counted per uplink in an
+# iptables chain of vlb's own (VLB_UPLINKS), so providers that share one
+# interface each get their own numbers. Without it, a provider with an
+# interface to itself is counted from that interface, and providers sharing
+# an interface are reported together as that interface's total — never
+# each credited with all of it.
 [traffic]
 enabled = true
 interval_secs = 2

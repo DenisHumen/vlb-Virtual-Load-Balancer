@@ -179,6 +179,9 @@ struct App {
     snapshot: ControlSnapshot,
     selected: usize,
     traffic: HashMap<String, Vec<TrafficPointWire>>,
+    /// Providers whose graph is their interface's total (see
+    /// `Response::Traffic::interface_total`), and which interface.
+    traffic_shared: HashMap<String, String>,
     system: Vec<SystemPointWire>,
     events: Vec<FailoverEventWire>,
     view: View,
@@ -238,6 +241,7 @@ impl App {
             snapshot,
             selected: 0,
             traffic: HashMap::new(),
+            traffic_shared: HashMap::new(),
             system: Vec::new(),
             events: Vec::new(),
             view: View::Dashboard,
@@ -320,8 +324,15 @@ impl App {
             )
             .await
             {
-                Ok(Response::Traffic { points }) => {
+                Ok(Response::Traffic {
+                    points,
+                    interface_total,
+                }) => {
                     self.traffic.insert(p.name.clone(), points);
+                    match interface_total {
+                        Some(iface) => self.traffic_shared.insert(p.name.clone(), iface),
+                        None => self.traffic_shared.remove(&p.name),
+                    };
                 }
                 Ok(_) => {}
                 Err(_) => {}
@@ -2155,9 +2166,15 @@ fn draw_traffic(f: &mut ratatui::Frame, area: Rect, app: &App) {
             .data(&tx),
     ];
 
+    // Providers sharing an interface, without per-uplink counters, only
+    // have the interface's total; say so rather than pass it off as theirs.
+    let whose = match app.traffic_shared.get(&selected.name) {
+        Some(iface) => format!("{iface}, all providers on it"),
+        None => selected.name.clone(),
+    };
     let title = format!(
         " {} — rx {} ({} pkts)  ·  tx {} ({} pkts)  ·  samples: {} ",
-        selected.name,
+        whose,
         fmt_bytes(rx_total),
         fmt_count(rx_pkts),
         fmt_bytes(tx_total),

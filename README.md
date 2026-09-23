@@ -1031,6 +1031,21 @@ for it, only the first probes do. It is skipped, with a warning and the
 command to run by hand, if the disk does not have room for twice the live data.
 From then on a small step after every prune keeps the file trimmed.
 
+### Traffic per provider
+
+With `firewall.manage = true` forwarded traffic is counted per uplink in a
+chain of vlb's own hooked into `FORWARD` (`VLB_UPLINKS`), split by the
+provider each connection belongs to: its pinned mark when connection pinning
+stamped one, otherwise the provider that was active — which, without
+pinning, is exactly where every forwarded packet went. Providers that share
+one interface each get their own numbers, and they add up to the total.
+
+Without firewall management there is nothing to split by. A provider with an
+interface to itself is counted from that interface; providers that share an
+interface are shown together as that interface's total — the dashboard
+titles the graph `ens18, all providers on it` and `vlb stats` lists it as
+`ens18 (all)` — rather than each being credited with all of it.
+
 ### Client accounting
 
 Full walk-through in [Client statistics](#who-is-on-the-network--client-statistics).
@@ -1353,7 +1368,11 @@ stops the container outright, which is a genuine LAN disconnection, and
 checks that vlb notices, records the drop, and picks the host back up with
 its history intact when it returns.
 
-96 assertions in 23 scenarios, all on Ubuntu 24.04.
+Traffic per uplink is tested on the same shared interface: the client's
+256 KB download has to be credited to the active provider, and the standby,
+which carried none of it, must not gain it too.
+
+103 assertions in 26 scenarios, all on Ubuntu 24.04.
 
 `expired` and `portal-http` are the two that matter. `expired` is the full
 production symptom. `portal-http` is the stricter test: it leaves DNS entirely
@@ -1590,11 +1609,13 @@ runs as root. If you're running by hand, prefix with `sudo`.
     │   ├── pin.rs            # per-connection provider marking (mangle chain)
     │   ├── router.rs         # writes to the kernel routing table
     │   ├── system.rs         # iptables / sysctl / ip rule / table bring-up
-    │   └── traffic.rs        # /proc/net/dev sampling
+    │   ├── traffic.rs        # /proc/net/dev sampling
+    │   └── uplinks.rs        # per-uplink forwarded-traffic counters (FORWARD chain)
     ├── obs/
     │   ├── logger.rs         # tracing setup
     │   ├── notify.rs         # sd_notify without libsystemd (status line in systemctl)
-    │   ├── stats.rs          # SQLite schema, queries, retention, persisted pin
+    │   ├── repeat.rs         # keeps repeated failures out of the log once they stop being news
+    │   ├── stats.rs          # SQLite schema, queries, retention, compaction, persisted pin
     │   └── sysmon.rs         # host metric sampling
     └── ui/
         ├── control.rs        # tiny line-delimited JSON control protocol

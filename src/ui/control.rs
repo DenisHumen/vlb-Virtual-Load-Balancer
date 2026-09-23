@@ -116,6 +116,11 @@ pub enum Response {
     },
     Traffic {
         points: Vec<TrafficPointWire>,
+        /// Set when `points` are the total of an interface several providers
+        /// share, because their traffic could not be told apart. Absent from
+        /// older daemons, which never split it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interface_total: Option<String>,
     },
     System {
         points: Vec<SystemPointWire>,
@@ -303,7 +308,8 @@ async fn dispatch(req: Request, balancer: &Arc<Balancer>) -> Response {
             }
         }
         Request::Traffic { provider, limit } => match balancer.recent_traffic(&provider, limit) {
-            Ok(points) => Response::Traffic {
+            Ok((points, interface_total)) => Response::Traffic {
+                interface_total,
                 points: points
                     .into_iter()
                     .map(|p| TrafficPointWire {

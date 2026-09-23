@@ -36,6 +36,8 @@ mod router;
 mod system;
 #[path = "net/traffic.rs"]
 mod traffic;
+#[path = "net/uplinks.rs"]
+mod uplinks;
 
 #[path = "obs/logger.rs"]
 mod logger;

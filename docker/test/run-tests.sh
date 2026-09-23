@@ -1058,6 +1058,59 @@ scenario_clients() {
         || bad "clients: traffic after the reconnection was not counted ($rx → $rx2)"
 }
 
+# Bytes received through provider `$1` over the last hour, as `vlb stats`
+# reports them. Read from the traffic section only: the health section above
+# it lists the same names.
+uplink_rx() {
+    local report
+    report=$(vlb_exec vlb --config /etc/vlb/vlb.toml stats --hours 1 || true)
+    awk -v p="$1" '/^traffic totals:/ {t=1; next} /^system load/ {t=0} t && $1 == p {print $2; exit}' \
+        <<<"$report"
+}
+
+# Both providers sit on eth0 here: the single-armed layout in which counting
+# the interface credited each of them with all of its traffic, so their rows
+# were identical and their sum was double the truth.
+scenario_uplink_traffic() {
+    info "uplink traffic — two providers on one interface are counted apart"
+    reset_lab
+    local rules
+    rules=$(vlb_exec iptables -S VLB_UPLINKS | grep -c '^-A' || true)
+    if [ "${rules:-0}" = 6 ]; then
+        ok "per-uplink counting chain installed (2 rules per provider + 2 for unmarked)"
+    else
+        bad "uplink_traffic: VLB_UPLINKS has ${rules:-0} rules, expected 6"
+        note "$(vlb_exec iptables -S VLB_UPLINKS | tr '\n' ' ')"
+    fi
+
+    local main0 backup0
+    main0=$(uplink_rx isp-main); main0=${main0:-0}
+    backup0=$(uplink_rx isp-backup); backup0=${backup0:-0}
+    "${COMPOSE[@]}" exec -T client sh -c \
+        'curl -s --max-time 25 -o /dev/null http://192.0.2.10/big.bin' >/dev/null 2>&1 || true
+
+    # Samples land every traffic interval; give them a few.
+    local main1=$main0 waited=0
+    while [ "$waited" -lt 30 ]; do
+        main1=$(uplink_rx isp-main); main1=${main1:-0}
+        [ $((main1 - main0)) -gt 200000 ] && break
+        sleep 2; waited=$((waited+2))
+    done
+    local backup1; backup1=$(uplink_rx isp-backup); backup1=${backup1:-0}
+    local dm=$((main1 - main0)) db=$((backup1 - backup0))
+    if [ "$dm" -gt 200000 ]; then
+        ok "the client's 256 KB download is credited to the active uplink (+$dm bytes)"
+    else
+        bad "uplink_traffic: isp-main gained $dm bytes after ${waited}s, expected the 256 KB download"
+        note "counters: $(vlb_exec iptables-save -c -t filter | grep -F 'vlb:' | grep -F VLB_UPLINKS | tr '\n' ' ')"
+    fi
+    if [ "$db" -lt 50000 ]; then
+        ok "the standby uplink is not credited with it (+$db bytes)"
+    else
+        bad "uplink_traffic: isp-backup gained $db bytes for traffic that went through isp-main"
+    fi
+}
+
 scenario_watchdog() {
     info "route watchdog — an external tool overwrites our default route"
     reset_lab
@@ -1330,7 +1383,7 @@ scenario_probe_cli() {
 
 # ─────────────────────────────────────────────────────────────────────────
 
-SCENARIOS=(baseline priority_gap dead blackhole lossy dns_blocked expired canary_only throttled failback pin_failback both_down restart restart_slow_primary restart_on_backup pin_survives_restart missing_interface clients watchdog netplan_fight missing_conntrack concurrent_force soak force probe_cli)
+SCENARIOS=(baseline priority_gap dead blackhole lossy dns_blocked expired canary_only throttled failback pin_failback both_down restart restart_slow_primary restart_on_backup pin_survives_restart missing_interface clients uplink_traffic watchdog netplan_fight missing_conntrack concurrent_force soak force probe_cli)
 
 cleanup() {
     if [ "$KEEP" -eq 1 ]; then

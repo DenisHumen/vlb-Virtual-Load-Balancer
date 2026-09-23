@@ -56,7 +56,10 @@ pub struct TrafficPoint {
 /// signed; values are non-negative in practice.
 #[derive(Debug, Clone)]
 pub struct TrafficTotals {
+    /// Empty for an interface total: traffic of providers that share an
+    /// interface and could not be told apart (see `interface`).
     pub provider: String,
+    pub interface: String,
     pub rx_bytes: i64,
     pub rx_packets: i64,
     pub tx_bytes: i64,
@@ -843,23 +846,24 @@ impl Stats {
         let window = cutoff(now, hours);
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT provider,
+            "SELECT provider, interface,
                     COALESCE(SUM(rx_bytes), 0),
                     COALESCE(SUM(rx_packets), 0),
                     COALESCE(SUM(tx_bytes), 0),
                     COALESCE(SUM(tx_packets), 0)
              FROM traffic_samples
              WHERE ts >= ?1
-             GROUP BY provider
-             ORDER BY provider",
+             GROUP BY provider, interface
+             ORDER BY provider = '', provider, interface",
         )?;
         let rows = stmt.query_map(params![window], |row| {
             Ok(TrafficTotals {
                 provider: row.get::<_, String>(0)?,
-                rx_bytes: row.get::<_, i64>(1)?,
-                rx_packets: row.get::<_, i64>(2)?,
-                tx_bytes: row.get::<_, i64>(3)?,
-                tx_packets: row.get::<_, i64>(4)?,
+                interface: row.get::<_, String>(1)?,
+                rx_bytes: row.get::<_, i64>(2)?,
+                rx_packets: row.get::<_, i64>(3)?,
+                tx_bytes: row.get::<_, i64>(4)?,
+                tx_packets: row.get::<_, i64>(5)?,
             })
         })?;
         let mut out = Vec::new();
@@ -873,15 +877,34 @@ impl Stats {
     /// by the TUI to draw sparklines without having to keep in-memory
     /// buffers duplicated between the daemon and the viewer.
     pub fn recent_traffic(&self, provider: &str, limit: u32) -> Result<Vec<TrafficPoint>> {
+        self.recent_traffic_where("provider = ?1", provider, limit)
+    }
+
+    /// Latest N interface-total samples for an interface that several
+    /// providers share, oldest-first.
+    pub fn recent_interface_traffic(
+        &self,
+        interface: &str,
+        limit: u32,
+    ) -> Result<Vec<TrafficPoint>> {
+        self.recent_traffic_where("provider = '' AND interface = ?1", interface, limit)
+    }
+
+    fn recent_traffic_where(
+        &self,
+        filter: &str,
+        key: &str,
+        limit: u32,
+    ) -> Result<Vec<TrafficPoint>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT ts, interval_s, rx_bytes, rx_packets, tx_bytes, tx_packets
              FROM traffic_samples
-             WHERE provider = ?1
+             WHERE {filter}
              ORDER BY id DESC
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![provider, limit], |row| {
+             LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![key, limit], |row| {
             let ts_str: String = row.get(0)?;
             let ts = DateTime::parse_from_rfc3339(&ts_str)
                 .map(|t| t.with_timezone(&Utc))
@@ -1113,15 +1136,23 @@ impl Stats {
         if traffic.is_empty() {
             let _ = writeln!(s, "(no traffic samples in window)");
         } else {
+            if traffic.iter().any(|t| t.provider.is_empty()) {
+                let _ = writeln!(
+                    s,
+                    "(\"<interface> (all)\": providers sharing that interface, not split per \
+                     provider — per-uplink counting needs firewall.manage = true)"
+                );
+            }
             for t in &traffic {
+                let who = if t.provider.is_empty() {
+                    format!("{} (all)", t.interface)
+                } else {
+                    shown(&t.provider)
+                };
                 let _ = writeln!(
                     s,
                     "{:<18} {:>14} {:>12} {:>14} {:>12}",
-                    shown(&t.provider),
-                    t.rx_bytes,
-                    t.rx_packets,
-                    t.tx_bytes,
-                    t.tx_packets
+                    who, t.rx_bytes, t.rx_packets, t.tx_bytes, t.tx_packets
                 );
             }
         }
@@ -2170,6 +2201,46 @@ mod tests {
         assert!(after.page_count < freed.page_count);
         // Nothing left to do is not an error.
         assert_eq!(stats.reclaim_free_pages().unwrap(), 0);
+
+        drop(stats);
+        remove_db(&db);
+    }
+
+    /// Interface totals (providers that share an interface and could not be
+    /// told apart) are summed on their own and labelled as such, never
+    /// folded into a provider.
+    #[test]
+    fn interface_totals_are_kept_apart_from_providers() {
+        let db = temp_db("iface-total");
+        let stats = Stats::open(&db, &mk_providers()).unwrap();
+        let d = |rx: u64| crate::traffic::IfCounters {
+            rx_bytes: rx,
+            rx_packets: 1,
+            tx_bytes: 1,
+            tx_packets: 1,
+        };
+        let now = Utc::now();
+        stats
+            .record_traffic("", "lan", now, 2.0, &d(9_000))
+            .unwrap();
+        stats
+            .record_traffic("", "lan", now, 2.0, &d(1_000))
+            .unwrap();
+        stats
+            .record_traffic("p0", "wan2", now, 2.0, &d(500))
+            .unwrap();
+
+        let totals = stats.traffic_totals_at(1, now).unwrap();
+        let got: Vec<(&str, &str, i64)> = totals
+            .iter()
+            .map(|t| (t.provider.as_str(), t.interface.as_str(), t.rx_bytes))
+            .collect();
+        assert_eq!(got, vec![("p0", "wan2", 500), ("", "lan", 10_000)]);
+
+        assert_eq!(stats.recent_interface_traffic("lan", 10).unwrap().len(), 2);
+        assert_eq!(stats.recent_traffic("p0", 10).unwrap().len(), 1);
+        let report = stats.report_at(1, 5, now).unwrap();
+        assert!(report.contains("lan (all)"), "{report}");
 
         drop(stats);
         remove_db(&db);

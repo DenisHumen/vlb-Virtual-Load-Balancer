@@ -29,6 +29,7 @@ use crate::stats::{
 use crate::sysmon::SysMonitor;
 use crate::system::Prepared;
 use crate::traffic;
+use crate::uplinks;
 
 /// Key under which the operator pin is persisted in the stats database.
 const KV_FORCED_PROVIDER: &str = "forced_provider";
@@ -213,6 +214,10 @@ pub struct Balancer {
     /// provider; this keeps it to one line when it starts, a reminder now
     /// and then, and one line when it ends.
     no_healthy: StdMutex<OutageLog>,
+    /// True while traffic is being counted per uplink (see `uplinks`);
+    /// false while providers that share an interface are only counted as
+    /// that interface's total.
+    uplink_counters: AtomicBool,
 }
 
 /// A better provider is healthy and the daemon is waiting for it to prove
@@ -444,6 +449,47 @@ async fn compact_stats_on_start(stats: &Arc<Stats>, path: &std::path::Path) {
     }
 }
 
+/// The rows one traffic interval writes, as `(provider, interface, delta)`.
+///
+/// With per-uplink counters every provider gets its own. Without them a
+/// provider with an interface to itself gets that interface's delta, and
+/// providers sharing an interface get one row between them with an empty
+/// provider name — the interface total — because crediting each of them
+/// with the whole interface multiplied the real traffic by their number.
+fn traffic_rows(
+    providers: &[crate::config::Provider],
+    iface_delta: &HashMap<String, traffic::IfCounters>,
+    per_mark: Option<&HashMap<u32, traffic::IfCounters>>,
+    mark_of: impl Fn(&crate::config::Provider) -> u32,
+) -> Vec<(String, String, traffic::IfCounters)> {
+    if let Some(per_mark) = per_mark {
+        return providers
+            .iter()
+            .map(|p| {
+                let d = per_mark.get(&mark_of(p)).copied().unwrap_or_default();
+                (p.name.clone(), p.interface.clone(), d)
+            })
+            .collect();
+    }
+    let mut sharing: HashMap<&str, usize> = HashMap::new();
+    for p in providers {
+        *sharing.entry(p.interface.as_str()).or_default() += 1;
+    }
+    let mut rows = Vec::new();
+    let mut totals_written = std::collections::HashSet::new();
+    for p in providers {
+        let Some(d) = iface_delta.get(&p.interface).copied() else {
+            continue;
+        };
+        if sharing[p.interface.as_str()] == 1 {
+            rows.push((p.name.clone(), p.interface.clone(), d));
+        } else if totals_written.insert(p.interface.as_str()) {
+            rows.push((String::new(), p.interface.clone(), d));
+        }
+    }
+    rows
+}
+
 /// Is the status frame due? Always the first time, whenever what it shows
 /// has changed, and otherwise every `every_secs` (never, if 0).
 fn status_due(
@@ -465,7 +511,10 @@ fn status_due(
 impl Balancer {
     pub async fn new(cfg: Config, dry_run: bool, prepared: Prepared) -> Result<Arc<Self>> {
         let stats = Arc::new(Stats::open(&cfg.database.path, &cfg.providers)?);
-        if cfg.database.auto_compact {
+        // Not in a dry run: that is typically started next to the real
+        // daemon, against the same database, and a rewrite would hold it
+        // away from the process that is actually routing.
+        if cfg.database.auto_compact && !dry_run {
             compact_stats_on_start(&stats, &cfg.database.path).await;
         }
         let router = Router::new(dry_run, prepared.installed_bootstrap);
@@ -659,6 +708,7 @@ impl Balancer {
             failback_pending: StdMutex::new(None),
             last_status_line: StdMutex::new(String::new()),
             no_healthy: StdMutex::new(OutageLog::default()),
+            uplink_counters: AtomicBool::new(false),
         });
         me.publish_status().await;
         Ok(me)
@@ -2318,10 +2368,37 @@ impl Balancer {
         self.stats.recent_system(limit)
     }
 
-    pub fn recent_traffic(&self, provider: &str, limit: u32) -> Result<Vec<TrafficPoint>> {
+    /// Recent traffic for one provider — or, when its traffic cannot be told
+    /// apart from the other providers on its interface, that interface's
+    /// total, with the interface named so the caller can say so.
+    pub fn recent_traffic(
+        &self,
+        provider: &str,
+        limit: u32,
+    ) -> Result<(Vec<TrafficPoint>, Option<String>)> {
         // Clamp to a sane maximum so a buggy TUI can't DoS the DB.
         let limit = limit.min(10_000);
-        self.stats.recent_traffic(provider, limit)
+        let shared_iface = self
+            .cfg
+            .providers
+            .iter()
+            .find(|p| p.name == provider)
+            .map(|p| p.interface.clone())
+            .filter(|iface| {
+                self.cfg
+                    .providers
+                    .iter()
+                    .filter(|p| &p.interface == iface)
+                    .count()
+                    > 1
+            });
+        match shared_iface {
+            Some(iface) if !self.uplink_counters.load(Ordering::Relaxed) => {
+                let points = self.stats.recent_interface_traffic(&iface, limit)?;
+                Ok((points, Some(iface)))
+            }
+            _ => Ok((self.stats.recent_traffic(provider, limit)?, None)),
+        }
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -2893,6 +2970,38 @@ impl Balancer {
             "traffic: sampling started"
         );
 
+        // Per-uplink counters, where vlb manages the firewall: the only way
+        // to tell apart providers that share an interface. Without them,
+        // such providers get one "interface total" row between them rather
+        // than a copy of the interface's traffic each.
+        let marks: Vec<u32> = self
+            .cfg
+            .providers
+            .iter()
+            .map(|p| self.cfg.mark_for(p))
+            .collect();
+        let mask = self.cfg.routing.fwmark_mask;
+        let want_counters = self.cfg.firewall.manage && !self.dry_run;
+        let mut counters: Option<HashMap<Option<u32>, traffic::IfCounters>> = None;
+        let mut last_install_attempt: Option<std::time::Instant> = None;
+        if want_counters {
+            match uplinks::install(&marks, mask).await {
+                Ok(()) => {
+                    counters = Some(HashMap::new());
+                    info!(chain = uplinks::CHAIN, "traffic: counted per uplink");
+                }
+                Err(e) => warn!(
+                    error = %e,
+                    "traffic: per-uplink counters unavailable — providers that share an \
+                     interface are reported as one interface total"
+                ),
+            }
+            last_install_attempt = Some(std::time::Instant::now());
+        } else if !self.dry_run {
+            // Left behind by a run with firewall management on.
+            uplinks::remove().await;
+        }
+
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -2941,23 +3050,77 @@ impl Balancer {
                 prev.insert(iface.clone(), curr);
             }
 
-            // 2. Persist one row per provider using the cached delta.
-            for p in &self.cfg.providers {
-                let Some(d) = iface_delta.get(&p.interface).copied() else {
-                    continue;
-                };
-                if let Err(e) = self.stats.record_traffic(
-                    &p.name,
-                    &p.interface,
-                    now,
-                    interval.as_secs_f64(),
-                    &d,
-                ) {
-                    warn!(error = %e, provider = %p.name, "traffic: persist failed");
+            // 2. Per-uplink counters, if they are in use. A chain that has
+            //    vanished (a firewall reload flushed it) is put back, at most
+            //    once a minute; until then these intervals fall back.
+            let mut per_mark: Option<HashMap<u32, traffic::IfCounters>> = None;
+            let mut baseline_only = false;
+            if let Some(prev_counts) = counters.as_mut() {
+                match uplinks::read().await {
+                    Ok(curr) => {
+                        let active_mark = {
+                            let active = self.active.read().await;
+                            active.as_ref().and_then(|a| {
+                                self.cfg
+                                    .providers
+                                    .iter()
+                                    .find(|p| &p.name == a)
+                                    .map(|p| self.cfg.mark_for(p))
+                            })
+                        };
+                        if prev_counts.is_empty() {
+                            baseline_only = true;
+                        } else {
+                            per_mark = Some(uplinks::attribute(prev_counts, &curr, active_mark));
+                        }
+                        *prev_counts = curr;
+                    }
+                    Err(e) => {
+                        prev_counts.clear();
+                        let due = last_install_attempt
+                            .is_none_or(|t| t.elapsed() >= Duration::from_secs(60));
+                        if due {
+                            last_install_attempt = Some(std::time::Instant::now());
+                            match uplinks::install(&marks, mask).await {
+                                Ok(()) => info!(
+                                    "traffic: per-uplink counters were gone ({e:#}); reinstalled"
+                                ),
+                                Err(e2) => warn!(
+                                    error = %e2,
+                                    "traffic: per-uplink counters were gone and could not be \
+                                     reinstalled"
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
+            // The first reading after a (re)install is only a baseline: no
+            // rows for that interval, rather than an interface total wedged
+            // into a per-uplink series. A failed reading falls back to the
+            // interface counters until the chain is back.
+            self.uplink_counters
+                .store(per_mark.is_some() || baseline_only, Ordering::Relaxed);
+
+            // 3. Persist: one row per provider when its own traffic can be
+            //    told apart, one row per shared interface when it cannot.
+            let rows = if baseline_only {
+                Vec::new()
+            } else {
+                traffic_rows(&self.cfg.providers, &iface_delta, per_mark.as_ref(), |p| {
+                    self.cfg.mark_for(p)
+                })
+            };
+            for (provider, iface, d) in rows {
+                if let Err(e) =
+                    self.stats
+                        .record_traffic(&provider, &iface, now, interval.as_secs_f64(), &d)
+                {
+                    warn!(error = %e, provider = %provider, "traffic: persist failed");
                 } else if !first_sample_logged {
                     info!(
-                        provider = %p.name,
-                        iface = %p.interface,
+                        provider = %provider,
+                        iface = %iface,
                         rx_bytes = d.rx_bytes,
                         tx_bytes = d.tx_bytes,
                         "traffic: first sample recorded"
@@ -3169,6 +3332,57 @@ mod tests {
         assert!(
             !busy_rather_than_capped(true, false, None, FLOOR),
             "no reading of the interface means no excuse — count the failure"
+        );
+    }
+
+    /// Three providers, two of them behind one interface. Crediting each of
+    /// those two with the whole interface — what happened before — made
+    /// their rows identical and their sum twice the real traffic.
+    #[test]
+    fn providers_sharing_an_interface_are_not_each_credited_with_all_of_it() {
+        use crate::config::{Provider, ProviderRole};
+        let p = |name: &str, iface: &str, prio: u32| Provider {
+            name: name.into(),
+            gateway: std::net::Ipv4Addr::new(10, 0, 0, prio as u8 + 1),
+            interface: iface.into(),
+            priority: prio,
+            role: ProviderRole::Backup,
+        };
+        let providers = vec![p("a", "lan", 0), p("b", "lan", 1), p("c", "wan2", 2)];
+        let d = |rx: u64| traffic::IfCounters {
+            rx_bytes: rx,
+            rx_packets: 1,
+            tx_bytes: rx / 10,
+            tx_packets: 1,
+        };
+        let mark = |p: &Provider| 0x200 + p.priority;
+        let flat =
+            |rows: Vec<(String, String, traffic::IfCounters)>| -> Vec<(String, String, u64)> {
+                rows.into_iter()
+                    .map(|(p, i, c)| (p, i, c.rx_bytes))
+                    .collect()
+            };
+        let iface = HashMap::from([("lan".to_string(), d(9_000)), ("wan2".to_string(), d(500))]);
+
+        // No per-uplink counters: one interface total for the shared one,
+        // the own interface for the provider that has one.
+        assert_eq!(
+            flat(traffic_rows(&providers, &iface, None, mark)),
+            vec![
+                (String::new(), "lan".to_string(), 9_000),
+                ("c".to_string(), "wan2".to_string(), 500),
+            ]
+        );
+
+        // With them: every provider its own share, nothing duplicated.
+        let per = HashMap::from([(0x200, d(6_000)), (0x201, d(3_000)), (0x202, d(500))]);
+        assert_eq!(
+            flat(traffic_rows(&providers, &iface, Some(&per), mark)),
+            vec![
+                ("a".to_string(), "lan".to_string(), 6_000),
+                ("b".to_string(), "lan".to_string(), 3_000),
+                ("c".to_string(), "wan2".to_string(), 500),
+            ]
         );
     }
 
