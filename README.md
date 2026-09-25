@@ -1,76 +1,164 @@
+<div align="center">
+
+<img src="docs/assets/banner.png" alt="vlb — multi-uplink failover gateway for Linux" width="100%" />
+
 # vlb — Virtual Load Balancer
 
-<p align="center">
-  <img src="docs/assets/logo.svg" alt="vlb — the direct uplink is broken, and the route steps over the break and carries on" width="240" />
-</p>
+**A multi-uplink failover gateway for Linux that checks every ISP actually works — not merely that it answers pings — and moves the default route the moment one stops.**
 
-<!--
-  Once the repo is public, swap the two badges below for the live ones:
-  [![CI](https://img.shields.io/github/actions/workflow/status/DenisHumen/vlb-Virtual-Load-Balancer/ci.yml?branch=main&label=CI&logo=github)](https://github.com/DenisHumen/vlb-Virtual-Load-Balancer/actions/workflows/ci.yml)
-  [![Release](https://img.shields.io/github/actions/workflow/status/DenisHumen/vlb-Virtual-Load-Balancer/release.yml?label=release&logo=github)](https://github.com/DenisHumen/vlb-Virtual-Load-Balancer/actions/workflows/release.yml)
--->
-[![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](https://github.com/DenisHumen/vlb-Virtual-Load-Balancer/releases)
-[![Platform: Linux](https://img.shields.io/badge/platform-linux-informational.svg)](#runtime-requirements)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Rust 1.88+](https://img.shields.io/badge/Rust-1.88%2B-blue.svg)](https://www.rust-lang.org)
+[![Release](https://img.shields.io/github/v/release/DenisHumen/vlb-Virtual-Load-Balancer?style=for-the-badge&color=1f6feb&label=release)](https://github.com/DenisHumen/vlb-Virtual-Load-Balancer/releases/latest)
+[![CI](https://img.shields.io/github/actions/workflow/status/DenisHumen/vlb-Virtual-Load-Balancer/ci.yml?branch=main&style=for-the-badge&label=CI&logo=github)](https://github.com/DenisHumen/vlb-Virtual-Load-Balancer/actions/workflows/ci.yml)
+[![Rust 1.88+](https://img.shields.io/badge/Rust-1.88%2B-dea584?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![Platform: Linux](https://img.shields.io/badge/platform-Linux-0e8a9e?style=for-the-badge&logo=linux&logoColor=white)](#-runtime-requirements)
+[![Docker](https://img.shields.io/badge/Docker-compose-2496ED?style=for-the-badge&logo=docker&logoColor=white)](#docker--docker-compose)
+[![License: MIT](https://img.shields.io/badge/license-MIT-2ea043?style=for-the-badge)](LICENSE)
+[![Last commit](https://img.shields.io/github/last-commit/DenisHumen/vlb-Virtual-Load-Balancer?style=for-the-badge)](https://github.com/DenisHumen/vlb-Virtual-Load-Balancer/commits/main)
 
-Multi-uplink failover gateway for Linux. Turns one box into an active/standby
-router across several upstream ISPs: probes every provider independently,
-installs the highest-priority healthy one as the kernel default route,
-flushes conntrack on switch, and ships a TUI / control protocol / SQLite
-stats so you can actually see what's happening.
+**English** · [Русский](README.ru.md)
 
-> **Status:** `0.7.1`. Runs in production, and the failover behaviour is
-> covered by a docker lab that breaks the network nine different ways — and
-> restarts the daemon under it three more — on every CI run. Still pre-1.0:
-> config keys can change between minor versions, and `vlb check` will tell
-> you when they do.
+[Features](#-features) · [Quick start](#-quick-start) · [Usage](#-usage) · [Configuration](#configuration) · [Troubleshooting](#-troubleshooting)
+
+</div>
+
+---
+
+`vlb` turns one Linux box into an active/standby router across several upstream ISPs. It probes every
+provider independently, installs the highest-priority healthy one as the kernel default route, flushes
+conntrack on a switch, and ships a TUI dashboard, a control protocol and local SQLite statistics so you can
+actually see what is happening — including who on the LAN was affected. It is a single binary for the
+"one gateway, two or more uplinks" home or office setup.
+
+> **Status:** `0.7.1`. Runs in production, and the failover behaviour is covered by a Docker lab that breaks
+> the network nine different ways — and restarts the daemon under it three more — on every CI run. Still
+> pre-1.0: config keys can change between minor versions, and `vlb check` will tell you when they do.
 
 <p align="center">
   <img src="docs/assets/failover.svg" alt="The dashboard during a failover: the primary is caught serving a payment page, traffic moves to the second uplink, the primary recovers, and after its stability window the route comes back" width="100%" />
 </p>
 
 <p align="center"><sub>
-  A real failover, frame by frame: the primary is caught serving somebody
-  else's bytes, traffic moves to the next uplink, the primary recovers, and
-  the route returns only after it has proven itself. Every frame here is
+  A real failover, frame by frame: the primary is caught serving somebody else's bytes, traffic moves to the
+  next uplink, the primary recovers, and the route returns only after it has proven itself. Every frame is
   rendered by the test suite from the same widgets the program draws with.
 </sub></p>
 
-```mermaid
-flowchart LR
-    subgraph LAN["your LAN"]
-        C1["laptop"]
-        C2["TV"]
-        C3["phone"]
-    end
-    GW["<b>vlb</b><br/>gateway"]
-    subgraph WAN["uplinks"]
-        P0["ISP A<br/>priority 0"]
-        P2["ISP B<br/>priority 2"]
-    end
-    NET(("internet"))
+### Why
 
-    C1 --- GW
-    C2 --- GW
-    C3 --- GW
-    GW ==>|"active"| P0
-    GW -.->|"standby"| P2
-    P0 --> NET
-    P2 --> NET
+If you have two or more ISPs hooked up to one Linux box, the usual options are:
 
-    style GW fill:#1f6feb,stroke:#1f6feb,color:#fff
-    style P0 stroke:#2ea043,stroke-width:3px
-    style P2 stroke-dasharray: 4 4
-```
+* **Multi-WAN routers** — a black box, often Lua/UI-only, hard to integrate.
+* **Bash + cron + ping** — fine until the day a provider answers ICMP for `1.1.1.1` but black-holes
+  everything else.
+* **`mwan3` / `keepalived` / OSPF** — overkill for a "one gateway, two uplinks" home/office setup, and weak
+  against the failure modes that actually bite (DNS-only outages, intermittent ICMP-prohibited, partial
+  blocking).
 
-`vlb` watches every uplink continuously, moves the default route to a healthy
-one the moment the active one stops actually working — not merely stops
-answering pings — and tells you who on the LAN was affected.
+`vlb` is the in-between: a single binary that probes properly, switches fast, and gives you a real dashboard.
 
----
+## ✨ Features
 
-## Get it running
+| | |
+|---|---|
+| 🩺 **Six layers of health checks** | Gateway ICMP → internet ICMP burst → DNS round trip → DNS integrity → content canary → throughput floor. Every probe is fwmark-bound, so any uplink can be verified at any time, whichever one owns the default route. |
+| 🕵️ **Interception detection** | The content canary fetches bytes it already knows. A lapsed account that rewrites DNS to a payment portal or answers HTTP with a billing page is caught — and treated as *proof*, switching on the first observation. |
+| 🐢 **Throttle detection** | A 64 KiB timed transfer catches an ISP capping an unpaid account at 64–128 kbit/s, without counting your own users' traffic against the link. |
+| 🔀 **Deterministic failover** | Priority-based selection with separate fail/recover thresholds, a failback stability window and flap backoff. The route is written as `metric 0 proto static`, rival defaults are removed, and a watchdog re-asserts it. |
+| 🔌 **Connection handling** | Conntrack is flushed on a switch, so flows reset instead of black-holing. Optional per-connection pinning keeps flows on uplinks that still work and evicts only the dead uplink's connections. |
+| ♻️ **Restarts without outages** | Nothing is torn down on shutdown; the next instance adopts the installed route and re-verifies it. The operator pin and flap history survive restarts, and a late or missing interface at boot does not stop the daemon. |
+| 👥 **Per-client statistics** | Every host behind the gateway, by address, MAC and name: traffic, connected time, drops and the gaps between them — counted by the kernel, stored locally, never sent anywhere. |
+| 📊 **TUI dashboard & SQLite stats** | ratatui dashboard with the provider table, sparklines, traffic and CPU/memory graphs, recent switchovers and client screens. Stats live in SQLite (WAL, indexed) with retention and auto-compaction. |
+| 🎛 **Operator control** | Pin a provider with `force` / release with `auto` over a loopback-only TCP control socket or the TUI hotkey; `vlb status` returns JSON for scripts. |
+| 🛡 **Safe by default** | A dry-run mode, a hardened config validator, a guided setup that validates every change, and a checksum-verified self-update with automatic rollback. |
+
+<details>
+<summary><b>Everything it does, in detail</b></summary>
+
+* **Per-provider, fwmark-bound probes**, all independent of which provider currently owns the default route.
+  Each provider gets its own routing table (`ip rule fwmark`), so any uplink can be verified at any time.
+* **Six layers of health checks** per provider:
+  1. **Gateway**: ICMP to the next hop on the LAN.
+  2. **Internet**: a 3-packet ICMP burst (≥2 replies needed) to a list of external targets — IPs *and
+     hostnames*. Hostnames are resolved through that provider's DNS, so the resolved IP is reachable via the
+     same uplink.
+  3. **DNS**: an explicit UDP/53 round trip to public resolvers, again fwmarked. Catches "ICMP works but DNS
+     is blocked" outages.
+  4. **DNS integrity**: a random name under `.invalid` — which RFC 6761 guarantees can never exist — must
+     come back NXDOMAIN. A resolver that invents an address for it is being intercepted.
+  5. **Content canary**: fetch a resource whose bytes we already know, over that uplink, and compare. This is
+     the one that catches the failure mode the others cannot (see below).
+  6. **Throughput floor**: move 64 KiB and check the link is not merely reachable but actually fast enough to
+     be worth anything.
+* **Selectively-prohibited detection**: if any hostname target is configured, at least one of them must
+  succeed — so a happy `1.1.1.1` reply cannot mask an uplink that returns `Destination Net Prohibited` for
+  everything else.
+* **Interception detection (the content canary).** Reachability probes all share one blind spot, and it is
+  the failure mode that hurts most: an ISP whose account has lapsed usually does *not* black-hole traffic — it
+  intercepts it. DNS answers get rewritten to a payment portal and HTTP requests get answered with a billing
+  page, while ICMP is left working. The next hop pings, `1.1.1.1` pings, `google.com` resolves and pings (to
+  the portal, which answers), DNS returns a well-formed NOERROR. Every reachability check passes and the uplink
+  looks perfectly healthy while nothing actually works. `vlb` closes that gap by fetching content it already
+  knows the answer to: an interceptor can fake reachability for free, but it cannot produce bytes it does not
+  have. Wrong content is treated as *proof* rather than a symptom, so it bypasses the failure threshold and
+  switches on first observation.
+* **Deterministic priority-based selection** with separate fail / recover thresholds (anti-flap).
+* **Default route written as `metric 0 proto static`** so it cleanly replaces existing netplan / DHCP
+  defaults instead of coexisting with them — failback to the primary actually works.
+* **Conntrack flush on every switchover** so live flows reset immediately instead of black-holing until TCP
+  timeout.
+* **Restarts and updates do not interrupt traffic.** Nothing is torn down on shutdown, and the next instance
+  *adopts* the default route it finds rather than choosing afresh: the incumbent keeps carrying traffic until
+  this process has probed it to a verdict of its own. No route change, no conntrack flush, no thirty-second
+  detour through the backup because its probes happened to finish first. The operator's pin and the flap
+  history survive the restart too. On a cold start — a reboot, where there is no route to adopt — it waits the
+  few rounds a better-priority provider needs for its verdict instead of installing the first healthy one and
+  switching again moments later.
+* **Starts even when an uplink's interface is not there yet.** A provider whose NIC is late to appear at boot
+  (or gone) is reported down and retried every health interval; the others are managed normally.
+* **Force / auto control** via the TCP control socket (and TUI hotkey `f`): pin a specific provider as long as
+  you like. The pin survives even when the pinned provider is briefly down (the best healthy one serves
+  meanwhile, and the route snaps back when the pin recovers).
+* **Per-client statistics.** Every host behind the gateway, by address, MAC and name: how much it moved, how
+  long it has been connected, and how many times its connection dropped — [with a screen of its
+  own](#-client-statistics). Counted by the kernel, stored locally in the same SQLite database, and never sent
+  anywhere.
+* **SQLite stats** (WAL, indexed) for health checks, traffic, host metrics, state changes, failover events and
+  clients. Everything stays on the box.
+* **TUI dashboard** (ratatui) — provider table, sparklines, traffic and CPU/memory graphs, client statistics,
+  hotkeys for force / auto.
+* **Dry-run** that validates and prints every system call without making it. Use it before pointing `vlb` at
+  production.
+* **Hardened config validator** — rejects reserved tables (253/254/255), overlong interface names, an fwmark
+  of 0, timeouts ≥ interval, control ports listening on non-loopback addresses, and a few dozen more footguns.
+* **A guided setup** that installs dependencies, finds the interface, asks for each uplink and verifies the
+  result — and, on a machine already running, a menu for changing uplinks, restarting and diagnosing.
+  [See it](#guided-setup-and-the-menu).
+
+</details>
+
+## 📸 Screenshots
+
+<table>
+  <tr>
+    <td colspan="2"><img src="docs/assets/tui-dashboard.svg" alt="The dashboard: gateway panel, host metrics, the provider table with per-layer health, recent switchovers, and the traffic chart" /><p align="center"><b>Dashboard</b> — gateway panel, provider health per layer, recent switchovers, traffic</p></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/assets/tui-clients.svg" alt="The client list: every host behind the gateway with its address, MAC, current and total traffic, online time and drops" /><p align="center"><b>Clients</b> — who is on the network right now</p></td>
+    <td width="50%"><img src="docs/assets/tui-client-detail.svg" alt="One client's detail: its connections, the gaps between them, and its average and peak rates" /><p align="center"><b>One client</b> — every connection and every gap</p></td>
+  </tr>
+</table>
+
+> Every dashboard picture in this file (the five terminal SVGs in `docs/assets/`) is rendered by the test suite
+> from the real widgets, and that is checked rather than asserted: an ordinary `cargo test` rebuilds all five and fails if what is committed differs by a byte.
+> It also reads each one back and compares it, row by row, with the terminal buffer it came from. Regenerate
+> them with `VLB_SHOTS=1 cargo test --bin vlb tui::tests::render_readme_assets`.
+
+## 🚀 Quick start
+
+You need a Linux box with root, policy routing and the usual networking tools (`ip`, `ping`, `iptables`,
+`conntrack`) — the guided setup and the installer add whatever is missing. Details in
+[Runtime requirements](#-runtime-requirements).
+
+**Guided setup from a checkout** — the recommended path:
 
 ```bash
 git clone https://github.com/DenisHumen/vlb-Virtual-Load-Balancer.git
@@ -78,336 +166,162 @@ cd vlb-Virtual-Load-Balancer
 sudo bash scripts/vlb.sh install
 ```
 
-That last command is a guided setup: it installs what is missing, works out
-which interface faces your network, asks for each uplink's gateway address,
-writes the configuration, starts the service and waits until traffic is
-actually flowing through a verified uplink. Run it again later and it opens a
-menu instead — add an uplink, change one, restart, diagnose.
-[More on it below](#guided-setup-and-the-menu).
+That last command installs what is missing, works out which interface faces your network, asks for each
+uplink's gateway address, writes the configuration, starts the service and waits until traffic is actually
+flowing through a verified uplink. Run it again later and it opens a menu instead — add an uplink, change one,
+restart, diagnose. [More below](#guided-setup-and-the-menu).
 
-Prefer a release binary and no build? [One command for that too](#install-or-update-on-a-server).
-
----
-
-## Contents
-
-| | |
-|---|---|
-| [Why](#why) · [What it does](#what-it-actually-does) | the pitch |
-| [Guided setup](#guided-setup-and-the-menu) · [Install / update](#install-or-update-on-a-server) · [From a checkout](#update-from-a-git-checkout) | getting it running |
-| [How readily it switches](#how-readily-it-switches) · [What survives a switch](#what-survives-a-switch) | failover behaviour |
-| [Client statistics](#who-is-on-the-network--client-statistics) | who is using the link |
-| [Configuration](#configuration-reference) · [CLI](#cli) · [TUI](#tui-hotkeys) | day-to-day use |
-| [How it works](#how-it-works) · [Failure modes](#failure-modes-we-cover) | the design |
-| [Testing](#testing) · [Ubuntu 24.04](#ubuntu-2404) · [Troubleshooting](#troubleshooting) | when things go wrong |
-
----
-
-## Why
-
-If you have two or more ISPs hooked up to one Linux box, the usual options
-are:
-
-* **Multi-WAN routers** — black box, often Lua/UI-only, hard to integrate.
-* **Bash + cron + ping** — fine until the day a provider answers ICMP for
-  `1.1.1.1` but black-holes everything else.
-* **`mwan3` / `keepalived` / OSPF** — overkill for a "one gateway, two
-  uplinks" home/office setup, and weak for the failure modes that actually
-  bite (DNS-only outages, intermittent ICMP-prohibited, partial blocking).
-
-`vlb` is the in-between: a single binary that probes properly, switches
-fast, and gives you a real dashboard.
-
----
-
-## What it actually does
-
-* **Per-provider, fwmark-bound probes**, all independent of which provider
-  currently owns the default route. Each provider gets its own routing
-  table (`ip rule fwmark`) so we can verify any uplink any time.
-* **Six layers of health checks** per provider:
-  1. **Gateway**: ICMP to next-hop on the LAN.
-  2. **Internet**: 3-packet ICMP burst (≥2 replies needed) to a list of
-     external targets — IPs *and hostnames*. Hostnames are resolved
-     through that provider's DNS, so the resolved IP is reachable via the
-     same uplink.
-  3. **DNS**: explicit UDP/53 round-trip to public resolvers, again
-     fwmarked. Catches "ICMP works but DNS is blocked" outages.
-  4. **DNS integrity**: a random name under `.invalid` — which RFC 6761
-     guarantees can never exist — must come back NXDOMAIN. A resolver that
-     invents an address for it is being intercepted.
-  5. **Content canary**: fetch a resource whose bytes we already know, over
-     that uplink, and compare. See below — this is the one that catches the
-     failure mode the others cannot.
-  6. **Throughput floor**: move 64 KiB and check the link is not merely
-     reachable but actually fast enough to be worth anything.
-* **Selectively-prohibited detection**: if any hostname target is
-  configured, at least one of them must succeed — so a happy `1.1.1.1`
-  reply can't mask an uplink that returns
-  `Destination Net Prohibited` for everything else.
-* **Interception detection (the content canary).** Reachability probes all
-  share one blind spot, and it is the failure mode that hurts most: an ISP
-  whose account has lapsed usually does *not* black-hole traffic — it
-  intercepts it. DNS answers get rewritten to a payment portal and HTTP
-  requests get answered with a billing page, while ICMP is left working. The
-  next hop pings, `1.1.1.1` pings, `google.com` resolves and pings (to the
-  portal, which answers), DNS returns a well-formed NOERROR. Every
-  reachability check passes and the uplink looks perfectly healthy while
-  nothing actually works. `vlb` closes that gap by fetching content it
-  already knows the answer to: an interceptor can fake reachability for
-  free, but it cannot produce bytes it does not have. Wrong content is
-  treated as *proof* rather than a symptom, so it bypasses the failure
-  threshold and switches on first observation.
-* **Deterministic priority-based selection** with separate fail / recover
-  thresholds (anti-flap).
-* **Default route written as `metric 0 proto static`** so it cleanly
-  replaces existing netplan / DHCP defaults instead of coexisting with
-  them — failback to the primary actually works.
-* **Conntrack flush on every switchover** so live flows reset
-  immediately instead of black-holing until TCP timeout.
-* **Restarts and updates do not interrupt traffic.** Nothing is torn down
-  on shutdown, and the next instance *adopts* the default route it finds
-  rather than choosing afresh: the incumbent keeps carrying traffic until
-  this process has probed it to a verdict of its own. No route change, no
-  conntrack flush, no thirty-second detour through the backup because its
-  probes happened to finish first. The operator's pin and the flap history
-  survive the restart too. On a cold start — a reboot, where there is no
-  route to adopt — it waits the few rounds a better-priority provider needs
-  for its verdict instead of installing the first healthy one and switching
-  again moments later.
-* **Starts even when an uplink's interface is not there yet.** A provider
-  whose NIC is late to appear at boot (or gone) is reported down and
-  retried every health interval; the others are managed normally.
-* **Force / auto control** via TCP control socket (and TUI hotkey `f`):
-  pin a specific provider as long as you like; pin survives even when
-  the pinned provider is briefly Down (we serve the best healthy one
-  meanwhile and snap back when the pin recovers).
-* **Per-client statistics.** Every host behind the gateway, by address, MAC
-  and name: how much it moved, how long it has been connected, and how many
-  times its connection dropped — [with a screen of its own](#who-is-on-the-network--client-statistics).
-  Counted by the kernel, stored locally in the same SQLite database, and
-  never sent anywhere.
-* **SQLite stats** (WAL, indexed) for health checks, traffic, host
-  metrics, state changes, failover events and clients. Everything stays on
-  the box.
-* **TUI dashboard** (ratatui) — provider table, sparklines, traffic and
-  CPU/mem graphs, client statistics, hotkeys for force / auto.
-* **Dry-run** that validates and prints every system call without doing
-  it. Use this before pointing it at production.
-* **Hardened config validator** — rejects reserved tables (253/254/255),
-  overlong interface names, fwmark of 0, timeouts >= interval, control
-  ports listening on non-loopback, and a few dozen more footguns.
-* **A guided setup** that installs dependencies, finds the interface, asks
-  for each uplink and verifies the result — and, on a machine already
-  running, a menu for changing uplinks, restarting and diagnosing.
-  [See it](#guided-setup-and-the-menu).
-
----
-
-## Install (or update) on a server
-
-One command. It downloads the release for your architecture, verifies it
-against the published SHA-256, checks the new build accepts your existing
-config *before* replacing anything, and restarts the service:
+**Release binary, no build** — static builds for x86_64 and aarch64:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/DenisHumen/vlb-Virtual-Load-Balancer/main/scripts/install.sh | sudo bash
 ```
 
-Safe to re-run: it is the update path as well as the install path. Your
-`/etc/vlb/vlb.toml` is never overwritten. If the new build rejects your config,
-cannot reach the canary targets, or the service fails to come back, it rolls
-back to the previous binary — and the previous unit — and tells you why.
-
-The restart in the middle does not interrupt traffic. The old daemon leaves
-its routes in place and the new one adopts them, re-verifying the active
-provider with its own probes before it will consider moving anything. The
-installer waits for that verification and reports `carrying traffic via:
-isp-main (verified by the new build)`.
-
-It adopts whatever is already there. If a `vlb` systemd unit exists, the
-installer reads its `ExecStart` and updates *that* binary with *that* config
-— so a box running out of `/opt/vlb` with its config beside it is updated in
-place, rather than having a second copy quietly installed at the default
-paths while the running one stays stale. A stock unit file is upgraded along
-with the binary (the previous one is kept as `vlb.service.bak`); a unit you
-edited by hand is left alone with a note. Put local changes in a drop-in
-(`sudo systemctl edit vlb`) and they survive every update.
-
-On a machine with no existing config it installs the annotated example and
-stops short of starting the service, so it cannot bring up a gateway pointed
-at example addresses.
-
-Once installed, the box can update itself with exactly the same safety net:
+On a fresh machine this installs the annotated example config and does **not** start the service. Edit it,
+then:
 
 ```bash
-sudo vlb update
+sudo $EDITOR /etc/vlb/vlb.toml
+sudo vlb --config /etc/vlb/vlb.toml check
+sudo vlb --config /etc/vlb/vlb.toml probe      # times each health layer
+sudo systemctl enable --now vlb
 ```
 
-…or from the dashboard (`sudo vlb tui`), press `u`. Both run the new build's
-`check` against your config, run its `probe` to confirm the canary quorum is
-reachable, swap the binary, restart the service, wait for the daemon to
-answer, and roll back if it does not.
+**Docker** — needs host networking and `NET_ADMIN`:
+
+```bash
+cp examples/vlb.example.toml vlb.toml && $EDITOR vlb.toml
+docker compose -f docker/docker-compose.yml up -d --build
+```
+
+Then open the dashboard with `sudo vlb tui` — or `sudo bash scripts/vlb.sh tui` from a checkout; in Docker, see
+[Docker / Docker Compose](#docker--docker-compose).
+
+## 🧭 Usage
+
+### Everyday commands
+
+Everything below assumes the config is at `/etc/vlb/vlb.toml`, which is where the guided setup puts it, what
+`vlb` uses by default when the file exists, and what `scripts/vlb.sh` picks up automatically.
+
+| I want to… | Command |
+|---|---|
+| Set it up, or change it | `sudo bash scripts/vlb.sh install` |
+| See what is happening | `sudo vlb tui` |
+| Check it from a script | `sudo vlb status` |
+| See who is on the network | `sudo vlb clients` |
+| See one host's history | `sudo vlb clients --ip 192.168.8.24` |
+| Find out why an uplink is down | `sudo vlb probe --provider isp-main` |
+| Pin one uplink by hand | `sudo vlb force isp-backup` … `sudo vlb auto` |
+| Restart without dropping traffic | `sudo systemctl restart vlb` |
+| Update | `sudo vlb update` (release install) — or `sudo bash scripts/vlb.sh update` (git checkout) |
+| Read the logs | `sudo journalctl -u vlb -f` |
+
+### CLI
 
 <details>
-<summary>Options</summary>
+<summary><b>Full command reference</b></summary>
 
-| Variable       | Effect                                          |
-|----------------|-------------------------------------------------|
-| `VLB_VERSION`  | Install a specific tag instead of the latest    |
-| `VLB_PRE=1`    | Consider pre-releases                            |
-| `VLB_NO_START=1` | Install the binary, leave the service alone    |
-| `VLB_SKIP_PROBE=1` | Skip the pre-restart canary reachability check |
-| `VLB_REPO`     | Pull from a fork                                 |
-
-```bash
-curl -fsSL .../install.sh | sudo VLB_VERSION=v0.2.1 bash
 ```
+vlb run    [--config <path>] [--dry-run]    # foreground daemon
+vlb check  [--config <path>]                # validate + summary
+vlb status [--config <path>]                # query running daemon
+vlb tui    [--config <path>]                # dashboard
+vlb force  [--config <path>] <name>         # pin provider
+vlb auto   [--config <path>]                # release pin
+vlb stats  [--config <path>] [--hours N] [--recent N]
+vlb system [--config <path>] [--recent N]
+vlb diag   [--config <path>]                # interfaces, DB, ports
+vlb probe  [--config <path>] [--provider <name>] [--repeat N]
+vlb clients [--config <path>] [--ip <addr>] [--hours N] [--json]
+vlb update [--config <path>] [--check] [--pre] [--yes] [--force] [--skip-probe]
+```
+
+`--config` defaults to `/etc/vlb/vlb.toml` when that file exists, and to `vlb.toml` in the current directory
+otherwise.
+
+`vlb status` is JSON, meant for scripts. Besides the per-provider table it carries `active`, `forced` (the
+pin), `active_adopted` (the route was taken over at startup and the new process has not confirmed its provider
+yet), `kernel_route` (what the kernel actually has), `failback_pending` (the countdown, if one is running),
+`version` and `started_at`.
+
 </details>
 
----
+#### `vlb probe` — size your timeouts from measurements
 
-## Guided setup and the menu
-
-```bash
-sudo bash scripts/vlb.sh install
-```
-
-On a machine with no configuration it walks the whole way through:
-
-```text
-Dependencies
-────────────
-[ ok] ip, ping, iptables and conntrack are all present
-
-Which interface faces your LAN and the uplinks?
-───────────────────────────────────────────────
-  1) ens18      10.0.0.100/10
-The default route currently leaves through: ens18
-Interface [ens18]:
-
-Uplinks
-───────
-Add them best first. The first one you enter is the primary; the others are
-tried in the order you give them if it fails.
-
-Uplink 1
-  Name (no spaces) [isp-main]:
-  Gateway (the ISP router's address): 10.0.0.2
-[ ok]   10.0.0.2 answers ping
-  Interface it is reached on [ens18]:
-  Priority (lower wins) [0]:
-  Role (primary/backup) [primary]:
-
-Add a backup uplink? (strongly recommended — with one uplink there is
-nothing to fail over to) (y/n) [y]:
-```
-
-…and finishes by writing `/etc/vlb/vlb.toml`, installing the service, and
-waiting until it can say **`carrying traffic through isp-main, verified by
-its own checks`**.
-
-Three things it will not do, all learned the hard way:
-
-* **It never leaves a configuration the daemon would reject.** Every change is
-  written to a temporary file, validated with the real binary, and only then
-  moved over the live one — with the previous version kept beside it. A
-  gateway whose config is rejected does not come back.
-* **It never leaves root-owned files in your checkout.** Building under `sudo`
-  makes `target/` unwritable for your ordinary user afterwards; the build is
-  handed back to whoever owns the source tree, and an already-root-owned
-  `target/` is given back too.
-* **It never answers its own questions.** Reached through a pipe, or run with
-  nothing on standard input, it stops and says so rather than accepting every
-  default in turn and configuring a gateway nobody asked for.
-
-Run it again on a configured machine and it opens a menu:
-
-```text
-  config   /etc/vlb/vlb.toml
-  daemon   running (systemd)
-  active   isp-main
-
-  1) Status
-  2) Dashboard (TUI)
-  3) Who is connected (clients)
-  4) Uplinks — add, change, remove
-  5) Restart
-  6) Diagnose a problem
-  7) Update from git
-  0) Quit
-```
-
-Adding an uplink asks the same four questions and checks the answer before
-accepting it — an address that is not directly connected cannot be a next
-hop, and it says so at the moment you type it rather than leaving you to
-find out from the daemon later. **Diagnose** runs the timed per-layer probe,
-prints the kernel's own routes and policy rules, and tails the log.
-
----
-
-## Update from a git checkout
-
-If you run `vlb` straight out of a clone rather than from a release, the
-whole update is one command:
+Runs every health layer once against each provider and prints what each one actually cost, without touching
+the routing table. Use it to pick `canary.timeout_ms` instead of guessing, and to see *why* a provider is
+considered unhealthy:
 
 ```bash
-sudo bash scripts/vlb.sh update
+sudo vlb --config /etc/vlb/vlb.toml probe --repeat 5
 ```
 
-It pulls, builds, checks the new binary against **this machine's own
-configuration**, installs it wherever the service actually runs it from,
-restarts, and waits for it to answer. If it does not come back, the previous
-binary is put back, the service is restarted again, and the reason is printed
-from the journal. Each earlier step fails safe on its own: a pull that
-conflicts, a build that does not compile, or a binary that rejects your
-config all stop before anything is deployed, and rewind the checkout.
+It reports the slowest observed run per layer — the number a timeout has to accommodate — and suggests a
+`canary.timeout_ms`. Under an intercepted uplink it names the interception explicitly rather than reporting a
+vague timeout.
 
-> **If you have been updating with `git pull && vlb.sh restart`, that never
-> deployed anything.** A build writes `target/release/vlb`; the systemd unit
-> runs `/usr/local/bin/vlb`. The restart in between re-executed the old
-> binary and reported success, and the `start` that followed raced the
-> running daemon for the control port. Fixed in 0.6.0, which is also why
-> features you pulled may never have appeared. Use `update`.
-
-The restart does not interrupt traffic (see [How it works](#how-it-works)):
-the new process adopts the default route the old one left in the kernel.
-
-> **Install the service once.** `sudo bash scripts/vlb.sh start` runs the
-> gateway from the checkout with a pid file, which works but does not survive
-> a reboot and depends on that directory staying where it is. One command
-> fixes it, and `update` says so if it finds the gateway running that way:
->
-> ```bash
-> sudo bash scripts/vlb.sh install-service
-> ```
+#### `vlb update` — install the newest release
 
 ```bash
-sudo bash scripts/vlb.sh status     # what is running now
-sudo bash scripts/vlb.sh tui        # dashboard (rebuilds + restarts if needed)
-sudo bash scripts/vlb.sh clients    # who is on the network
-sudo bash scripts/vlb.sh install    # the setup menu: uplinks, restart, diagnose
-VLB_NO_RESTART=1 bash scripts/vlb.sh build   # rebuild, leave the daemon alone
+sudo vlb --config /etc/vlb/vlb.toml update --check   # look, change nothing
+sudo vlb --config /etc/vlb/vlb.toml update           # install, with a prompt
 ```
 
-`scripts/vlb.sh` uses `/etc/vlb/vlb.toml` whenever that file exists, and falls
-back to the bundled example only when it does not. Keeping the live
-configuration out of the tracked example file is what makes `git pull` safe:
-edit the example and the next pull either refuses to update or overwrites your
-gateway's settings.
+In order, and nothing on the box changes until step 4 has passed:
 
-The dashboard says so plainly if it is newer than the daemon it is talking
-to, rather than showing an empty screen.
+1. downloads the release asset for this host's architecture and verifies it against the published SHA-256;
+2. proves the new binary runs here (`--version`);
+3. runs the new binary's `check` against the config in use — a release that tightened validation is caught
+   while the working binary is still in place, not after the restart with the gateway down;
+4. runs the new binary's `probe` and refuses to continue if the canary quorum cannot be met through any
+   provider, since restarting into that would switch automatic failover off (`--skip-probe` overrides);
+5. swaps the binary atomically, keeping the previous one as `vlb.bak`;
+6. restarts the unit and waits for the daemon to answer on its control socket. If the service dies, the
+   previous binary is put back and restarted.
 
----
+The restart itself does not touch the routing table: the new daemon adopts the route the old one left and
+re-verifies its provider before it would move anything. The same flow is on the TUI's `u` key, with progress
+shown while it runs.
 
-## How readily it switches
+### TUI hotkeys
 
-A switch is not free: it resets every connection on the network. So the bar is
-"this uplink has stopped working", not "this uplink just had a bad second".
+| Key     | Action                                    |
+|---------|-------------------------------------------|
+| `↑`/`↓` | Move selection                            |
+| `f`     | Force the selected provider               |
+| `a`     | Release force, return to auto             |
+| `c`     | **Client statistics** — who is on the LAN |
+| `r`     | Force redraw                              |
+| `u`     | Check for a new release and install it    |
+| `q`     | Quit                                      |
 
-Each layer keeps its own count, because a lost UDP query and a forged payment
-page are not the same kind of evidence:
+On the client screens:
+
+| Key     | Action                                    |
+|---------|-------------------------------------------|
+| `↑`/`↓` | Move between hosts                        |
+| `Enter` | Open one host's full history              |
+| `w`     | Cycle the window: 1h → 24h → 7d → 30d     |
+| `Esc`   | Back (detail → list → dashboard)          |
+
+Top to bottom, the dashboard shows: the **gateway** panel (active provider and whether it is verified or still
+adopted from the routing table, the pin, the failback countdown, the kernel's own default route, daemon version
+and uptime), host metrics, the **providers** table (state, latency, canary, throughput, how long each has been
+up, and *why* one is down), **recent events** — every switchover with its timestamp and reason — and the
+traffic chart for the selected provider. The TUI keeps running through a daemon restart and says so when the
+daemon is back. It also says plainly if it is newer than the daemon it is talking to, rather than showing an
+empty screen.
+
+## 🔀 Failover behaviour
+
+### How readily it switches
+
+A switch is not free: it resets every connection on the network. So the bar is "this uplink has stopped
+working", not "this uplink just had a bad second".
+
+Each layer keeps its own count, because a lost UDP query and a forged payment page are not the same kind of
+evidence:
 
 | layer | default | what it means |
 |---|---|---|
@@ -416,18 +330,16 @@ page are not the same kind of evidence:
 | content canary | 3 rounds, ~30s | one failed fetch is one failed fetch |
 | throughput floor | 3 measurements | see below |
 
-Wrong bytes are the exception. A forged payment page or a hijacked resolver is
-proof rather than a symptom, so those act on the first observation.
+Wrong bytes are the exception. A forged payment page or a hijacked resolver is proof rather than a symptom, so
+those act on the first observation.
 
-**The throughput floor does not count your own users against you.** It exists
-to catch an ISP capping an unpaid account at 64 kbit/s. On a gateway it will
-also catch the traffic you are carrying: a 64 KiB probe fired across a busy
-link comes back slow through nobody's fault. Left alone that is a loop — the
-link is called throttled, everyone is moved off, the link goes quiet, the next
-measurement is fast, everyone moves back, and the gateway switches every few
-minutes for as long as anybody is using it. vlb samples the interface on both
-sides of the probe and does not count a slow reading against a link that was
-demonstrably carrying more than the floor at the time.
+**The throughput floor does not count your own users against you.** It exists to catch an ISP capping an unpaid
+account at 64 kbit/s. On a gateway it would also catch the traffic you are carrying: a 64 KiB probe fired
+across a busy link comes back slow through nobody's fault. Left alone that is a loop — the link is called
+throttled, everyone is moved off, the link goes quiet, the next measurement is fast, everyone moves back, and
+the gateway switches every few minutes for as long as anybody is using it. `vlb` samples the interface on both
+sides of the probe and does not count a slow reading against a link that was demonstrably carrying more than
+the floor at the time.
 
 Change the whole set from the menu rather than by hand:
 
@@ -435,39 +347,32 @@ Change the whole set from the menu rather than by hand:
 sudo bash scripts/vlb.sh install     # → 9) How readily it switches
 ```
 
-Quick is about six seconds, Balanced twelve, Patient thirty.
+Quick is about six seconds, Balanced (the shipped default) twelve, Patient thirty.
 
----
-
-## What survives a switch
+### What survives a switch
 
 The honest answer, because it decides what you can expect from this box.
 
-**A connection whose provider is still working survives.** With
-`routing.pin_connections = true`, each forwarded connection is stamped on its
-first packet with the mark of whichever uplink was active then, and keeps
-being routed by that stamp rather than by the current default route. So the
-switches that are *good news* — the primary recovering and the route coming
-back to it, an operator pinning a provider by hand, the watchdog putting the
-route back after `netplan apply` — move nothing that is already running. Only
-new connections follow the new route.
+**A connection whose provider is still working survives.** With `routing.pin_connections = true`, each
+forwarded connection is stamped on its first packet with the mark of whichever uplink was active then, and keeps
+being routed by that stamp rather than by the current default route. So the switches that are *good news* — the
+primary recovering and the route coming back to it, an operator pinning a provider by hand, the watchdog putting
+the route back after `netplan apply` — move nothing that is already running. Only new connections follow the new
+route.
 
-That is most of the switching a healthy gateway does, and until 0.6.0 every
-one of them reset every connection on the box.
+That is most of the switching a healthy gateway does, and until 0.6.0 every one of them reset every connection
+on the box.
 
-**A connection whose provider actually dies does not survive, and cannot.**
-Each of your uplinks is a router that hides this gateway behind *its own*
-public address. The moment traffic leaves through a different one, the far
-end receives packets from an address it has no connection with, and hangs up.
-Nothing installed on this machine can prevent that: the address belongs to
-the ISP router one hop away, and sending its address through a different ISP
-is source spoofing, which the upstream drops.
+**A connection whose provider actually dies does not survive, and cannot.** Each of your uplinks is a router
+that hides this gateway behind *its own* public address. The moment traffic leaves through a different one, the
+far end receives packets from an address it has no connection with, and hangs up. Nothing installed on this
+machine can prevent that: the address belongs to the ISP router one hop away, and sending its address through a
+different ISP is source spoofing, which the upstream drops.
 
-What vlb does instead is make the loss surgical and immediate. When a
-provider goes down its connections are evicted **by mark**, so they fail at
-once instead of waiting out a five-day conntrack timeout — and nobody else's
-connections are touched. Before, a single blip on the primary cost you two
-resets of everything: one leaving, one coming back.
+What `vlb` does instead is make the loss surgical and immediate. When a provider goes down its connections are
+evicted **by mark**, so they fail at once instead of waiting out a five-day conntrack timeout — and nobody
+else's connections are touched. Before, a single blip on the primary cost you two resets of everything: one
+leaving, one coming back.
 
 ```bash
 sudo bash scripts/vlb.sh install      # menu → 8) Connections during a switch
@@ -480,12 +385,10 @@ or by hand:
 pin_connections = true      # needs conntrack installed
 ```
 
-Off by default. It changes how every forwarded packet is routed, so switch it
-on deliberately.
+Off by default. It changes how every forwarded packet is routed, so switch it on deliberately.
 
-Then you can see it working. The dashboard's gateway panel grows a line
-counting the connections each uplink is holding, and after a failback the
-uplink that was left should still be carrying the ones that started on it:
+Then you can see it working. The dashboard's gateway panel grows a line counting the connections each uplink is
+holding, and after a failback the uplink that was left should still be carrying the ones that started on it:
 
 ```text
 active isp-second   pin auto
@@ -495,43 +398,35 @@ pinned isp-main 148  ·  isp-second 26  ·  isp-backup 3
 
 The same numbers are in `sudo vlb status` as `pinned_connections`.
 
-This assumes the software that must not be interrupted runs on a machine
-*behind* the gateway, which is the usual arrangement: only forwarded traffic
-is pinned. Connections the gateway itself opens are not, deliberately —
-marking those is how an operator locks themselves out of their own box.
+This assumes the software that must not be interrupted runs on a machine *behind* the gateway, which is the
+usual arrangement: only forwarded traffic is pinned. Connections the gateway itself opens are not, deliberately
+— marking those is how an operator locks themselves out of their own box.
 
 <details>
 <summary>If you need streams to survive a dead uplink too</summary>
 
-There is exactly one arrangement that does it, and it is a change of
-topology rather than a setting: give the traffic a public address that does
-not belong to any of the uplinks.
+There is exactly one arrangement that does it, and it is a change of topology rather than a setting: give the
+traffic a public address that does not belong to any of the uplinks.
 
-Rent a small server with a static address and run a single WireGuard tunnel
-to it from the gateway. LAN traffic goes into the tunnel, so the far end
-always sees the rented server's address; vlb switches only the tunnel's
-*outer* packets between uplinks, and WireGuard re-homes on the first
-authenticated packet from the new path without a rekey. A stream stalls for
-about as long as the failover takes and then continues.
+Rent a small server with a static address and run a single WireGuard tunnel to it from the gateway. LAN traffic
+goes into the tunnel, so the far end always sees the rented server's address; `vlb` switches only the tunnel's
+*outer* packets between uplinks, and WireGuard re-homes on the first authenticated packet from the new path
+without a rekey. A stream stalls for about as long as the failover takes and then continues.
 
-The costs are real: every byte crosses that server twice, you pay for its
-bandwidth, the MTU has to be clamped to the smallest of your uplinks or large
-packets vanish silently, and the server becomes a single point of failure of
-its own. vlb does not manage this for you today. It is written down here so
-the trade is visible, not because it is recommended.
+The costs are real: every byte crosses that server twice, you pay for its bandwidth, the MTU has to be clamped
+to the smallest of your uplinks or large packets vanish silently, and the server becomes a single point of
+failure of its own. `vlb` does not manage this for you today. It is written down here so the trade is visible,
+not because it is recommended.
 
-The other textbook answer — BGP with your own address space, which is what a
-device like an F5 relies on — is not available on links that hand out a
-NAT'd address on a shared LAN.
+The other textbook answer — BGP with your own address space, which is what a device like an F5 relies on — is
+not available on links that hand out a NAT'd address on a shared LAN.
 
 </details>
 
----
+## 👥 Client statistics
 
-## Who is on the network — client statistics
-
-Press <kbd>c</kbd> in the dashboard, or run `vlb clients`. Every host behind
-the gateway, connected first — and <kbd>Enter</kbd> opens one of them:
+Press <kbd>c</kbd> in the dashboard, or run `vlb clients`. Every host behind the gateway, connected first —
+and <kbd>Enter</kbd> opens one of them:
 
 <p align="center">
   <img src="docs/assets/clients.svg" alt="The client list, then one client's detail: its connections, the gaps between them, and its average and peak rates" width="100%" />
@@ -541,14 +436,13 @@ the gateway, connected first — and <kbd>Enter</kbd> opens one of them:
   <a href="docs/assets/tui-client-detail.svg">one client</a></sub>
 </p>
 
-The detail view is where "was it us or them" gets answered: every connection,
-how long each lasted, and **how long the host was away in between**.
+The detail view is where "was it us or them" gets answered: every connection, how long each lasted, and **how
+long the host was away in between**.
 
 <details>
 <summary>The same two screens as text, if you prefer to copy from them</summary>
 
-Both are the still frames linked above, at the width they are drawn:
-the list at 132x19, one client at 132x26.
+Both are the still frames linked above, at the width they are drawn: the list at 132x19, one client at 132x26.
 
 ```text
 ┌ clients · window 24h ────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
@@ -603,14 +497,6 @@ the list at 132x19, one client at 132x26.
 
 </details>
 
-> Every picture in this file is rendered by the test suite from the real
-> widgets, and that is checked rather than asserted: an ordinary `cargo test`
-> rebuilds all five and fails if what is committed differs by a byte. It also
-> reads each one back and compares it, row by row, with the terminal buffer it
-> came from. Regenerate them with
-> `VLB_SHOTS=1 cargo test --bin vlb tui::tests::render_readme_assets`.
-
-
 ### The same thing from the shell
 
 ```bash
@@ -640,31 +526,23 @@ flowchart TD
 
 Three deliberate choices behind that picture:
 
-* **The kernel does the counting.** Two rules per host in a chain of our
-  own — `-s <ip>` and `-d <ip>`, with no `-j` target, so they count and fall
-  through. Nothing is sampled, nothing is estimated, and a flow that ends
-  does not take its bytes with it. NAT is not in the way: masquerading
-  happens later, in `POSTROUTING`, so the host's own address is visible in
-  both directions.
-* **Presence is ARP, nudged.** A host that has been quiet for half a minute
-  goes `STALE` in the neighbour table, which looks exactly like a host that
-  has left. So stale neighbours get an occasional ping — and even one that
-  drops ICMP has to answer the ARP request that precedes it, which is what
-  refreshes the entry. Without this every idle laptop would show a
-  disconnection every minute.
-* **Sample fast, write slowly.** Presence and rates are read every few
-  seconds; traffic is accumulated in memory and written once a minute, and
-  only when it is not zero. Presence costs two rows per connection rather
-  than one per tick. A gateway that runs for a year does not need a database
-  the size of its logs.
+* **The kernel does the counting.** Two rules per host in a chain of our own — `-s <ip>` and `-d <ip>`, with no
+  `-j` target, so they count and fall through. Nothing is sampled, nothing is estimated, and a flow that ends
+  does not take its bytes with it. NAT is not in the way: masquerading happens later, in `POSTROUTING`, so the
+  host's own address is visible in both directions.
+* **Presence is ARP, nudged.** A host that has been quiet for half a minute goes `STALE` in the neighbour table,
+  which looks exactly like a host that has left. So stale neighbours get an occasional ping — and even one that
+  drops ICMP has to answer the ARP request that precedes it, which is what refreshes the entry. Without this
+  every idle laptop would show a disconnection every minute.
+* **Sample fast, write slowly.** Presence and rates are read every few seconds; traffic is accumulated in memory
+  and written once a minute, and only when it is not zero. Presence costs two rows per connection rather than
+  one per tick. A gateway that runs for a year does not need a database the size of its logs.
 
-One gap worth knowing about: a host is counted from the moment it is
-*discovered*, so a machine nobody has ever seen before can move up to one
-sampling interval of traffic before its rules exist. It applies once per
-host — the rules stay in place when a client goes quiet, and across daemon
-restarts, so a returning laptop is counted from its first packet. The
-alternative, pre-creating rules for every address on the segment, is how a
-ruleset grows without bound on a network with a guest wifi.
+One gap worth knowing about: a host is counted from the moment it is *discovered*, so a machine nobody has ever
+seen before can move up to one sampling interval of traffic before its rules exist. It applies once per host —
+the rules stay in place when a client goes quiet, and across daemon restarts, so a returning laptop is counted
+from its first packet. The alternative, pre-creating rules for every address on the segment, is how a ruleset
+grows without bound on a network with a guest Wi-Fi.
 
 ### Names
 
@@ -677,8 +555,7 @@ In priority order — the first one that knows wins:
 | `/etc/hosts` | automatic |
 | Reverse DNS | automatic, via the system resolver (`resolve_hostnames`) |
 
-A machine nobody can name shows as `—` and is still counted; it is
-identified by its address and MAC.
+A machine nobody can name shows as `—` and is still counted; it is identified by its address and MAC.
 
 ```toml
 [[clients.names]]
@@ -692,16 +569,14 @@ ip   = "192.168.8.9"
 
 ### What is *not* a client
 
-Provider gateways, this machine's own addresses, broadcast and multicast are
-excluded automatically — an ISP's router sharing the LAN segment is not one
-of your users. Anything else you do not want counted (a managed switch, an
-access point) goes in `clients.exclude`.
+Provider gateways, this machine's own addresses, broadcast and multicast are excluded automatically — an ISP's
+router sharing the LAN segment is not one of your users. Anything else you do not want counted (a managed
+switch, an access point) goes in `clients.exclude`.
 
 ### Turning it off
 
-Client accounting installs one iptables chain. If you told vlb not to manage
-your firewall (`firewall.manage = false`) it does not install anything unless
-you ask for it explicitly:
+Client accounting installs one iptables chain. If you told `vlb` not to manage your firewall
+(`firewall.manage = false`) it does not install anything unless you ask for it explicitly:
 
 ```toml
 [clients]
@@ -710,9 +585,264 @@ enabled = false     # or true, to account even with firewall.manage = false
 
 `vlb check` prints which of the two you have.
 
----
+## 🛠 Installation & operations
 
-## Quick start (development host)
+### Guided setup and the menu
+
+```bash
+sudo bash scripts/vlb.sh install
+```
+
+On a machine with no configuration it walks the whole way through — dependencies, the LAN-facing interface,
+each uplink's gateway (checked with a ping as you type it) — and finishes by writing `/etc/vlb/vlb.toml`,
+installing the service, and waiting until it can say **`carrying traffic through isp-main, verified by its own
+checks`**.
+
+<details>
+<summary>What the first run looks like</summary>
+
+```text
+Dependencies
+────────────
+[ ok] ip, ping, iptables and conntrack are all present
+
+Which interface faces your LAN and the uplinks?
+───────────────────────────────────────────────
+  1) ens18      10.0.0.100/10
+The default route currently leaves through: ens18
+Interface [ens18]:
+
+Uplinks
+───────
+Add them best first. The first one you enter is the primary; the others are
+tried in the order you give them if it fails.
+
+Uplink 1
+  Name (no spaces) [isp-main]:
+  Gateway (the ISP router's address): 10.0.0.2
+[ ok]   10.0.0.2 answers ping
+  Interface it is reached on [ens18]:
+  Priority (lower wins) [0]:
+  Role (primary/backup) [primary]:
+
+Add a backup uplink? (strongly recommended — with one uplink there is
+nothing to fail over to) (y/n) [y]:
+```
+
+</details>
+
+Three things it will not do, all learned the hard way:
+
+* **It never leaves a configuration the daemon would reject.** Every change is written to a temporary file,
+  validated with the real binary, and only then moved over the live one — with the previous version kept beside
+  it. A gateway whose config is rejected does not come back.
+* **It never leaves root-owned files in your checkout.** Building under `sudo` makes `target/` unwritable for
+  your ordinary user afterwards; the build is handed back to whoever owns the source tree, and an
+  already-root-owned `target/` is given back too.
+* **It never answers its own questions.** Reached through a pipe, or run with nothing on standard input, it
+  stops and says so rather than accepting every default in turn and configuring a gateway nobody asked for.
+
+Run it again on a configured machine and it opens a menu:
+
+```text
+  config   /etc/vlb/vlb.toml
+  daemon   running (systemd)
+  active   isp-main
+
+  1) Status
+  2) Dashboard (TUI)
+  3) Who is connected (clients)
+  4) Uplinks — add, change, remove
+  5) Restart
+  6) Diagnose a problem
+  7) Update from git
+  0) Quit
+```
+
+Adding an uplink asks the same four questions and checks the answer before accepting it — an address that is not
+directly connected cannot be a next hop, and it says so at the moment you type it rather than leaving you to find
+out from the daemon later. **Diagnose** runs the timed per-layer probe, prints the kernel's own routes and policy
+rules, and tails the log.
+
+### Install (or update) on a server
+
+One command. It downloads the release for your architecture, verifies it against the published SHA-256, checks
+the new build accepts your existing config *before* replacing anything, and restarts the service:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/DenisHumen/vlb-Virtual-Load-Balancer/main/scripts/install.sh | sudo bash
+```
+
+Safe to re-run: it is the update path as well as the install path. Your `/etc/vlb/vlb.toml` is never
+overwritten. If the new build rejects your config, cannot reach the canary targets, or the service fails to come
+back, it rolls back to the previous binary — and the previous unit — and tells you why.
+
+The restart in the middle does not interrupt traffic. The old daemon leaves its routes in place and the new one
+adopts them, re-verifying the active provider with its own probes before it will consider moving anything. The
+installer waits for that verification and reports `carrying traffic via: isp-main (verified by the new build)`.
+
+It adopts whatever is already there. If a `vlb` systemd unit exists, the installer reads its `ExecStart` and
+updates *that* binary with *that* config — so a box running out of `/opt/vlb` with its config beside it is
+updated in place, rather than having a second copy quietly installed at the default paths while the running one
+stays stale. A stock unit file is upgraded along with the binary (the previous one is kept as `vlb.service.bak`);
+a unit you edited by hand is left alone with a note. Put local changes in a drop-in (`sudo systemctl edit vlb`)
+and they survive every update.
+
+On a machine with no existing config it installs the annotated example and stops short of starting the service,
+so it cannot bring up a gateway pointed at example addresses.
+
+Once installed, the box can update itself with exactly the same safety net:
+
+```bash
+sudo vlb update
+```
+
+…or from the dashboard (`sudo vlb tui`), press `u`. Both run the new build's `check` against your config, run
+its `probe` to confirm the canary quorum is reachable, swap the binary, restart the service, wait for the daemon
+to answer, and roll back if it does not.
+
+<details>
+<summary>Installer options</summary>
+
+| Variable       | Effect                                          |
+|----------------|-------------------------------------------------|
+| `VLB_VERSION`  | Install a specific tag instead of the latest    |
+| `VLB_PRE=1`    | Consider pre-releases                            |
+| `VLB_NO_START=1` | Install the binary, leave the service alone    |
+| `VLB_SKIP_PROBE=1` | Skip the pre-restart canary reachability check |
+| `VLB_REPO`     | Pull from a fork                                 |
+
+```bash
+curl -fsSL .../install.sh | sudo VLB_VERSION=v0.2.1 bash
+```
+
+</details>
+
+### Update from a git checkout
+
+If you run `vlb` straight out of a clone rather than from a release, the whole update is one command:
+
+```bash
+sudo bash scripts/vlb.sh update
+```
+
+It pulls, builds, checks the new binary against **this machine's own configuration**, installs it wherever the
+service actually runs it from, restarts, and waits for it to answer. If it does not come back, the previous binary
+is put back, the service is restarted again, and the reason is printed from the journal. Each earlier step fails
+safe on its own: a pull that conflicts, a build that does not compile, or a binary that rejects your config all
+stop before anything is deployed, and rewind the checkout.
+
+> **If you have been updating with `git pull && vlb.sh restart`, that never deployed anything.** A build writes
+> `target/release/vlb`; the systemd unit runs `/usr/local/bin/vlb`. The restart in between re-executed the old
+> binary and reported success, and the `start` that followed raced the running daemon for the control port.
+> Fixed in 0.6.0, which is also why features you pulled may never have appeared. Use `update`.
+
+The restart does not interrupt traffic (see [How it works](#how-it-works)): the new process adopts the default
+route the old one left in the kernel.
+
+> **Install the service once.** `sudo bash scripts/vlb.sh start` runs the gateway from the checkout with a pid
+> file, which works but does not survive a reboot and depends on that directory staying where it is. One command
+> fixes it, and `update` says so if it finds the gateway running that way:
+>
+> ```bash
+> sudo bash scripts/vlb.sh install-service
+> ```
+
+```bash
+sudo bash scripts/vlb.sh status     # what is running now
+sudo bash scripts/vlb.sh tui        # dashboard (rebuilds + restarts if needed)
+sudo bash scripts/vlb.sh clients    # who is on the network
+sudo bash scripts/vlb.sh install    # the setup menu: uplinks, restart, diagnose
+VLB_NO_RESTART=1 bash scripts/vlb.sh build   # rebuild, leave the daemon alone
+```
+
+`scripts/vlb.sh` uses `/etc/vlb/vlb.toml` whenever that file exists, and falls back to the bundled example only
+when it does not. Keeping the live configuration out of the tracked example file is what makes `git pull` safe:
+edit the example and the next pull either refuses to update or overwrites your gateway's settings. The launcher
+documents every command inline (`./scripts/vlb.sh help`).
+
+### Production install (systemd)
+
+```bash
+sudo ./scripts/vlb.sh install-service
+# → installs /usr/local/bin/vlb,
+#   /etc/systemd/system/vlb.service,
+#   /etc/vlb/vlb.toml (your current config),
+#   enables and starts the unit.
+
+# Operate via systemd
+sudo systemctl status vlb        # one-line summary: active provider, per-provider state, pin
+sudo journalctl -u vlb -f
+sudo systemctl restart vlb       # traffic keeps flowing; the route is adopted, not re-chosen
+
+# Or talk to the running daemon directly
+vlb --config /etc/vlb/vlb.toml status
+vlb --config /etc/vlb/vlb.toml tui
+vlb --config /etc/vlb/vlb.toml stats --hours 24
+```
+
+The journal is kept for events. A provider that starts failing gets one warning with the reason, a summary every
+15 minutes while it stays that way (`isp-b still failing: … — 90 failed checks in the last 15m`), and a line when
+its state changes; the per-check detail is at DEBUG (`RUST_LOG=debug`). "No healthy providers" is logged when it
+starts, every 15 minutes while it lasts, and with its duration when it ends. The status frame is printed when a
+provider's state or the active provider changes, and otherwise every `health.status_print_secs` (default 15
+minutes; 0 = only on changes).
+
+<details>
+<summary>Why the unit file looks the way it does</summary>
+
+The unit is written for a gateway, and the choices are deliberate:
+
+| Setting                         | Why                                                                 |
+|---------------------------------|---------------------------------------------------------------------|
+| `After=network.target`          | *not* `network-online.target`: that one waits for every uplink, so a dead ISP at boot would delay the failover daemon by up to two minutes |
+| `StartLimitIntervalSec=0`       | systemd's default gives up after five failures in ten seconds; a gateway daemon is never given up on |
+| `Restart=always`, `RestartSec=2`| any exit — clean or not — is followed by a restart, and the routes it left are adopted |
+| `Type=exec`                     | `systemctl start` fails if the binary cannot be executed, instead of reporting success |
+| `NotifyAccess=main`             | the daemon writes its status line into `systemctl status` |
+| `OOMScoreAdjust=-900`           | the process routing the site is the last one the OOM killer should pick |
+| `ProtectSystem=full` + `ReadWritePaths=-/etc/sysctl.d` | hardening, with the one write the daemon needs: persisting `ip_forward=1` so forwarding is on from early boot |
+
+</details>
+
+To change anything, use a drop-in rather than editing the file — the installer upgrades the stock unit on update
+and leaves an edited one alone:
+
+```bash
+sudo systemctl edit vlb      # e.g. [Service] Environment=RUST_LOG=debug
+```
+
+Uninstall with `sudo ./scripts/vlb.sh uninstall-service` (keeps `/etc/vlb` and the stats DB intact).
+
+### Docker / Docker Compose
+
+The container needs host networking and `NET_ADMIN` (the compose file also adds `NET_RAW`): the daemon manages
+routes, ip rules, iptables and policy routing, and none of that works in a default container network namespace.
+
+```bash
+# The compose file mounts ./vlb.toml from the repo root — create it first
+cp examples/vlb.example.toml vlb.toml
+$EDITOR vlb.toml
+
+# Build and start (compose file lives in ./docker)
+docker compose -f docker/docker-compose.yml up -d --build
+
+# Tail
+docker compose -f docker/docker-compose.yml logs -f
+
+# TUI inside the container
+docker compose -f docker/docker-compose.yml exec vlb \
+    vlb --config /etc/vlb/vlb.toml tui
+
+# Stop
+docker compose -f docker/docker-compose.yml down
+```
+
+`docker/docker-compose.yml` mounts `./vlb.toml` read-only and persists the stats DB under `./data/`. See
+[`docker/Dockerfile`](docker/Dockerfile) and [`docker/docker-compose.yml`](docker/docker-compose.yml) for the
+full picture. A pre-built image will be published to Docker Hub later; for now the compose file builds locally.
+
+### Development host
 
 ```bash
 # 1. clone, build
@@ -737,97 +867,47 @@ sudo VLB_CONFIG=$PWD/vlb.toml ./scripts/vlb.sh logs   # tail logs
 sudo VLB_CONFIG=$PWD/vlb.toml ./scripts/vlb.sh stop
 ```
 
-The launcher is documented inline (`./scripts/vlb.sh help`).
-
----
-
-## Production install (systemd)
+### Building from source
 
 ```bash
-sudo ./scripts/vlb.sh install-service
-# → installs /usr/local/bin/vlb,
-#   /etc/systemd/system/vlb.service,
-#   /etc/vlb/vlb.toml (your current config),
-#   enables and starts the unit.
+cargo build --release
+# binary at target/release/vlb
 
-# Operate via systemd
-sudo systemctl status vlb        # one-line summary: active provider, per-provider state, pin
-sudo journalctl -u vlb -f
-sudo systemctl restart vlb       # traffic keeps flowing; the route is adopted, not re-chosen
+# tests (no system mutation)
+cargo test --release
 
-# Or talk to the running daemon directly
-vlb --config /etc/vlb/vlb.toml status
-vlb --config /etc/vlb/vlb.toml tui
-vlb --config /etc/vlb/vlb.toml stats --hours 24
+# lint clean
+cargo clippy --release --all-targets -- -D warnings
 ```
 
-The journal is kept for events. A provider that starts failing gets one
-warning with the reason, a summary every 15 minutes while it stays that way
-(`isp-b still failing: … — 90 failed checks in the last 15m`), and a line when
-its state changes; the per-check detail is at DEBUG (`RUST_LOG=debug`). "No
-healthy providers" is logged when it starts, every 15 minutes while it lasts,
-and with its duration when it ends. The status frame is printed when a
-provider's state or the active provider changes, and otherwise every
-`health.status_print_secs` (default 15 minutes; 0 = only on changes).
+MSRV is **1.88**. The launcher script (`scripts/vlb.sh`) bootstraps `rustup` automatically on hosts without a
+recent toolchain.
 
-The unit is written for a gateway, and the choices are deliberate:
+<a id="configuration"></a>
 
-| Setting                         | Why                                                                 |
-|---------------------------------|---------------------------------------------------------------------|
-| `After=network.target`          | *not* `network-online.target`: that one waits for every uplink, so a dead ISP at boot would delay the failover daemon by up to two minutes |
-| `StartLimitIntervalSec=0`       | systemd's default gives up after five failures in ten seconds; a gateway daemon is never given up on |
-| `Restart=always`, `RestartSec=2`| any exit — clean or not — is followed by a restart, and the routes it left are adopted |
-| `Type=exec`                     | `systemctl start` fails if the binary cannot be executed, instead of reporting success |
-| `NotifyAccess=main`             | the daemon writes its status line into `systemctl status` |
-| `OOMScoreAdjust=-900`           | the process routing the site is the last one the OOM killer should pick |
-| `ProtectSystem=full` + `ReadWritePaths=-/etc/sysctl.d` | hardening, with the one write the daemon needs: persisting `ip_forward=1` so forwarding is on from early boot |
+## ⚙️ Configuration
 
-To change anything, use a drop-in rather than editing the file — the
-installer upgrades the stock unit on update and leaves an edited one alone:
+The full annotated example is [`examples/vlb.example.toml`](examples/vlb.example.toml) — it is also what the
+installer puts in place on a fresh machine. Most deployments only edit `[general]` and `[[providers]]`.
 
-```bash
-sudo systemctl edit vlb      # e.g. [Service] Environment=RUST_LOG=debug
-```
+| Section | What it controls |
+|---|---|
+| `[general]` | the LAN-facing interface and this box's own LAN address |
+| `[health]` | reachability and DNS probes: interval, timeouts, thresholds, targets, resolvers |
+| `[canary]`, `[[canary.targets]]` | content authenticity: which URLs, what they must return, quorum |
+| `[canary.throughput]` | the throughput floor: URL, minimum rate, interval |
+| `[failover]` | failback stability window, flap backoff, route watchdog |
+| `[routing]` | per-provider tables and fwmarks, rule preference, connection pinning |
+| `[firewall]` | whether `vlb` writes iptables MASQUERADE / mangle rules |
+| `[database]` | SQLite path and auto-compaction |
+| `[control]` | control socket address (loopback only) |
+| `[traffic]`, `[system]` | interface traffic and host metric sampling and retention |
+| `[clients]` | per-client accounting |
+| `[update]` | where `vlb update` and the TUI's `u` key look for releases |
+| `[[providers]]` | one block per uplink: name, gateway, interface, priority, role |
 
-Uninstall with `sudo ./scripts/vlb.sh uninstall-service` (keeps
-`/etc/vlb` and the stats DB intact).
-
----
-
-## Docker / Docker Compose
-
-The container needs `--network host` and `--cap-add NET_ADMIN` (the
-daemon manages routes, ip rules, iptables and policy routing — none of
-that works in a default container netns).
-
-```bash
-# Build and start (compose file lives in ./docker)
-docker compose -f docker/docker-compose.yml up -d --build
-
-# Tail
-docker compose -f docker/docker-compose.yml logs -f
-
-# TUI inside the container
-docker compose -f docker/docker-compose.yml exec vlb \
-    vlb --config /etc/vlb/vlb.toml tui
-
-# Stop
-docker compose -f docker/docker-compose.yml down
-```
-
-`docker/docker-compose.yml` mounts `./vlb.toml` read-only and persists the
-stats DB under `./data/`. See [`docker/Dockerfile`](docker/Dockerfile) and
-[`docker/docker-compose.yml`](docker/docker-compose.yml) for the full picture.
-
-A pre-built image will be published to Docker Hub later; for now the
-compose file builds locally.
-
----
-
-## Configuration reference
-
-Full annotated example: [`examples/vlb.example.toml`](examples/vlb.example.toml). Most
-deployments only edit `[general]` and `[[providers]]`.
+<details>
+<summary><b>Configuration reference</b> — every section with the values the example ships</summary>
 
 ```toml
 [general]
@@ -835,15 +915,52 @@ lan_interface   = "ens18"        # interface that fronts your LAN clients
 gateway_address = "10.0.0.100"   # this box's own LAN IP
 
 [health]
-interval_secs       = 3
-timeout_ms          = 1000
-failure_threshold   = 2          # ticks down before declaring DOWN
-success_threshold   = 2          # ticks up before declaring UP
-probe_targets       = ["1.1.1.1", "8.8.8.8", "google.com"]
-dns_check_enabled   = true
-dns_resolvers       = ["1.1.1.1", "8.8.8.8"]
-dns_check_name      = "cloudflare.com"
-status_print_secs   = 900        # status frame in the log: on every change, and this often (0 = changes only)
+interval_secs         = 3
+timeout_ms            = 1000
+failure_threshold     = 4        # rounds down before declaring DOWN (built-in default if omitted: 2)
+success_threshold     = 2        # rounds up before declaring UP
+dns_failure_threshold = 4        # DNS gets its own, higher count
+status_print_secs     = 900      # status frame in the log: on every change, and this often (0 = changes only)
+probe_targets         = ["1.1.1.1", "8.8.8.8", "google.com"]
+dns_check_enabled     = true
+dns_resolvers         = ["1.1.1.1", "8.8.8.8"]
+dns_check_name        = "cloudflare.com"
+dns_integrity_check   = true     # a random name under .invalid must come back NXDOMAIN
+retention_hours       = 72       # health_checks table; 0 disables pruning
+
+[canary]                         # content authenticity — see below
+enabled           = true
+interval_secs     = 10
+timeout_ms        = 4000
+quorum            = "majority"   # any | majority | all
+failure_threshold = 3            # built-in default if omitted: 2
+
+[[canary.targets]]
+url = "http://connectivitycheck.gstatic.com/generate_204"
+expect_status = 204
+
+[[canary.targets]]
+url = "http://detectportal.firefox.com/success.txt"
+expect_exact = "success\n"
+
+[[canary.targets]]
+url = "https://raw.githubusercontent.com/DenisHumen/vlb-Virtual-Load-Balancer/main/canary/canary.txt"
+expect_contains = "vlb-canary-v1-do-not-edit"
+
+[canary.throughput]              # throughput floor — see below
+enabled           = true
+url               = "https://raw.githubusercontent.com/DenisHumen/vlb-Virtual-Load-Balancer/main/canary/throughput-64k.bin"
+min_kbps          = 128
+interval_secs     = 120
+timeout_ms        = 15000
+failure_threshold = 3            # built-in default if omitted: 2
+
+[failover]
+failback_stable_secs     = 30    # primary must be clean this long before we return
+flap_threshold           = 3     # switches inside flap_window before backoff kicks in
+flap_window_secs         = 600
+max_failback_stable_secs = 900
+route_watchdog_secs      = 15    # re-assert our default route if something else took it
 
 [routing]
 table_base  = 200                # provider tables: 200, 201, ...
@@ -860,28 +977,6 @@ disable_host_firewall  = false   # leave UFW etc. alone
 path         = "/var/lib/vlb/stats.db"
 auto_compact = true              # hand space freed by pruning back to the disk
 
-[canary]                         # content authenticity — see below
-enabled         = true
-interval_secs   = 10
-timeout_ms      = 4000
-quorum          = "majority"     # any | majority | all
-failure_threshold = 2
-
-[[canary.targets]]
-url = "http://connectivitycheck.gstatic.com/generate_204"
-expect_status = 204
-
-[[canary.targets]]
-url = "https://raw.githubusercontent.com/DenisHumen/vlb-Virtual-Load-Balancer/main/canary/canary.txt"
-expect_contains = "vlb-canary-v1-do-not-edit"
-
-[failover]
-failback_stable_secs     = 30    # primary must be clean this long before we return
-flap_threshold           = 3     # switches inside flap_window before backoff kicks in
-flap_window_secs         = 600
-max_failback_stable_secs = 900
-route_watchdog_secs      = 15    # re-assert our default route if something else took it
-
 [control]
 listen = "127.0.0.1:7650"        # control socket; loopback only
 
@@ -895,6 +990,22 @@ enabled         = true
 interval_secs   = 2
 retention_hours = 72
 per_core        = true
+
+[clients]                        # per-client accounting — see Client statistics
+enabled            = true        # unset: follows firewall.manage
+interval_secs      = 5
+persist_every_secs = 60
+offline_after_secs = 180
+retention_hours    = 168
+presence_probe     = true
+resolve_hostnames  = true
+max_tracked        = 512
+
+[update]                         # used by `vlb update` and the TUI's `u` key
+repo             = "DenisHumen/vlb-Virtual-Load-Balancer"
+allow_prerelease = false
+restart_service  = true
+service_name     = "vlb"
 
 [[providers]]
 name      = "isp-main"
@@ -911,19 +1022,19 @@ priority  = 2                    # gaps are fine — see below
 role      = "backup"
 ```
 
+</details>
+
 ### Priorities
 
-Lowest number wins. Priorities only have to be **unique** — they do not need
-to start at 0 and gaps are allowed. `0` and `2` with nothing at `1` is a
-perfectly good configuration, and leaving a gap is useful: you can slot in a
-third uplink later without renumbering, which would otherwise move an
-existing provider's routing table and fwmark (`table = table_base + priority`,
-`mark = fwmark_base + priority`).
+Lowest number wins. Priorities only have to be **unique** — they do not need to start at 0 and gaps are allowed.
+`0` and `2` with nothing at `1` is a perfectly good configuration, and leaving a gap is useful: you can slot in a
+third uplink later without renumbering, which would otherwise move an existing provider's routing table and
+fwmark (`table = table_base + priority`, `mark = fwmark_base + priority`).
 
 ### Canary targets
 
-Each target names a URL, the status code you expect, and optionally what the
-body must look like. Set **exactly one** of:
+Each target names a URL, the status code you expect, and optionally what the body must look like. Set **exactly
+one** of:
 
 | Field             | Meaning                                                        |
 |-------------------|----------------------------------------------------------------|
@@ -932,30 +1043,27 @@ body must look like. Set **exactly one** of:
 | `expect_sha256`   | SHA-256 of the body, 64 hex chars. Strictest.                   |
 | *(none)*          | Only the status code is checked — for `generate_204`-style endpoints. |
 
-The shipped defaults deliberately mix schemes, so that no single failure can
-both cause a false failover and hide a real one:
+The shipped defaults deliberately mix schemes, so that no single failure can both cause a false failover and hide
+a real one:
 
-* the two **plain-HTTP** endpoints are the standard captive-portal probes
-  (what Android and Firefox use). Plain HTTP is precisely what an
-  intercepting ISP rewrites, so these trip first and loudest;
-* the **HTTPS** endpoint additionally proves the certificate chain — a
-  transparent proxy cannot present a valid certificate for
-  `raw.githubusercontent.com`, so it fails the handshake rather than serving
-  a portal page.
+* the two **plain-HTTP** endpoints are the standard captive-portal probes (what Android and Firefox use). Plain
+  HTTP is precisely what an intercepting ISP rewrites, so these trip first and loudest;
+* the **HTTPS** endpoint additionally proves the certificate chain — a transparent proxy cannot present a valid
+  certificate for `raw.githubusercontent.com`, so it fails the handshake rather than serving a portal page.
 
-`quorum = "majority"` (the default) means one endpoint being unavailable is
-tolerated, while an interceptor — which necessarily breaks all of them —
-still trips the check. Two failure kinds are distinguished:
+`quorum = "majority"` (the default) means one endpoint being unavailable is tolerated, while an interceptor —
+which necessarily breaks all of them — still trips the check. Two failure kinds are distinguished:
 
-* **tampered** — proof that something is answering in place of the real
-  server. Overrides the quorum entirely: one tampered target takes the
-  provider down immediately, with no threshold.
-* **unreachable** — something failed, but benign explanations exist. Counts
-  as a single vote and must repeat `failure_threshold` times.
+* **tampered** — proof that something is answering in place of the real server. Overrides the quorum entirely:
+  one tampered target takes the provider down immediately, with no threshold.
+* **unreachable** — something failed, but benign explanations exist. Counts as a single vote and must repeat
+  `failure_threshold` times.
 
-Where the line falls matters, because `tampered` is powerful enough for one
-endpoint to fail every uplink over on its own. Only signals that cannot occur
-on a healthy link qualify:
+<details>
+<summary>What counts as <i>tampered</i> and what as <i>unreachable</i></summary>
+
+Where the line falls matters, because `tampered` is powerful enough for one endpoint to fail every uplink over on
+its own. Only signals that cannot occur on a healthy link qualify:
 
 | Observation                                  | Verdict     |
 |----------------------------------------------|-------------|
@@ -967,89 +1075,75 @@ on a healthy link qualify:
 | **4xx / 5xx**                                | unreachable |
 | Timeout, refused, TLS handshake failure      | unreachable |
 
-The 4xx/5xx row is deliberate. Interceptors serve payment pages, not 404s, so
-a 4xx overwhelmingly means a wrong URL or a broken endpoint — and treating a
-typo'd canary URL as proof would fail over every provider at once on a
+The 4xx/5xx row is deliberate. Interceptors serve payment pages, not 404s, so a 4xx overwhelmingly means a wrong
+URL or a broken endpoint — and treating a typo'd canary URL as proof would fail over every provider at once on a
 perfectly healthy network.
 
-> Disabling the canary (`enabled = false`) removes the **only** check capable
-> of detecting a reachable-but-intercepted uplink. `vlb check` and the daemon
-> both warn when it is off.
+</details>
+
+> Disabling the canary (`enabled = false`) removes the **only** check capable of detecting a
+> reachable-but-intercepted uplink. `vlb check` and the daemon both warn when it is off.
 
 ### Throughput floor — the case content checking cannot see
 
-Verifying content proves the bytes are genuine. It says nothing about how
-*fast* they arrived, and a provider suspending an account may simply cap the
-rate rather than redirect or drop.
+Verifying content proves the bytes are genuine. It says nothing about how *fast* they arrived, and a provider
+suspending an account may simply cap the rate rather than redirect or drop.
 
-It is worse than "small transfers are fast enough". A rate limiter is a token
-bucket, so a small transfer drains the burst allowance and completes at **full
-line speed**. Measured against a 64 kbit/s policer in the test lab:
+It is worse than "small transfers are fast enough". A rate limiter is a token bucket, so a small transfer drains
+the burst allowance and completes at **full line speed**. Measured against a 64 kbit/s policer in the test lab:
 
 | Transfer over the same throttled link | Time    | Effective rate |
 |---------------------------------------|---------|----------------|
 | the 1.2 KB canary file                | 0.6 ms  | ~16 Mbit/s (!) |
 | a 256 KB transfer                     | 12.3 s  | 60 kbit/s      |
 
-So no latency budget on the small probe could ever fire. `vlb` moves 64 KiB
-twice a minute instead — under a kilobyte per second on average — and fails
-the provider if the measured rate is below `min_kbps`.
+So no latency budget on the small probe could ever fire. `vlb` moves 64 KiB per provider every two minutes
+instead (`interval_secs = 120`) — well under a kilobyte per second on average — and fails the provider if the
+measured rate is below `min_kbps`.
 
-The default floor of 128 kbit/s is deliberately low: a suspension throttle is
-64–128 kbit/s, while any working link clears it comfortably. Round-trip time
-alone caps the *measured* figure (64 KiB over a 100 ms RTT reads as roughly
-5 Mbit/s however fast the pipe is), so a high floor would fail healthy
-providers over — validation refuses anything above 5000. Run `vlb probe` to
-see what your links actually report before changing it.
+The default floor of 128 kbit/s is deliberately low: a suspension throttle is 64–128 kbit/s, while any working
+link clears it comfortably. Round-trip time alone caps the *measured* figure (64 KiB over a 100 ms RTT reads as
+roughly 5 Mbit/s however fast the pipe is), so a high floor would fail healthy providers over — validation refuses
+anything above 5000. Run `vlb probe` to see what your links actually report before changing it.
 
-The probe runs only when the reachability layers pass; there is nothing to
-learn about the speed of a link that is already down, and firing a 64 KiB
-transfer at one would just delay the failover.
+The probe runs only when the reachability layers pass; there is nothing to learn about the speed of a link that is
+already down, and firing a 64 KiB transfer at one would just delay the failover.
 
 ### Failback policy
 
-Leaving a broken uplink is immediate and unconditional — users are offline
-now, so any healthy provider beats the one we are on. Coming *back* is the
-opposite: nothing is broken, so `vlb` waits until the higher-priority
-provider has passed **every** layer continuously for `failback_stable_secs`.
-If a link proves unstable — more than `flap_threshold` switches inside
-`flap_window_secs` — that wait doubles for each extra switch, capped at
+Leaving a broken uplink is immediate and unconditional — users are offline now, so any healthy provider beats the
+one we are on. Coming *back* is the opposite: nothing is broken, so `vlb` waits until the higher-priority provider
+has passed **every** layer continuously for `failback_stable_secs`. If a link proves unstable — more than
+`flap_threshold` switches inside `flap_window_secs` — that wait doubles for each extra switch, capped at
 `max_failback_stable_secs`, and decays on its own once the link settles.
 
 ### The statistics database
 
-Every table with a `retention_hours` is pruned hourly to exactly that window.
-With `auto_compact = true` (the default) the space those rows occupied goes
-back to the filesystem too: SQLite reuses freed pages but never shrinks the
-file on its own, so without it the file would stay at the largest size it ever
-reached.
+Every table with a `retention_hours` is pruned hourly to exactly that window. With `auto_compact = true` (the
+default) the space those rows occupied goes back to the filesystem too: SQLite reuses freed pages but never shrinks
+the file on its own, so without it the file would stay at the largest size it ever reached.
 
-A database created by a release before 0.7.1 is rewritten once, at the first
-start, when more than a quarter of it (and at least 64 MiB) is empty pages.
-That takes seconds for a few hundred megabytes of data; routing does not wait
-for it, only the first probes do. It is skipped, with a warning and the
-command to run by hand, if the disk does not have room for twice the live data.
-From then on a small step after every prune keeps the file trimmed.
+A database created by a release before 0.7.1 is rewritten once, at the first start, when more than a quarter of it
+(and at least 64 MiB) is empty pages. That takes seconds for a few hundred megabytes of data; routing does not wait
+for it, only the first probes do. It is skipped, with a warning and the command to run by hand, if the disk does
+not have room for twice the live data. From then on a small step after every prune keeps the file trimmed.
 
 ### Traffic per provider
 
-With `firewall.manage = true` forwarded traffic is counted per uplink in a
-chain of vlb's own hooked into `FORWARD` (`VLB_UPLINKS`), split by the
-provider each connection belongs to: its pinned mark when connection pinning
-stamped one, otherwise the provider that was active — which, without
-pinning, is exactly where every forwarded packet went. Providers that share
-one interface each get their own numbers, and they add up to the total.
+With `firewall.manage = true` forwarded traffic is counted per uplink in a chain of `vlb`'s own hooked into
+`FORWARD` (`VLB_UPLINKS`), split by the provider each connection belongs to: its pinned mark when connection
+pinning stamped one, otherwise the provider that was active — which, without pinning, is exactly where every
+forwarded packet went. Providers that share one interface each get their own numbers, and they add up to the
+total.
 
-Without firewall management there is nothing to split by. A provider with an
-interface to itself is counted from that interface; providers that share an
-interface are shown together as that interface's total — the dashboard
-titles the graph `ens18, all providers on it` and `vlb stats` lists it as
-`ens18 (all)` — rather than each being credited with all of it.
+Without firewall management there is nothing to split by. A provider with an interface to itself is counted from
+that interface; providers that share an interface are shown together as that interface's total — the dashboard
+titles the graph `ens18, all providers on it` and `vlb stats` lists it as `ens18 (all)` — rather than each being
+credited with all of it.
 
 ### Client accounting
 
-Full walk-through in [Client statistics](#who-is-on-the-network--client-statistics).
-The knobs:
+Full walk-through in [Client statistics](#-client-statistics). The knobs:
 
 | Key | Default | What it changes |
 |---|---|---|
@@ -1067,155 +1161,58 @@ The knobs:
 
 ### Probe target rules
 
-* IPv4 literal (e.g. `1.1.1.1`) → ping it directly through the
-  provider's mark.
-* Anything else → treated as a hostname, resolved via that provider's
-  DNS resolvers (also marked), then ping the resolved IP through the
-  same mark.
-* Mix both. If at least one hostname is configured, at least one
-  hostname must pass — so `google.com` failing while `1.1.1.1` works
-  still counts as a broken uplink.
+* IPv4 literal (e.g. `1.1.1.1`) → ping it directly through the provider's mark.
+* Anything else → treated as a hostname, resolved via that provider's DNS resolvers (also marked), then the
+  resolved IP is pinged through the same mark.
+* Mix both. If at least one hostname is configured, at least one hostname must pass — so `google.com` failing
+  while `1.1.1.1` works still counts as a broken uplink.
 
----
+## 🧱 Architecture
 
-## CLI
+```mermaid
+flowchart LR
+    subgraph LAN["your LAN"]
+        C1["laptop"]
+        C2["TV"]
+        C3["phone"]
+    end
+    GW["<b>vlb</b><br/>gateway"]
+    subgraph WAN["uplinks"]
+        P0["ISP A<br/>priority 0"]
+        P2["ISP B<br/>priority 2"]
+    end
+    NET(("internet"))
 
-Everything below assumes the config is at `/etc/vlb/vlb.toml`, which is where
-the guided setup puts it and what `scripts/vlb.sh` picks up automatically.
+    C1 --- GW
+    C2 --- GW
+    C3 --- GW
+    GW ==>|"active"| P0
+    GW -.->|"standby"| P2
+    P0 --> NET
+    P2 --> NET
 
-| I want to… | Command |
-|---|---|
-| Set it up, or change it | `sudo bash scripts/vlb.sh install` |
-| See what is happening | `sudo vlb tui` |
-| Check it from a script | `sudo vlb status` |
-| See who is on the network | `sudo vlb clients` |
-| See one host's history | `sudo vlb clients --ip 192.168.8.24` |
-| Find out why an uplink is down | `sudo vlb probe --provider isp-main` |
-| Pin one uplink by hand | `sudo vlb force isp-backup` … `sudo vlb auto` |
-| Restart without dropping traffic | `sudo systemctl restart vlb` |
-| Update | `sudo vlb update` — or `git pull && sudo bash scripts/vlb.sh restart` |
-| Read the logs | `sudo journalctl -u vlb -f` |
-
-```
-vlb run    [--config <path>] [--dry-run]    # foreground daemon
-vlb check  [--config <path>]                # validate + summary
-vlb status [--config <path>]                # query running daemon
-vlb tui    [--config <path>]                # dashboard
-vlb force  [--config <path>] <name>         # pin provider
-vlb auto   [--config <path>]                # release pin
-vlb stats  [--config <path>] [--hours N] [--recent N]
-vlb system [--config <path>] [--recent N]
-vlb diag   [--config <path>]                # interfaces, DB, ports
-vlb probe  [--config <path>] [--provider <name>] [--repeat N]
-vlb clients [--config <path>] [--ip <addr>] [--hours N] [--json]
-vlb update [--config <path>] [--check] [--pre] [--yes] [--force] [--skip-probe]
+    style GW fill:#1f6feb,stroke:#1f6feb,color:#fff
+    style P0 stroke:#2ea043,stroke-width:3px
+    style P2 stroke-dasharray: 4 4
 ```
 
-`vlb status` is JSON, meant for scripts. Besides the per-provider table it
-carries `active`, `forced` (the pin), `active_adopted` (the route was taken
-over at startup and the new process has not confirmed its provider yet),
-`kernel_route` (what the kernel actually has), `failback_pending` (the
-countdown, if one is running), `version` and `started_at`.
+**Tech stack:** Rust (edition 2024, MSRV 1.88) · Tokio · ratatui + crossterm (TUI) · rusqlite with bundled SQLite
+· rustls with the `ring` provider and webpki roots (canary and self-update TLS) · clap · iproute2, iptables and
+conntrack on the host.
 
-### `vlb probe` — size your timeouts from measurements
+### How it works
 
-Runs every health layer once against each provider and prints what each one
-actually cost, without touching the routing table. Use it to pick
-`canary.timeout_ms` instead of guessing, and to see *why* a provider is
-considered unhealthy:
-
-```bash
-sudo vlb --config /etc/vlb/vlb.toml probe --repeat 5
-```
-
-It reports the slowest observed run per layer — the number a timeout has to
-accommodate — and suggests a `canary.timeout_ms`. Under an intercepted
-uplink it names the interception explicitly rather than reporting a vague
-timeout.
-
-### `vlb update` — install the newest release
-
-```bash
-sudo vlb --config /etc/vlb/vlb.toml update --check   # look, change nothing
-sudo vlb --config /etc/vlb/vlb.toml update           # install, with a prompt
-```
-
-In order, and nothing on the box changes until step 4 has passed:
-
-1. downloads the release asset for this host's architecture and verifies it
-   against the published SHA-256;
-2. proves the new binary runs here (`--version`);
-3. runs the new binary's `check` against the config in use — a release that
-   tightened validation is caught while the working binary is still in
-   place, not after the restart with the gateway down;
-4. runs the new binary's `probe` and refuses to continue if the canary
-   quorum cannot be met through any provider, since restarting into that
-   would switch automatic failover off (`--skip-probe` overrides);
-5. swaps the binary atomically, keeping the previous one as `vlb.bak`;
-6. restarts the unit and waits for the daemon to answer on its control
-   socket. If the service dies, the previous binary is put back and
-   restarted.
-
-The restart itself does not touch the routing table: the new daemon adopts
-the route the old one left and re-verifies its provider before it would
-move anything. The same flow is on the TUI's `u` key, with progress shown
-while it runs.
-
----
-
-## TUI hotkeys
-
-<p align="center">
-  <img src="docs/assets/tui-dashboard.svg" alt="The dashboard: gateway panel, host metrics, the provider table with per-layer health, recent switchovers, and the traffic chart" width="100%" />
-</p>
-
-| Key     | Action                                    |
-|---------|-------------------------------------------|
-| `↑`/`↓` | Move selection                            |
-| `f`     | Force the selected provider               |
-| `a`     | Release force, return to auto             |
-| `c`     | **Client statistics** — who is on the LAN |
-| `r`     | Force redraw                              |
-| `u`     | Check for a new release and install it    |
-| `q`     | Quit                                      |
-
-On the client screens:
-
-| Key     | Action                                    |
-|---------|-------------------------------------------|
-| `↑`/`↓` | Move between hosts                        |
-| `Enter` | Open one host's full history              |
-| `w`     | Cycle the window: 1h → 24h → 7d → 30d     |
-| `Esc`   | Back (detail → list → dashboard)          |
-
-Top to bottom: the **gateway** panel (active provider and whether it is
-verified or still adopted from the routing table, the pin, the failback
-countdown, the kernel's own default route, daemon version and uptime), host
-metrics, the **providers** table (state, latency, canary, throughput, how
-long each has been up, and *why* one is down), **recent events** — every
-switchover with its timestamp and reason — and the traffic chart for the
-selected provider. The TUI keeps running through a daemon restart and says
-so when the daemon is back.
-
----
-
-## How it works
-
-For each provider we install one routing table (`ip route add default via
-<gw> dev <if> table <N>`), one fwmark policy rule (`ip rule add fwmark
-<M> lookup <N>`), and one MASQUERADE rule on egress. Health probes set
-`SO_MARK` (DNS) or pass `-m <mark>` (ping), so they always exit through
-the chosen provider regardless of the active default. The state machine
-counts consecutive successes/failures, picks the lowest-priority healthy
-provider as active, and writes the result via `ip route replace default
-via <chosen> metric 0 proto static`. On every change we `conntrack -F`
-so live flows reset and reconnect.
+For each provider `vlb` installs one routing table (`ip route add default via <gw> dev <if> table <N>`), one
+fwmark policy rule (`ip rule add fwmark <M> lookup <N>`), and one MASQUERADE rule on egress. Health probes set
+`SO_MARK` (DNS) or pass `-m <mark>` (ping), so they always exit through the chosen provider regardless of the
+active default. The state machine counts consecutive successes/failures, picks the lowest-priority healthy
+provider as active, and writes the result via `ip route replace default via <chosen> metric 0 proto static`. On
+every change it runs `conntrack -F` so live flows reset and reconnect.
 
 ### One health round, per provider
 
-Each layer only runs when the one before it passed — there is nothing to
-learn from a DNS query down a cable that is unplugged, and a 64 KiB transfer
-down a dead link costs a whole timeout for no information.
+Each layer only runs when the one before it passed — there is nothing to learn from a DNS query down a cable that
+is unplugged, and a 64 KiB transfer down a dead link costs a whole timeout for no information.
 
 ```mermaid
 flowchart TD
@@ -1239,14 +1236,13 @@ flowchart TD
     style D7 fill:#bf8700,color:#fff
 ```
 
-The two red boxes are *proof* rather than symptoms: no working link returns
-somebody else's bytes, so those bypass the failure threshold and switch on
-first observation. Everything else has to repeat before it counts.
+The two red boxes are *proof* rather than symptoms: no working link returns somebody else's bytes, so those bypass
+the failure threshold and switch on first observation. Everything else has to repeat before it counts.
 
 ### A restart, or an update
 
-Nothing is torn down when the daemon stops, and the next one picks up where
-it left off rather than starting from an empty table:
+Nothing is torn down when the daemon stops, and the next one picks up where it left off rather than starting from
+an empty table:
 
 ```mermaid
 sequenceDiagram
@@ -1264,12 +1260,9 @@ sequenceDiagram
     Note over N: pin and flap history restored from SQLite
 ```
 
-No route change, no conntrack flush, no detour through the backup because
-its probes happened to finish first.
+No route change, no conntrack flush, no detour through the backup because its probes happened to finish first.
 
----
-
-## Failure modes we cover
+### Failure modes we cover
 
 | Symptom                                              | Detected by                |
 |------------------------------------------------------|----------------------------|
@@ -1295,9 +1288,7 @@ its probes happened to finish first.
 | **"Was it the internet, or just my laptop?"**         | **per-client sessions: every drop is a row with a start, an end and the gap** |
 | **"Who used all the bandwidth at four o'clock?"**     | **per-client byte counters in the kernel, kept per host with history** |
 
----
-
-## Testing
+## 🧪 Testing
 
 ```bash
 # everything that runs without root or docker: fmt, clippy, unit tests,
@@ -1324,13 +1315,11 @@ Run this before pushing — it is the same set CI enforces.
    └───────────────────────────────────────────────────┘
 ```
 
-Both providers hang off the *same* vlb interface with different next hops —
-the single-armed topology of the real deployment — with priorities 0 and 2 so
-the priority-gap case is exercised on every run. The `origin` container plays
-the real internet and is the only holder of the genuine canary content,
-reachable exclusively through one of the two ISPs. The lab's default route is
-deleted at startup, so vlb owns the only one: if it picks the wrong provider,
-nothing reaches the origin at all.
+Both providers hang off the *same* `vlb` interface with different next hops — the single-armed topology of the
+real deployment — with priorities 0 and 2 so the priority-gap case is exercised on every run. The `origin`
+container plays the real internet and is the only holder of the genuine canary content, reachable exclusively
+through one of the two ISPs. The lab's default route is deleted at startup, so `vlb` owns the only one: if it picks
+the wrong provider, nothing reaches the origin at all.
 
 Each ISP can be switched between failure modes at runtime:
 
@@ -1347,47 +1336,6 @@ Each ISP can be switched between failure modes at runtime:
 | `expired`     | **unpaid account: DNS hijacked to a portal, HTTP answered by a billing page, ICMP left working** |
 | `mitm`        | as `expired`, plus TLS interception with a forged certificate        |
 
-Beyond the per-provider fault modes, the suite also covers the operational
-cases that break gateways in the field: competing default routes from
-netplan/networkd, a missing `conntrack`, operator `force`/`auto` racing a
-switchover, a soak that runs six full failover/failback cycles and then
-checks the daemon has not grown — and the restart, four ways. The daemon
-process is killed and restarted in place (what an update and `Restart=always`
-do) on a healthy gateway whose primary is *slower* than its backup, while
-failed over to the backup, and with an operator pin in place; the container
-is restarted outright for the reboot case; and it is brought up with a
-provider on an interface that does not exist. In every one the route must not
-move, no switchover may be logged, the pin must come back, and client traffic
-must keep flowing.
-
-Client accounting is tested against the same LAN client: it moves a real
-256 KB transfer through the gateway, and the suite checks that the bytes are
-attributed to that host, that its MAC and its name are learned, that the
-provider gateways sharing the segment are *not* listed as users — and then
-stops the container outright, which is a genuine LAN disconnection, and
-checks that vlb notices, records the drop, and picks the host back up with
-its history intact when it returns.
-
-Traffic per uplink is tested on the same shared interface: the client's
-256 KB download has to be credited to the active provider, and the standby,
-which carried none of it, must not gain it too.
-
-103 assertions in 26 scenarios, all on Ubuntu 24.04.
-
-`expired` and `portal-http` are the two that matter. `expired` is the full
-production symptom. `portal-http` is the stricter test: it leaves DNS entirely
-honest — the resolver still returns NXDOMAIN for `.invalid`, so the integrity
-probe is satisfied — meaning a failover there can *only* have come from
-comparing bytes. It exists so the canary cannot quietly stop working while the
-DNS check covers for it.
-
-In both modes the portal sits on a *public-looking* address (TEST-NET-3), and
-the simulated internet on another (TEST-NET-1), rather than on RFC1918 space.
-That is deliberate: vlb short-circuits a hijack that resolves into private
-address space, so a private portal would never reach the content comparison at
-all. Public-looking addresses force the real path — resolve, connect, fetch,
-compare bytes.
-
 ```bash
 docker/test/run-tests.sh                 # all scenarios
 docker/test/run-tests.sh expired         # just the one
@@ -1398,186 +1346,218 @@ docker compose -f docker/test/docker-compose.yml exec isp1 isp-mode expired
 docker compose -f docker/test/docker-compose.yml logs -f vlb
 ```
 
-Scenarios assert on the **kernel's** default route and on whether traffic
-from a separate `client` container — a plain LAN host whose only route out is
-the vlb box — reaches the origin. That is deliberately not the gateway's own
-traffic: it also exercises forwarding, NAT and the conntrack state a failover
-disturbs, and it is what the people behind the gateway actually experience.
-Assertions never rest on what vlb believes — a daemon that
-reports a healthy failover while traffic still black-holes fails the test.
+103 assertions in 26 scenarios, all on Ubuntu 24.04.
 
-> One gap worth naming: the lab exercises the canary over plain HTTP. Testing
-> a *successful* HTTPS canary hermetically would need a custom CA in the trust
-> store, and `vlb` deliberately trusts only the webpki roots. TLS failure
-> paths are covered (the `mitm` mode's forged certificate must be rejected),
-> and the TLS client config is unit-tested; a successful HTTPS fetch is
-> covered by the real-world default targets.
+<details>
+<summary><b>What the lab covers beyond the fault modes</b></summary>
 
----
+Beyond the per-provider fault modes, the suite also covers the operational cases that break gateways in the
+field: competing default routes from netplan/networkd, a missing `conntrack`, operator `force`/`auto` racing a
+switchover, a soak that runs six full failover/failback cycles and then checks the daemon has not grown — and the
+restart, four ways. The daemon process is killed and restarted in place (what an update and `Restart=always` do)
+on a healthy gateway whose primary is *slower* than its backup, while failed over to the backup, and with an
+operator pin in place; the container is restarted outright for the reboot case; and it is brought up with a
+provider on an interface that does not exist. In every one the route must not move, no switchover may be logged,
+the pin must come back, and client traffic must keep flowing.
 
-## Building from source
+Client accounting is tested against the same LAN client: it moves a real 256 KB transfer through the gateway, and
+the suite checks that the bytes are attributed to that host, that its MAC and its name are learned, that the
+provider gateways sharing the segment are *not* listed as users — and then stops the container outright, which is a
+genuine LAN disconnection, and checks that `vlb` notices, records the drop, and picks the host back up with its
+history intact when it returns.
 
-```bash
-cargo build --release
-# binary at target/release/vlb
+Traffic per uplink is tested on the same shared interface: the client's 256 KB download has to be credited to the
+active provider, and the standby, which carried none of it, must not gain it too.
 
-# tests (no system mutation)
-cargo test --release
+`expired` and `portal-http` are the two that matter. `expired` is the full production symptom. `portal-http` is
+the stricter test: it leaves DNS entirely honest — the resolver still returns NXDOMAIN for `.invalid`, so the
+integrity probe is satisfied — meaning a failover there can *only* have come from comparing bytes. It exists so the
+canary cannot quietly stop working while the DNS check covers for it.
 
-# lint clean
-cargo clippy --release --all-targets -- -D warnings
-```
+In both modes the portal sits on a *public-looking* address (TEST-NET-3), and the simulated internet on another
+(TEST-NET-1), rather than on RFC1918 space. That is deliberate: `vlb` short-circuits a hijack that resolves into
+private address space, so a private portal would never reach the content comparison at all. Public-looking
+addresses force the real path — resolve, connect, fetch, compare bytes.
 
-MSRV is **1.88**. The launcher script (`scripts/vlb.sh`) bootstraps
-`rustup` automatically on hosts without a recent toolchain.
+Scenarios assert on the **kernel's** default route and on whether traffic from a separate `client` container — a
+plain LAN host whose only route out is the `vlb` box — reaches the origin. That is deliberately not the gateway's
+own traffic: it also exercises forwarding, NAT and the conntrack state a failover disturbs, and it is what the
+people behind the gateway actually experience. Assertions never rest on what `vlb` believes — a daemon that reports
+a healthy failover while traffic still black-holes fails the test.
 
----
+> One gap worth naming: the lab exercises the canary over plain HTTP. Testing a *successful* HTTPS canary
+> hermetically would need a custom CA in the trust store, and `vlb` deliberately trusts only the webpki roots. TLS
+> failure paths are covered (the `mitm` mode's forged certificate must be rejected), and the TLS client config is
+> unit-tested; a successful HTTPS fetch is covered by the real-world default targets.
 
-## Runtime requirements
+</details>
 
-* Linux kernel with policy routing (`ip rule`, fwmark) — every kernel
-  shipped this decade.
-* `iproute2` (`ip` command) and `iputils` ping (must support `-m
-  <mark>` and fractional `-W`).
-* `iptables` NAT table — nftables hosts ship `iptables-nft`, which
-  works.
-* `conntrack` — **install it.** Nominally optional, but without it the
-  per-failover flush silently does nothing: failover looks like it worked
-  while every established connection stays pinned to the dead provider and
-  hangs until it times out. **A stock Ubuntu 24.04 server does not have it**,
-  so this is the default state on a fresh box, not an edge case. The
-  installer puts it there; `vlb check` and the daemon both say so if it is
-  missing.
+## 🐧 Runtime requirements
+
+* Linux kernel with policy routing (`ip rule`, fwmark) — every kernel shipped this decade.
+* `iproute2` (`ip` command) and `iputils` ping (must support `-m <mark>` and fractional `-W`).
+* `iptables` NAT table — nftables hosts ship `iptables-nft`, which works.
+* `conntrack` — **install it.** Nominally optional, but without it the per-failover flush silently does nothing:
+  failover looks like it worked while every established connection stays pinned to the dead provider and hangs
+  until it times out. **A stock Ubuntu 24.04 server does not have it**, so this is the default state on a fresh
+  box, not an edge case. The installer puts it there; `vlb check` and the daemon both say so if it is missing.
 * Root (`CAP_NET_ADMIN` plus write access to `/proc/sys`).
 
----
+`scripts/vlb.ps1` is a limited Windows launcher (build, check, TUI, stats, the Docker lab); the forwarding,
+iptables and ip-rule work itself is Linux-only.
 
-## Ubuntu 24.04
+### Ubuntu 24.04
 
-The primary deployment target, and the platform the test lab runs on. Three
-things differ from older releases and all three are handled:
+The primary deployment target, and the platform the test lab runs on. Several things differ from older releases,
+and all of them are handled:
 
-* **`iptables` is the nf_tables backend** (`iptables-nft`). The rules vlb
-  writes — MASQUERADE, the `-C` idempotency check, the FORWARD policy — all
-  behave identically on it. Verified, not assumed.
-* **`conntrack` is not installed.** See above; the installer adds it, because
-  its absence degrades failover silently rather than loudly.
-* **netplan drives systemd-networkd**, and both write default routes. `ip
-  route replace` keys on (destination, metric, **proto**), so a rival default
-  at the same metric 0 with a different proto is a *separate* route to the
-  kernel: the two coexist at equal cost and the kernel picks between them by
-  insertion order. vlb removes such rivals when it installs its own route,
-  and the watchdog removes any that appear later — verified against `proto`
-  values of `dhcp`, `static`, `kernel`, `boot` and `ra` at both metric 0 and
-  higher.
+* **`iptables` is the nf_tables backend** (`iptables-nft`). The rules `vlb` writes — MASQUERADE, the `-C`
+  idempotency check, the FORWARD policy — all behave identically on it. Verified, not assumed.
+* **`conntrack` is not installed.** See above; the installer adds it, because its absence degrades failover
+  silently rather than loudly.
+* **netplan drives systemd-networkd**, and both write default routes. `ip route replace` keys on (destination,
+  metric, **proto**), so a rival default at the same metric 0 with a different proto is a *separate* route to the
+  kernel: the two coexist at equal cost and the kernel picks between them by insertion order. `vlb` removes such
+  rivals when it installs its own route, and the watchdog removes any that appear later — verified against `proto`
+  values of `dhcp`, `static`, `kernel`, `boot` and `ra` at both metric 0 and higher. A `netplan apply` or a DHCP
+  renewal that replaces the route outright is reclaimed within one `route_watchdog_secs` period.
+* **systemd 255.** The unit relies on `StartLimitIntervalSec=` in `[Unit]`, `Type=exec` and `ReadWritePaths=-…`,
+  all of which have been there for years; `systemctl status vlb` shows the daemon's own status line (active
+  provider, per-provider state, pin) via `NotifyAccess=main`.
 
-A `netplan apply` or a DHCP renewal that replaces our route outright is
-reclaimed within one `route_watchdog_secs` period.
+## 🩹 Troubleshooting
 
-* **systemd 255.** The unit relies on `StartLimitIntervalSec=` in `[Unit]`,
-  `Type=exec` and `ReadWritePaths=-…`, all of which have been there for years;
-  `systemctl status vlb` shows the daemon's own status line (active provider,
-  per-provider state, pin) via `NotifyAccess=main`.
+<details>
+<summary><b>The dashboard says "vlb has not answered yet".</b></summary>
 
----
+Normal for a few seconds after a start: the daemon is bringing up policy routing and meeting every host on the LAN,
+and it answers when that settles. The dashboard retries by itself and then tells you which of the two things went
+wrong — nothing listening (it is not running) or listening but slow. If it says the second and never clears, look at
+`sudo journalctl -u vlb -n 50`.
 
-## Troubleshooting
+</details>
 
-**The dashboard says "vlb has not answered yet".**  
-Normal for a few seconds after a start: the daemon is bringing up policy
-routing and meeting every host on the LAN, and it answers when that settles.
-The dashboard retries by itself and then tells you which of the two things
-went wrong — nothing listening (it is not running) or listening but slow.
-If it says the second and never clears, look at `sudo journalctl -u vlb -n 50`.
+<details>
+<summary><b><code>vlb status</code> says <code>"active_adopted": true</code> / the TUI says "adopted — verifying".</b></summary>
 
-**`vlb status` says `"active_adopted": true` / the TUI says "adopted — verifying".**  
-Normal for a few seconds after a restart: the daemon took over the route it
-found in the kernel and is confirming that provider with its own probes
-(`success_threshold` rounds). Traffic is flowing the whole time. If it stays
-that way, the adopted provider is not passing its checks *and* nothing else
-is healthy either — run `vlb probe`.
+Normal for a few seconds after a restart: the daemon took over the route it found in the kernel and is confirming
+that provider with its own probes (`success_threshold` rounds). Traffic is flowing the whole time. If it stays that
+way, the adopted provider is not passing its checks *and* nothing else is healthy either — run `vlb probe`.
 
-**Port already in use on start.**  
-Another `vlb` is alive (systemd unit, leftover daemon, etc). Stop it
-with `sudo systemctl stop vlb` or `sudo pkill -x vlb` and try again.
-The launcher refuses to fork a second daemon on top of an existing one
-on purpose.
+</details>
 
-**`ip route replace … failed`.**  
-Usually means another process owns a default at the same `(metric,
-proto)` key. We write at `metric 0 proto static` exactly because that
-deterministically replaces netplan/networkd defaults. If you still see
-it: `ip route show default` should give you the conflicting line.
+<details>
+<summary><b>Port already in use on start.</b></summary>
 
-**Failback never happens after the primary recovers.**  
-You probably saw this on a netplan/networkd box. Confirm with `ip route
-show default` that the live default is `proto static`, not `proto boot`
-or `proto dhcp`. The fix is already in `vlb` (we always write `proto
-static`); if you've manually pinned `proto boot` somewhere, remove that.
+Another `vlb` is alive (systemd unit, leftover daemon, etc.). Stop it with `sudo systemctl stop vlb` or
+`sudo pkill -x vlb` and try again. The launcher refuses to fork a second daemon on top of an existing one on
+purpose.
 
-**Everything looks healthy but nobody has internet — and the ISP bill is overdue.**  
+</details>
+
+<details>
+<summary><b><code>ip route replace … failed</code>.</b></summary>
+
+Usually means another process owns a default at the same `(metric, proto)` key. `vlb` writes at `metric 0 proto
+static` exactly because that deterministically replaces netplan/networkd defaults. If you still see it,
+`ip route show default` should give you the conflicting line.
+
+</details>
+
+<details>
+<summary><b>Failback never happens after the primary recovers.</b></summary>
+
+You probably saw this on a netplan/networkd box. Confirm with `ip route show default` that the live default is
+`proto static`, not `proto boot` or `proto dhcp`. The fix is already in `vlb` (it always writes `proto static`);
+if you have manually pinned `proto boot` somewhere, remove that.
+
+</details>
+
+<details>
+<summary><b>Everything looks healthy but nobody has internet — and the ISP bill is overdue.</b></summary>
+
 This is interception, not an outage. Confirm it with:
 
 ```bash
 sudo vlb --config /etc/vlb/vlb.toml probe --provider isp-main
 ```
 
-A tampered verdict names what came back instead of the expected content —
-usually a payment page. `vlb` should have failed over on its own within one
-canary interval; if it did not, check that `[canary] enabled = true` and that
-`vlb check` lists targets. Before the content canary existed this case passed
-every probe and no failover happened, which is precisely the bug it was added
-to fix.
+A tampered verdict names what came back instead of the expected content — usually a payment page. `vlb` should
+have failed over on its own within one canary interval; if it did not, check that `[canary] enabled = true` and
+that `vlb check` lists targets. Before the content canary existed this case passed every probe and no failover
+happened, which is precisely the bug it was added to fix.
 
-**Probes pass but the internet is dead.**  
-You're hitting selective prohibition. Add a hostname to
-`probe_targets` (e.g. `"google.com"`) — IP-only probes can be deceived
-by upstreams that allow popular DNS IPs but block everything else. If the
-uplink is intercepted rather than filtered, see the entry above.
+</details>
 
-**The canary fails on a provider that is genuinely fine.**  
-Usually one endpoint being unreachable from your region. `quorum = "majority"`
-already tolerates one of three; find out which with `vlb probe`, then either
-replace that target or relax to `quorum = "any"`. If the failure is a timeout,
-raise `canary.timeout_ms` — `vlb probe --repeat 5` prints a suggested value.
+<details>
+<summary><b>Probes pass but the internet is dead.</b></summary>
 
-**Failback to the primary is slower than expected.**  
-By design: `failback_stable_secs` (30 s default) plus flap backoff. If the
-primary has been bouncing, the wait doubles for each extra switch inside
-`flap_window_secs`. `RUST_LOG=debug` logs the countdown on every tick, and
-the TUI's gateway panel shows it. The flap history is persisted, so a restart
-does not reset the backoff.
+You are hitting selective prohibition. Add a hostname to `probe_targets` (e.g. `"google.com"`) — IP-only probes
+can be deceived by upstreams that allow popular DNS IPs but block everything else. If the uplink is intercepted
+rather than filtered, see the entry above.
 
-**`vlb force` was undone.**  
-Not by a restart — the pin is persisted and restored (`operator pin restored`
-in the journal). Check `vlb status` for `forced`; `vlb auto` is the only thing
-that clears it, and that is persisted too.
+</details>
 
-**`ping: invalid argument: '0x200'`.**  
-`iputils-ping`'s `-m` takes decimal. Inside the daemon we always pass
-decimal; if you're running ping by hand for diagnostics, do
-`-m $((0x200))`.
+<details>
+<summary><b>The canary fails on a provider that is genuinely fine.</b></summary>
 
-**`SO_MARK` setsockopt fails with EPERM.**  
-You're not root or the binary lost `CAP_NET_ADMIN`. The systemd unit
-runs as root. If you're running by hand, prefix with `sudo`.
+Usually one endpoint being unreachable from your region. `quorum = "majority"` already tolerates one of three; find
+out which with `vlb probe`, then either replace that target or relax to `quorum = "any"`. If the failure is a
+timeout, raise `canary.timeout_ms` — `vlb probe --repeat 5` prints a suggested value.
 
-**Stats DB locked.**  
-`*.db-wal` next to `stats.db` plus a stale process. Make sure only one
-`vlb` is running.
+</details>
 
----
+<details>
+<summary><b>Failback to the primary is slower than expected.</b></summary>
 
-## Repo layout
+By design: `failback_stable_secs` (30 s default) plus flap backoff. If the primary has been bouncing, the wait
+doubles for each extra switch inside `flap_window_secs`. `RUST_LOG=debug` logs the countdown on every tick, and the
+TUI's gateway panel shows it. The flap history is persisted, so a restart does not reset the backoff.
+
+</details>
+
+<details>
+<summary><b><code>vlb force</code> was undone.</b></summary>
+
+Not by a restart — the pin is persisted and restored (`operator pin restored` in the journal). Check `vlb status`
+for `forced`; `vlb auto` is the only thing that clears it, and that is persisted too.
+
+</details>
+
+<details>
+<summary><b><code>ping: invalid argument: '0x200'</code>.</b></summary>
+
+`iputils-ping`'s `-m` takes decimal. Inside the daemon `vlb` always passes decimal; if you are running ping by hand
+for diagnostics, use `-m $((0x200))`.
+
+</details>
+
+<details>
+<summary><b><code>SO_MARK</code> setsockopt fails with EPERM.</b></summary>
+
+You are not root or the binary lost `CAP_NET_ADMIN`. The systemd unit runs as root. If you are running by hand,
+prefix with `sudo`.
+
+</details>
+
+<details>
+<summary><b>Stats DB locked.</b></summary>
+
+`*.db-wal` next to `stats.db` plus a stale process. Make sure only one `vlb` is running.
+
+</details>
+
+## 📁 Project structure
 
 ```
 .
 ├── Cargo.toml
-├── README.md
+├── README.md / README.ru.md
 ├── LICENSE
 ├── rustfmt.toml
 ├── canary/
-│   └── canary.txt            # content fetched by the canary probe — do not edit
+│   ├── canary.txt            # content fetched by the canary probe — do not edit
+│   └── throughput-64k.bin    # payload for the throughput floor
 ├── docker/
 │   ├── Dockerfile
 │   ├── docker-compose.yml
@@ -1591,7 +1571,7 @@ runs as root. If you're running by hand, prefix with `sudo`.
 │   ├── install.sh            # one-command install/update from a release
 │   ├── vlb.sh                # launcher (build / start / tui / clients / install / …)
 │   ├── vlb-setup.sh          # the guided setup and the menu behind `vlb.sh install`
-│   └── vlb.ps1               # Windows helper (limited; Linux only feature set)
+│   └── vlb.ps1               # Windows helper (limited; Linux-only feature set)
 ├── systemd/
 │   └── vlb.service
 └── src/
@@ -1623,15 +1603,16 @@ runs as root. If you're running by hand, prefix with `sudo`.
         └── tui.rs            # dashboard + client screens
 ```
 
----
+## 🤝 Contributing
 
-## Contributing
+Issues and pull requests are welcome. Please run `./scripts/vlb.sh test` (or `cargo fmt`,
+`cargo clippy --release --all-targets -- -D warnings` and `cargo test --release`) before opening one — it is the
+same set CI enforces.
 
-PRs welcome. Please run `cargo fmt`, `cargo clippy --release --all-targets
--- -D warnings`, and `cargo test --release` before opening one.
+## 📄 License
 
----
+[MIT](LICENSE) © 2025 Denis Humen.
 
-## License
-
-MIT — see [`LICENSE`](LICENSE).
+<div align="center">
+  <img src="docs/assets/logo.svg" alt="vlb — the direct uplink is broken, and the route steps over the break and carries on" width="96" />
+</div>
